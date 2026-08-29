@@ -953,7 +953,6 @@ void DuckDialog::refresh()
 // ---------------------------------------------------------------------------
 // AppsDialog
 // ---------------------------------------------------------------------------
-static QString runPactl(const QStringList& args) { return pactlRun(args); }
 
 // BetterBanana endpoints first: those are what you normally want to pick.
 static void listTargets(bool playback, QStringList& ids, QStringList& labels)
