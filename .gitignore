@@ -1,0 +1,4 @@
+build/
+*.tar.gz
+*.pkg.tar.zst
+*.o

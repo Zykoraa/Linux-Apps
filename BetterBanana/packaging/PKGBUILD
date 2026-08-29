@@ -1,0 +1,28 @@
+# Maintainer: you
+pkgname=betterbanana
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="BetterBanana-style virtual audio mixer for PipeWire"
+arch=('x86_64')
+license=('MIT')
+depends=('pipewire' 'qt6-base' 'libsndfile' 'libpulse')
+makedepends=('gcc' 'pkgconf' 'qt6-tools')
+optdepends=('pipewire-pulse: needed for the application routing panel')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  make all gui
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  ./build/test_dsp
+  QT_QPA_PLATFORM=offscreen ./build/test_fader
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  make install-system PREFIX=/usr DESTDIR="$pkgdir"
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=betterbanana audio engine
+Documentation=https://github.com/local/betterbanana
+# PipeWire must be up first: the engine publishes its nodes into that graph.
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bb-engine
+Restart=on-failure
+RestartSec=2
+# The mixer runs in the audio callback; ask for realtime scheduling.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+Nice=-10
+
+[Install]
+WantedBy=default.target

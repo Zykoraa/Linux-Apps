@@ -1,0 +1,47 @@
+// betterbanana GUI - colour themes.
+//
+// One global palette drives everything. Plain Qt widgets are styled through an
+// application-wide stylesheet keyed on dynamic properties (role="mute" etc.),
+// so switching themes is a single setStyleSheet() call; the custom-painted
+// widgets read theme() directly in their paintEvent.
+#pragma once
+
+#include <QColor>
+#include <QString>
+#include <QVector>
+
+struct Theme {
+    QString name;
+
+    QColor bg;         // window background
+    QColor panel;      // strip / group background
+    QColor panelAlt;   // inset areas, meter troughs
+    QColor header;     // strip title plate
+    QColor border;
+
+    QColor text;
+    QColor textDim;
+
+    QColor accent;     // primary highlight (knob arcs, focus)
+    QColor busA;       // A1..A3 assign buttons
+    QColor busB;       // B1/B2 assign buttons
+    QColor mute;
+    QColor solo;
+    QColor mono;
+    QColor eqOn;
+    QColor rec;        // record-armed / recording
+
+    QColor meterLow;   // <= -18 dB
+    QColor meterMid;   // -18 .. -6
+    QColor meterHigh;  // -6 .. -1
+    QColor meterPeak;  // clipping
+    QColor meterHold;
+
+    bool dark = true;
+};
+
+const QVector<Theme>& builtinThemes();
+const Theme&          theme();                 // current
+void                  setThemeIndex(int i);
+int                   themeIndex();
+QString               buildStyleSheet(const Theme& t);

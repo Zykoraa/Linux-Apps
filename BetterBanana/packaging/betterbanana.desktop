@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BetterBanana
+GenericName=Audio Mixer
+Comment=Virtual audio mixer for PipeWire
+Exec=bb-gui
+Icon=betterbanana
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;mixer;routing;pipewire;betterbanana;
+StartupWMClass=bb-gui

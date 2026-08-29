@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3140"/>
+      <stop offset="1" stop-color="#15181d"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="26" fill="url(#bg)"/>
+  <!-- three faders at different positions, the app's whole idea in one glance -->
+  <g stroke="#3d4658" stroke-width="7" stroke-linecap="round">
+    <line x1="34" y1="26" x2="34" y2="102"/>
+    <line x1="64" y1="26" x2="64" y2="102"/>
+    <line x1="94" y1="26" x2="94" y2="102"/>
+  </g>
+  <g stroke="#6ee7a8" stroke-width="7" stroke-linecap="round">
+    <line x1="34" y1="70" x2="34" y2="102"/>
+    <line x1="64" y1="46" x2="64" y2="102"/>
+    <line x1="94" y1="84" x2="94" y2="102"/>
+  </g>
+  <g fill="#e8eef7">
+    <rect x="22" y="63" width="24" height="12" rx="4"/>
+    <rect x="52" y="39" width="24" height="12" rx="4"/>
+    <rect x="82" y="77" width="24" height="12" rx="4"/>
+  </g>
+</svg>

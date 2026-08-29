@@ -1,0 +1,111 @@
+// betterbanana GUI - custom-painted controls that follow the active theme.
+#pragma once
+
+#include <QWidget>
+#include <QString>
+#include <functional>
+
+// Rotary knob with a 270-degree sweep. Values are integers (tenths of a unit,
+// as elsewhere in the GUI); `bipolar` fills the arc outward from centre, which
+// is what you want for EQ cut/boost.
+class Knob : public QWidget {
+    Q_OBJECT
+public:
+    Knob(int lo, int hi, int def, bool bipolar, QString suffix, QWidget* parent = nullptr);
+
+    int  value() const { return m_value; }
+    void setValue(int v);
+    void setDecimals(int d)     { m_decimals = d; update(); }
+    // Overrides the printed value, for non-linear scales such as EQ frequency.
+    void setFormatter(std::function<QString(int)> f) { m_fmt = std::move(f); update(); }
+    void setScale(double s)     { m_scale = s;    update(); }
+    bool isDragging() const     { return m_dragging; }
+
+    QSize sizeHint() const override        { return QSize(40, 50); }
+    QSize minimumSizeHint() const override { return QSize(32, 42); }
+
+signals:
+    void valueChanged(int v);
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+    void mousePressEvent(QMouseEvent*) override;
+    void mouseMoveEvent(QMouseEvent*) override;
+    void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;
+    void wheelEvent(QWheelEvent*) override;
+
+private:
+    int     m_lo, m_hi, m_def, m_value;
+    bool    m_bipolar;
+    QString m_suffix;
+    int     m_decimals = 1;
+    double  m_scale = 0.1;      // display value = raw * scale
+    std::function<QString(int)> m_fmt;
+    bool    m_dragging = false;
+    int     m_dragStartY = 0, m_dragStartVal = 0;
+};
+
+// Mixer fader. Linear in dB, with a marked unity position, a dB scale, and
+// double-click to snap back to 0 dB.
+class Fader : public QWidget {
+    Q_OBJECT
+public:
+    Fader(int lo, int hi, int def, QWidget* parent = nullptr);
+
+    int  value() const { return m_value; }
+    void setValue(int v);
+    bool isDragging() const { return m_dragging; }
+
+    QSize sizeHint() const override        { return QSize(40, 180); }
+    QSize minimumSizeHint() const override { return QSize(38, 90); }
+
+signals:
+    void valueChanged(int v);
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+    void mousePressEvent(QMouseEvent*) override;
+    void mouseMoveEvent(QMouseEvent*) override;
+    void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;
+    void wheelEvent(QWheelEvent*) override;
+
+private:
+    QRectF grooveRect() const;
+    double valueToY(int v) const;
+    int    yToValue(double y) const;
+
+    int  m_lo, m_hi, m_def, m_value;
+    bool m_dragging = false;
+};
+
+// Voicemeeter's Intellipan: X pans, Y is reserved for the front/rear blend.
+class XYPad : public QWidget {
+    Q_OBJECT
+public:
+    explicit XYPad(QWidget* parent = nullptr);
+
+    int  xValue() const { return m_x; }
+    int  yValue() const { return m_y; }
+    void setValues(int x, int y);
+    bool isDragging() const { return m_dragging; }
+
+    QSize sizeHint() const override        { return QSize(64, 42); }
+    QSize minimumSizeHint() const override { return QSize(48, 34); }
+
+signals:
+    void valuesChanged(int x, int y);
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+    void mousePressEvent(QMouseEvent*) override;
+    void mouseMoveEvent(QMouseEvent*) override;
+    void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;
+
+private:
+    void applyPos(const QPoint& p);
+    int  m_x = 0, m_y = 0;      // -100 .. 100
+    bool m_dragging = false;
+};

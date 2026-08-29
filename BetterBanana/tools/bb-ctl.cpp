@@ -1,0 +1,436 @@
+// bb-ctl - command line control for the betterbanana engine.
+// Maps the same shared-memory segment the GUI uses.
+#include "../common/protocol.h"
+#include "../common/preset.h"
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <string>
+#include <algorithm>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <csignal>
+
+using namespace bb;
+
+// dsp.h is engine-only; keep a local copy rather than pulling it in here.
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static int   clampi(int v, int lo, int hi)         { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Header layout (magic, version, struct_size, engine_pid) is stable across
+// versions, so "quit" can find and signal the engine even when the rest of the
+// struct has changed underneath us.
+static pid_t engine_pid_unchecked()
+{
+    int fd = shm_open(kShmName, O_RDONLY, 0600);
+    if (fd < 0) return -1;
+    void* m = mmap(nullptr, sizeof(Shared), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return -1;
+    const Shared* s = static_cast<const Shared*>(m);
+    pid_t pid = (s->magic.load() == kMagic) ? (pid_t)s->engine_pid.load() : -1;
+    munmap(m, sizeof(Shared));
+    return pid;
+}
+
+static Shared* map_shm(bool rw = true)
+{
+    int fd = shm_open(kShmName, rw ? O_RDWR : O_RDONLY, 0600);
+    if (fd < 0) { std::fprintf(stderr, "bb-ctl: engine not running (%s)\n", kShmName); return nullptr; }
+    void* m = mmap(nullptr, sizeof(Shared), PROT_READ | (rw ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) { perror("mmap"); return nullptr; }
+    Shared* s = static_cast<Shared*>(m);
+    if (!shm_compatible(s)) {
+        std::fprintf(stderr, "bb-ctl: engine/tool version mismatch "
+                             "(engine v%u/%uB, tool v%u/%zuB). Rebuild both and restart the engine.\n",
+                     s->version.load(), s->struct_size.load(), kVersion, sizeof(Shared));
+        return nullptr;
+    }
+    return s;
+}
+
+static float db(float lin) { return lin <= 1e-7f ? -99.9f : 20.0f * std::log10(lin); }
+
+static void bar(float lin)
+{
+    const float d = db(lin);
+    int n = (int)((d + 60.0f) / 60.0f * 24.0f);
+    if (n < 0) n = 0;
+    if (n > 24) n = 24;
+    std::printf("[");
+    for (int i = 0; i < 24; ++i) std::putchar(i < n ? '#' : '.');
+    std::printf("] %6.1f dB", d);
+}
+
+static const char* kStripName[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX" };
+static const char* kBusName[kBuses]    = { "A1", "A2", "A3", "B1", "B2" };
+
+static void usage()
+{
+    std::printf(
+      "bb-ctl - control the betterbanana engine\n\n"
+      "  status                      show routing, gains and device assignment\n"
+      "  meters [n]                  print meters n times (default 1, ~10/s)\n"
+      "  strip <i> gain <dB>         -60 .. +12\n"
+      "  strip <i> mute|solo|mono <0|1|toggle>\n"
+      "  strip <i> key <0|1>         this strip triggers the ducker\n"
+      "  strip <i> duck <dB>         how far this strip drops while ducking\n"
+      "  strip <i> gate|comp|aud <0..10>\n"
+      "  strip <i> eq <low> <mid> <high>   dB, -12 .. +12\n"
+      "  strip <i> pan <-1..1>\n"
+      "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
+      "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
+      "  route in <1..3> <source-node-name|cable:0..2|->\n"
+      "  route out <A1|A2|A3> <sink-node-name|->\n"
+      "  rec file <path> | bus <A1..B2> | start | stop\n"
+      "  play file <path> | start | stop | gain <dB> | loop <0|1>\n"
+      "  play bus <A1|A2|A3|B1|B2> <0|1>\n"
+      "  vban out <1..8> on|off | host <ip> | port <n> | name <s> | bus <A1..B2>\n"
+      "  vban in  <1..8> on|off | port <n> | name <s>\n"
+      "  vban apply                  reload VBAN modules\n"
+      "  label strip <0..4> <name>   rename a strip (empty resets)\n"
+      "  label bus <A1..B2> <name>   rename a bus\n"
+      "  preset save <name|path>     save current state\n"
+      "  preset load <name|path>     restore a saved state\n"
+      "  preset list                 list saved presets\n"
+      "  duck on|off|toggle | threshold <dB> | attack <ms> | release <ms>\n"
+      "  clearclip                   clear latched clip indicators\n"
+      "  reset                       reset meters\n"
+      "  quit                        stop the engine\n\n"
+      "  strip index: 0=HW1 1=HW2 2=HW3 3=VAIO 4=AUX\n");
+}
+
+static int bus_index(const char* s)
+{
+    for (int b = 0; b < kBuses; ++b) if (strcasecmp(s, kBusName[b]) == 0) return b;
+    if (s[0] >= '0' && s[0] <= '4' && s[1] == 0) return s[0] - '0';
+    return -1;
+}
+
+static void send_cmd(Shared* s, Command c)
+{
+    s->cmd.store(c, std::memory_order_relaxed);
+    s->cmd_seq.fetch_add(1, std::memory_order_release);
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) { usage(); return 1; }
+
+    // Handled before the compatibility check: stopping a stale engine is
+    // exactly what you need after a version bump.
+    if (std::string(argv[1]) == "quit") {
+        const pid_t pid = engine_pid_unchecked();
+        if (pid <= 0) { std::fprintf(stderr, "bb-ctl: no engine running\n"); return 1; }
+        if (kill(pid, SIGTERM) != 0) { perror("bb-ctl: kill"); return 1; }
+        std::printf("stopped engine pid %d\n", pid);
+        return 0;
+    }
+
+    Shared* s = map_shm();
+    if (!s) return 1;
+    const std::string cmd = argv[1];
+
+    if (cmd == "status") {
+        std::printf("engine pid %d   heartbeat %u   rate %.0f\n\n",
+                    s->engine_pid.load(), s->engine_heartbeat.load(), s->samplerate.load());
+        char hw[kHwStrips][kNameLen], out[kPhysBuses][kNameLen];
+        uint32_t seq;
+        for (int t = 0; t < 8 && !routing_read(s->routing, seq, hw, out); ++t) {}
+        char lstrip[kStrips][kLabelLen], lbus[kBuses][kLabelLen];
+        bool lok = false;
+        for (int t = 0; t < 16 && !lok; ++t) lok = labels_read(s->labels, lstrip, lbus);
+        std::printf("%-12s %7s %5s %5s %5s  %-5s %-5s %-5s   routing\n",
+                    "STRIP", "GAIN", "MUTE", "SOLO", "MONO", "GATE", "COMP", "AUD");
+        for (int i = 0; i < kStrips; ++i) {
+            StripParams& p = s->strip[i];
+            std::printf("%-12s %6.1f  %5d %5d %5d  %5.1f %5.1f %5.1f   ",
+                (lok && lstrip[i][0]) ? lstrip[i] : kStripName[i], p.gain_db.load(), p.mute.load(), p.solo.load(), p.mono.load(),
+                p.gate.load(), p.comp.load(), p.audibility.load());
+            for (int b = 0; b < kBuses; ++b)
+                std::printf("%s%s ", kBusName[b], p.bus_on[b].load() ? "*" : "-");
+            if (i < kHwStrips) {
+                // Render "cable:N" the way the GUI labels it.
+                if (std::strncmp(hw[i], kCablePrefix, std::strlen(kCablePrefix)) == 0)
+                    std::printf("  <- BetterBanana Cable %d", atoi(hw[i] + std::strlen(kCablePrefix)) + 1);
+                else
+                    std::printf("  <- %s", hw[i][0] ? hw[i] : "(unassigned)");
+            }
+            std::printf("\n");
+        }
+        std::printf("\n%-12s %7s %5s %5s %5s   device\n", "BUS", "GAIN", "MUTE", "MONO", "EQ");
+        for (int b = 0; b < kBuses; ++b) {
+            BusParams& p = s->bus[b];
+            std::printf("%-12s %6.1f  %5d %5d %5d   %s\n",
+                (lok && lbus[b][0]) ? lbus[b] : kBusName[b], p.gain_db.load(),
+                p.mute.load(), p.mono.load(), p.eq_on.load(),
+                b < kPhysBuses ? (out[b][0] ? out[b] : "(unassigned)") : "(virtual source)");
+        }
+        const char* st[] = { "idle", "RECORDING", "PLAYING" };
+        std::printf("\nDUCKER    %s  threshold %.1f dB  attack %.0f ms  release %.0f ms  env %.2f\n",
+            s->duck_enabled.load() ? "ON " : "off", s->duck_threshold_db.load(),
+            s->duck_attack_ms.load(), s->duck_release_ms.load(), s->meters.duck_env.load());
+        std::printf("          ");
+        for (int i = 0; i < kStrips; ++i) {
+            const bool k = s->strip[i].duck_key.load() != 0;
+            const float d = s->strip[i].duck_depth_db.load();
+            if (k) std::printf("[%s=KEY] ", (lok && lstrip[i][0]) ? lstrip[i] : kStripName[i]);
+            else if (d < -0.05f) std::printf("[%s %.0fdB] ", (lok && lstrip[i][0]) ? lstrip[i] : kStripName[i], d);
+        }
+        std::printf("\n");
+
+        std::printf("\nRECORDER  %s   src=%s  written=%u  played=%u/%u  gain=%.1f  loop=%d\n",
+            st[clampi(s->rec.state.load(), 0, 2)], kBusName[clampi(s->rec.source_bus.load(), 0, kBuses-1)],
+            s->rec.frames_written.load(), s->rec.frames_played.load(),
+            s->rec.total_frames.load(), s->rec.gain_db.load(), s->rec.loop.load());
+        std::printf("          play routing: ");
+        for (int b = 0; b < kBuses; ++b) std::printf("%s%s ", kBusName[b], s->rec.bus_on[b].load() ? "*" : "-");
+        std::printf("\n");
+
+        std::printf("\nVBAN      %-4s %-9s %-18s %-6s %s\n", "#", "DIR", "NAME", "PORT", "DETAIL");
+        for (int i = 0; i < kVbanStreams; ++i) {
+            const VbanOutCfg& o = s->vban.out[i];
+            if (o.enabled) std::printf("          %-4d %-9s %-18s %-6d -> %s  from %s\n",
+                i + 1, "out", o.name, o.port, o.host[0] ? o.host : "(no host)",
+                kBusName[clampi(o.source_bus, 0, kBuses - 1)]);
+        }
+        for (int i = 0; i < kVbanStreams; ++i) {
+            const VbanInCfg& n = s->vban.in[i];
+            if (n.enabled) std::printf("          %-4d %-9s %-18s %-6d <- source bb_vban_in_%d\n",
+                i + 1, "in", n.name, n.port, i + 1);
+        }
+        return 0;
+    }
+
+    if (cmd == "meters") {
+        const int n = argc > 2 ? atoi(argv[2]) : 1;
+        for (int k = 0; k < n; ++k) {
+            if (k) usleep(100000);
+            std::printf("\n");
+            for (int i = 0; i < kStrips; ++i) {
+                std::printf("  %-7s pre ", kStripName[i]);
+                bar(std::max(s->meters.strip_pre[i][0].load(), s->meters.strip_pre[i][1].load()));
+                std::printf("   post ");
+                bar(std::max(s->meters.strip_post[i][0].load(), s->meters.strip_post[i][1].load()));
+                std::printf("\n");
+            }
+            for (int b = 0; b < kBuses; ++b) {
+                std::printf("  BUS %-3s     ", kBusName[b]);
+                bar(std::max(s->meters.bus_out[b][0].load(), s->meters.bus_out[b][1].load()));
+                std::printf("\n");
+            }
+        }
+        return 0;
+    }
+
+    if (cmd == "strip" && argc >= 4) {
+        const int i = atoi(argv[2]);
+        if (i < 0 || i >= kStrips) { std::fprintf(stderr, "strip 0..%d\n", kStrips - 1); return 1; }
+        StripParams& p = s->strip[i];
+        const std::string w = argv[3];
+        // "toggle" flips the current value; that is what a global hotkey binds to.
+        auto flag = [&](ai& target, const char* v) {
+            const bool tog = std::strcmp(v, "toggle") == 0;
+            target.store(tog ? (target.load() ? 0 : 1) : (atoi(v) ? 1 : 0));
+            // Only a toggle reports back, so a hotkey can show the new state
+            // while scripted 0/1 calls stay quiet.
+            if (tog) std::printf("%d\n", target.load());
+        };
+        if      (w == "gain" && argc >= 5) p.gain_db.store(clampf(atof(argv[4]), -60.0f, 12.0f));
+        else if (w == "mute" && argc >= 5) flag(p.mute, argv[4]);
+        else if (w == "solo" && argc >= 5) flag(p.solo, argv[4]);
+        else if (w == "mono" && argc >= 5) flag(p.mono, argv[4]);
+        else if (w == "key"  && argc >= 5) flag(p.duck_key, argv[4]);
+        else if (w == "duck" && argc >= 5) p.duck_depth_db.store(clampf(atof(argv[4]), -60.0f, 0.0f));
+        else if (w == "gate" && argc >= 5) p.gate.store(clampf(atof(argv[4]), 0.0f, 10.0f));
+        else if (w == "comp" && argc >= 5) p.comp.store(clampf(atof(argv[4]), 0.0f, 10.0f));
+        else if (w == "aud"  && argc >= 5) p.audibility.store(clampf(atof(argv[4]), 0.0f, 10.0f));
+        else if (w == "pan"  && argc >= 5) p.pan_x.store(clampf(atof(argv[4]), -1.0f, 1.0f));
+        else if (w == "eq"   && argc >= 7) {
+            p.eq_low.store (clampf(atof(argv[4]), -12.0f, 12.0f));
+            p.eq_mid.store (clampf(atof(argv[5]), -12.0f, 12.0f));
+            p.eq_high.store(clampf(atof(argv[6]), -12.0f, 12.0f));
+        }
+        else if (w == "bus" && argc >= 6) {
+            const int b = bus_index(argv[4]);
+            if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+            p.bus_on[b].store(atoi(argv[5]) ? 1 : 0);
+        }
+        else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "bus" && argc >= 5) {
+        const int b = bus_index(argv[2]);
+        if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+        BusParams& p = s->bus[b];
+        const std::string w = argv[3];
+        if      (w == "gain") p.gain_db.store(clampf(atof(argv[4]), -60.0f, 12.0f));
+        else if (w == "mute") p.mute.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "mono") p.mono.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "eq")   p.eq_on.store(atoi(argv[4]) ? 1 : 0);
+        else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "route" && argc >= 5) {
+        const std::string dir = argv[2];
+        const char* name = argv[4];
+        if (std::strcmp(name, "-") == 0) name = "";
+        routing_write_begin(s->routing);
+        if (dir == "in") {
+            const int i = atoi(argv[3]) - 1;
+            if (i < 0 || i >= kHwStrips) { routing_write_end(s->routing); std::fprintf(stderr, "in 1..3\n"); return 1; }
+            std::snprintf(s->routing.hw_in[i], kNameLen, "%s", name);
+        } else if (dir == "out") {
+            const int b = bus_index(argv[3]);
+            if (b < 0 || b >= kPhysBuses) { routing_write_end(s->routing); std::fprintf(stderr, "out A1..A3\n"); return 1; }
+            std::snprintf(s->routing.bus_out[b], kNameLen, "%s", name);
+        } else { routing_write_end(s->routing); usage(); return 1; }
+        routing_write_end(s->routing);
+        return 0;
+    }
+
+    if (cmd == "rec" && argc >= 3) {
+        const std::string w = argv[2];
+        if (w == "file" && argc >= 4) {
+            s->rec.cfg_seq.fetch_add(1, std::memory_order_acq_rel);
+            std::snprintf(s->rec.rec_path, kNameLen, "%s", argv[3]);
+            s->rec.cfg_seq.fetch_add(1, std::memory_order_release);
+        } else if (w == "bus" && argc >= 4) {
+            const int b = bus_index(argv[3]);
+            if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+            s->rec.source_bus.store(b);
+        } else if (w == "start") send_cmd(s, kCmdRecStart);
+        else if (w == "stop")    send_cmd(s, kCmdRecStop);
+        else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "play" && argc >= 3) {
+        const std::string w = argv[2];
+        if (w == "file" && argc >= 4) {
+            s->rec.cfg_seq.fetch_add(1, std::memory_order_acq_rel);
+            std::snprintf(s->rec.play_path, kNameLen, "%s", argv[3]);
+            s->rec.cfg_seq.fetch_add(1, std::memory_order_release);
+        } else if (w == "start") send_cmd(s, kCmdPlayStart);
+        else if (w == "stop")    send_cmd(s, kCmdPlayStop);
+        else if (w == "gain" && argc >= 4) s->rec.gain_db.store(clampf(atof(argv[3]), -60.0f, 12.0f));
+        else if (w == "loop" && argc >= 4) s->rec.loop.store(atoi(argv[3]) ? 1 : 0);
+        else if (w == "bus"  && argc >= 5) {
+            const int b = bus_index(argv[3]);
+            if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+            s->rec.bus_on[b].store(atoi(argv[4]) ? 1 : 0);
+        } else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "vban") {
+        if (argc >= 3 && std::string(argv[2]) == "apply") { send_cmd(s, kCmdVbanReload); return 0; }
+        if (argc < 5) { usage(); return 1; }
+        const std::string dir = argv[2];
+        const int i = atoi(argv[3]) - 1;
+        if (i < 0 || i >= kVbanStreams) { std::fprintf(stderr, "stream 1..%d\n", kVbanStreams); return 1; }
+        const std::string w = argv[4];
+        s->vban.seq.fetch_add(1, std::memory_order_acq_rel);
+        if (dir == "out") {
+            VbanOutCfg& o = s->vban.out[i];
+            if      (w == "on")  o.enabled = 1;
+            else if (w == "off") o.enabled = 0;
+            else if (w == "host" && argc >= 6) std::snprintf(o.host, sizeof(o.host), "%s", argv[5]);
+            else if (w == "port" && argc >= 6) o.port = atoi(argv[5]);
+            else if (w == "name" && argc >= 6) std::snprintf(o.name, sizeof(o.name), "%s", argv[5]);
+            else if (w == "bus"  && argc >= 6) { const int b = bus_index(argv[5]); if (b >= 0) o.source_bus = b; }
+        } else if (dir == "in") {
+            VbanInCfg& n = s->vban.in[i];
+            if      (w == "on")  n.enabled = 1;
+            else if (w == "off") n.enabled = 0;
+            else if (w == "port" && argc >= 6) n.port = atoi(argv[5]);
+            else if (w == "name" && argc >= 6) std::snprintf(n.name, sizeof(n.name), "%s", argv[5]);
+        }
+        s->vban.seq.fetch_add(1, std::memory_order_release);
+        return 0;
+    }
+
+    if (cmd == "label" && argc >= 4) {
+        const std::string what = argv[2];
+        const char* text = argc >= 5 ? argv[4] : "";
+        int idx = -1;
+        bool strip = (what == "strip");
+        if (strip) idx = atoi(argv[3]);
+        else if (what == "bus") idx = bus_index(argv[3]);
+        else { usage(); return 1; }
+        if (idx < 0 || idx >= (strip ? kStrips : kBuses)) {
+            std::fprintf(stderr, "index out of range\n"); return 1;
+        }
+        s->labels.seq.fetch_add(1, std::memory_order_acq_rel);
+        std::snprintf(strip ? s->labels.strip[idx] : s->labels.bus[idx], kLabelLen, "%s", text);
+        s->labels.seq.fetch_add(1, std::memory_order_release);
+        return 0;
+    }
+
+    if (cmd == "preset" && argc >= 3) {
+        const std::string w = argv[2];
+        // A bare name lands in the preset directory; anything with a slash or
+        // a .bbp suffix is taken as a literal path.
+        auto resolve = [](const char* n) {
+            std::string v = n;
+            if (v.find('/') != std::string::npos) return v;
+            return presets_path() + "/" + v + ".bbp";
+        };
+        if (w == "list") {
+            DIR* d = opendir(presets_path().c_str());
+            if (!d) { std::printf("no presets yet (%s)\n", presets_path().c_str()); return 0; }
+            std::printf("presets in %s:\n", presets_path().c_str());
+            while (dirent* e = readdir(d)) {
+                std::string n = e->d_name;
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".bbp") == 0)
+                    std::printf("  %s\n", n.substr(0, n.size() - 4).c_str());
+            }
+            closedir(d);
+            return 0;
+        }
+        if (argc < 4) { usage(); return 1; }
+        const std::string path = resolve(argv[3]);
+        if (w == "save") {
+            mkdir(preset_dir().c_str(), 0755);
+            mkdir(presets_path().c_str(), 0755);
+            if (!save_preset(s, path.c_str())) {
+                std::fprintf(stderr, "bb-ctl: cannot write %s\n", path.c_str());
+                return 1;
+            }
+            std::printf("saved %s\n", path.c_str());
+        } else if (w == "load") {
+            if (!load_preset(s, path.c_str())) {
+                std::fprintf(stderr, "bb-ctl: cannot read %s\n", path.c_str());
+                return 1;
+            }
+            send_cmd(s, kCmdVbanReload);
+            std::printf("loaded %s\n", path.c_str());
+        } else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "duck" && argc >= 3) {
+        const std::string w = argv[2];
+        if      (w == "on")     s->duck_enabled.store(1);
+        else if (w == "off")    s->duck_enabled.store(0);
+        else if (w == "toggle") s->duck_enabled.store(s->duck_enabled.load() ? 0 : 1);
+        else if (w == "threshold" && argc >= 4) s->duck_threshold_db.store(clampf(atof(argv[3]), -80.0f, 0.0f));
+        else if (w == "attack"    && argc >= 4) s->duck_attack_ms.store(clampf(atof(argv[3]), 1.0f, 500.0f));
+        else if (w == "release"   && argc >= 4) s->duck_release_ms.store(clampf(atof(argv[3]), 10.0f, 5000.0f));
+        else { usage(); return 1; }
+        return 0;
+    }
+
+    if (cmd == "clearclip") { send_cmd(s, kCmdClearClip); return 0; }
+    if (cmd == "reset") { send_cmd(s, kCmdResetMeters); return 0; }
+
+    usage();
+    return 1;
+}
