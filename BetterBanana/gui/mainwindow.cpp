@@ -9,6 +9,8 @@
 #include <QJsonObject>
 #include <QAbstractItemView>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QInputDialog>
 #include <QMenu>
 #include <QPainter>
@@ -1192,6 +1194,67 @@ void AppsDialog::refresh()
     rebuildRemembered();
 }
 
+
+// ---------------------------------------------------------------------------
+// Start-at-login. The engine is a systemd user service; the mixer window is a
+// plain XDG autostart entry. They are independent on purpose: most people want
+// the engine always up (otherwise their virtual devices vanish) but not
+// necessarily the window in their face at every login.
+// ---------------------------------------------------------------------------
+static const char* kUnit = "betterbanana-engine.service";
+
+static QString runProc(const QString& prog, const QStringList& args, int* code = nullptr)
+{
+    QProcess p;
+    p.start(prog, args);
+    if (!p.waitForFinished(4000)) { if (code) *code = -1; return QString(); }
+    if (code) *code = p.exitCode();
+    return QString::fromUtf8(p.readAllStandardOutput()).trimmed();
+}
+
+// The unit is only present once the app has been installed.
+static bool engineUnitInstalled()
+{
+    const QString s = runProc("systemctl", { "--user", "is-enabled", kUnit });
+    return !s.isEmpty() && s != "not-found";
+}
+
+static bool engineAutostart()
+{
+    return runProc("systemctl", { "--user", "is-enabled", kUnit }) == "enabled";
+}
+
+static void setEngineAutostart(bool on)
+{
+    runProc("systemctl", { "--user", on ? "enable" : "disable", kUnit });
+}
+
+static QString guiAutostartPath()
+{
+    return QDir::homePath() + "/.config/autostart/betterbanana.desktop";
+}
+
+static bool guiAutostart() { return QFile::exists(guiAutostartPath()); }
+
+static void setGuiAutostart(bool on)
+{
+    const QString path = guiAutostartPath();
+    if (!on) { QFile::remove(path); return; }
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    // Exec is resolved through PATH so this keeps working if the binary moves
+    // between ~/.local/bin and /usr/bin.
+    f.write("[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=BetterBanana\n"
+            "Comment=Virtual audio mixer\n"
+            "Exec=bb-gui\n"
+            "Icon=betterbanana\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n");
+}
+
 // ---------------------------------------------------------------------------
 // MainWindow
 // ---------------------------------------------------------------------------
@@ -1350,6 +1413,27 @@ void MainWindow::buildMenus()
     eng->addAction("Sidechain &ducking...", QKeySequence("Ctrl+D"), this, &MainWindow::openDuckDialog);
     eng->addAction("&VBAN streams...", QKeySequence("Ctrl+B"), this, &MainWindow::openVbanDialog);
     eng->addSeparator();
+
+    auto* boot = eng->addMenu("Start at &login");
+    m_autoEngine = boot->addAction("Audio engine", this, [this](bool on) {
+        setEngineAutostart(on);
+        refreshAutostart();
+        statusBar()->showMessage(on ? "Engine will start at login"
+                                    : "Engine will no longer start at login", 4000);
+    });
+    m_autoEngine->setCheckable(true);
+    m_autoGui = boot->addAction("Mixer window", this, [this](bool on) {
+        setGuiAutostart(on);
+        refreshAutostart();
+        statusBar()->showMessage(on ? "Mixer will open at login"
+                                    : "Mixer will no longer open at login", 4000);
+    });
+    m_autoGui->setCheckable(true);
+    // Reflect changes made outside the app (systemctl, another window).
+    connect(boot, &QMenu::aboutToShow, this, &MainWindow::refreshAutostart);
+    refreshAutostart();
+
+    eng->addSeparator();
     eng->addAction("&Quit GUI", QKeySequence("Ctrl+Q"), this, [] { QApplication::quit(); });
 
     auto* view = menuBar()->addMenu("&Theme");
@@ -1361,6 +1445,24 @@ void MainWindow::buildMenus()
         a->setCheckable(true);
         group->addAction(a);
         m_themeActions.push_back(a);
+    }
+}
+
+void MainWindow::refreshAutostart()
+{
+    if (!m_autoEngine || !m_autoGui) return;
+    const bool installed = engineUnitInstalled();
+    {
+        QSignalBlocker b(m_autoEngine);
+        m_autoEngine->setEnabled(installed);
+        m_autoEngine->setChecked(installed && engineAutostart());
+        m_autoEngine->setToolTip(installed
+            ? "Run the audio engine as a systemd user service from login onward"
+            : "Not available: run 'make install' so the service unit exists");
+    }
+    {
+        QSignalBlocker b(m_autoGui);
+        m_autoGui->setChecked(guiAutostart());
     }
 }
 

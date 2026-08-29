@@ -228,6 +228,7 @@ private slots:
     void tick();
     void refreshDevices();
     void applyTheme(int index);
+    void refreshAutostart();
 
 private:
     void writeRouting();
@@ -245,6 +246,8 @@ private:
     int      m_stallTicks = 0;
     int      m_syncTicks = 0;
     QVector<QAction*> m_themeActions;
+    QAction* m_autoEngine = nullptr;
+    QAction* m_autoGui = nullptr;
     AppsDialog* m_apps = nullptr;
     QSet<int>   m_ruledStreams;
     int         m_ruleTicks = 0;

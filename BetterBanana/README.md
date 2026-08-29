@@ -186,6 +186,23 @@ decides what counts as speech rather than every keyboard click.
     bb-ctl strip 1 duck -12     # this strip drops 12 dB while you talk
     bb-ctl duck on
 
+## Start at login
+
+**Engine → Start at login** has two independent toggles:
+
+- **Audio engine** — enables/disables the `betterbanana-engine` systemd user
+  service. Leave this on: with the engine stopped, the virtual devices do not
+  exist, so anything pointed at them falls back to your default output.
+- **Mixer window** — whether the GUI opens automatically, via an XDG autostart
+  entry at `~/.config/autostart/betterbanana.desktop`.
+
+The installer turns the engine on and leaves the window off. Both reflect
+changes made outside the app, and there is a shell equivalent:
+
+    bb-ctl autostart                 # show what starts at login
+    bb-ctl autostart engine off
+    bb-ctl autostart gui on
+
 ## Keyboard shortcuts
 
 `packaging/` is wired into Hyprland via `~/.config/hypr/config/betterbanana.lua`:

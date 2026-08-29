@@ -100,6 +100,8 @@ static void usage()
       "  preset list                 list saved presets\n"
       "  duck on|off|toggle | threshold <dB> | attack <ms> | release <ms>\n"
       "  clearclip                   clear latched clip indicators\n"
+      "  autostart                   show what starts at login\n"
+      "  autostart engine|gui on|off set what starts at login\n"
       "  reset                       reset meters\n"
       "  quit                        stop the engine\n\n"
       "  strip index: 0=HW1 1=HW2 2=HW3 3=VAIO 4=AUX\n");
@@ -121,6 +123,57 @@ static void send_cmd(Shared* s, Command c)
 int main(int argc, char** argv)
 {
     if (argc < 2) { usage(); return 1; }
+
+    // Start-at-login needs no running engine, so handle it before mapping.
+    if (std::string(argv[1]) == "autostart") {
+        const std::string home = getenv("HOME") ? getenv("HOME") : ".";
+        const std::string gui_desktop = home + "/.config/autostart/betterbanana.desktop";
+        auto unit_state = [] {
+            FILE* f = popen("systemctl --user is-enabled betterbanana-engine.service 2>/dev/null", "r");
+            if (!f) return std::string("unknown");
+            char buf[64] = {};
+            if (!fgets(buf, sizeof(buf), f)) { pclose(f); return std::string("not-found"); }
+            pclose(f);
+            std::string v(buf);
+            while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back();
+            return v.empty() ? std::string("not-found") : v;
+        };
+        if (argc == 2) {
+            std::printf("engine  %s\n", unit_state().c_str());
+            std::printf("gui     %s\n",
+                access(gui_desktop.c_str(), F_OK) == 0 ? "enabled" : "disabled");
+            return 0;
+        }
+        if (argc < 4) { usage(); return 1; }
+        const std::string what = argv[2], val = argv[3];
+        const bool on = (val == "on" || val == "1" || val == "true");
+        if (what == "engine") {
+            std::string cmd = "systemctl --user ";
+            cmd += on ? "enable" : "disable";
+            cmd += " betterbanana-engine.service";
+            if (std::system(cmd.c_str()) != 0) {
+                std::fprintf(stderr, "bb-ctl: could not %s the service; is it installed?\n",
+                             on ? "enable" : "disable");
+                return 1;
+            }
+        } else if (what == "gui") {
+            if (on) {
+                std::string dir = home + "/.config/autostart";
+                mkdir((home + "/.config").c_str(), 0755);
+                mkdir(dir.c_str(), 0755);
+                FILE* f = fopen(gui_desktop.c_str(), "w");
+                if (!f) { perror("bb-ctl"); return 1; }
+                fputs("[Desktop Entry]\nType=Application\nName=BetterBanana\n"
+                      "Comment=Virtual audio mixer\nExec=bb-gui\nIcon=betterbanana\n"
+                      "Terminal=false\nX-GNOME-Autostart-enabled=true\n", f);
+                fclose(f);
+            } else {
+                unlink(gui_desktop.c_str());
+            }
+        } else { usage(); return 1; }
+        std::printf("%s autostart %s\n", what.c_str(), on ? "enabled" : "disabled");
+        return 0;
+    }
 
     // Handled before the compatibility check: stopping a stale engine is
     // exactly what you need after a version bump.
