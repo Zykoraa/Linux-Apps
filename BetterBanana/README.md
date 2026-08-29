@@ -23,7 +23,9 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 
 One command, on any systemd + PipeWire distribution:
 
-    curl -fsSL https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/install.sh | bash
+```sh
+curl -fsSL https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/install.sh | bash
+```
 
 It installs the dependencies for your distribution (Arch, Debian/Ubuntu, Fedora
 or openSUSE), builds, installs into `~/.local/bin`, and starts the audio engine
@@ -31,8 +33,10 @@ as a systemd user service. Re-run it any time to update.
 
 Prefer to read it first — always sensible before piping anything to a shell:
 
-    curl -fsSL -O https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/install.sh
-    less install.sh && bash install.sh
+```sh
+curl -fsSL -O https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/install.sh
+less install.sh && bash install.sh
+```
 
 Then run `bb-gui`. Point an application's output at **BetterBanana VAIO** (or a
 Cable), and set your chat app's microphone to **BetterBanana Out B1**.
