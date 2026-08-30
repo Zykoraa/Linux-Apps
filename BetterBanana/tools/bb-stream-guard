@@ -24,18 +24,18 @@ This daemon fixes both. Every couple of seconds it:
     bus; the stream then goes silent until something restarts the chain.
 
 The stream bus is discovered, not hardcoded: it is whichever A-bus you have
-assigned to the stream sink (default "bb_stream"). If no bus is assigned to it,
+assigned to the stream sink (default "betterbanana_stream"). If no bus is assigned to it,
 stream-bus management stays off and only the echo protection runs -- so this is
 safe to enable even if you never share your screen.
 
 Set up the stream bus by pointing an unused bus at the null sink and routing the
 strips you want streamed to it, leaving AUX off it:
 
-    bb-ctl route out A3 bb_stream
+    bb-ctl route out A3 betterbanana_stream
     bb-ctl strip <app-strip> bus A3 1
 
 Environment:
-    BB_GUARD_STREAM_SINK  sink that marks the stream bus   (default bb_stream)
+    BB_GUARD_STREAM_SINK  sink that marks the stream bus   (default betterbanana_stream)
     BB_GUARD_BLOCK        override auto-detected bus block list, e.g. "bb_a1 bb_a2"
     BB_GUARD_INTERVAL     poll seconds                     (default 2)
     BB_GUARD_BBCTL        path to bb-ctl                   (default ~/.local/bin/bb-ctl)
@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 
-STREAM_SINK = os.environ.get("BB_GUARD_STREAM_SINK", "bb_stream")
+STREAM_SINK = os.environ.get("BB_GUARD_STREAM_SINK", "betterbanana_stream")
 BLOCK_OVERRIDE = os.environ.get("BB_GUARD_BLOCK", "").split()
 INTERVAL = float(os.environ.get("BB_GUARD_INTERVAL", "2"))
 BBCTL = os.environ.get("BB_GUARD_BBCTL", os.path.expanduser("~/.local/bin/bb-ctl"))

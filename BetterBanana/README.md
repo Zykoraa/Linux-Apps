@@ -374,10 +374,10 @@ transmitted to viewers. `pw-link` matches ports by name, so linking a bus to
 evening: the routing is correct, the meters move, and your friends hear nothing.
 
 The fix is a dedicated stream bus that carries only what you want streamed, wired
-to every capture instance by port id. Point a spare bus at the `bb_stream` null
+to every capture instance by port id. Point a spare bus at the `betterbanana_stream` null
 sink and route the strips you want shared to it:
 
-    bb-ctl route out A3 bb_stream     # A3 becomes the stream bus
+    bb-ctl route out A3 betterbanana_stream     # A3 becomes the stream bus
     bb-ctl strip 1 bus A3 1           # game / app audio -> stream
     bb-ctl strip 3 bus A3 1           # music -> stream
 
@@ -389,7 +389,7 @@ sink and route the strips you want shared to it:
 | A3 | apps and music, no AUX | your viewers |
 
 The guard discovers the stream bus rather than assuming it: whichever bus you
-have assigned to `bb_stream` is the one it feeds to Discord, and every other bus
+have assigned to `betterbanana_stream` is the one it feeds to Discord, and every other bus
 is kept out. If you never set one up it still runs, and still stops the buses
 carrying AUX from reaching Discord — so the echo cannot happen either way.
 
@@ -404,7 +404,7 @@ Two things that look like routing faults and are not:
 - **The stream bus can vanish.** A null sink with nothing playing gets suspended
   as idle, and that takes BetterBanana's bus node down with it — the stream then
   goes silent until something restarts the chain. The shipped
-  `99-bb-stream.conf` disables suspend for `bb_stream`, and the guard re-creates
+  `99-bb-stream.conf` disables suspend for `betterbanana_stream`, and the guard re-creates
   the bus if it disappears anyway.
 
 ## Control from the shell
