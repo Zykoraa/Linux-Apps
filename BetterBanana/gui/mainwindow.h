@@ -197,6 +197,8 @@ private:
         QString      app;                       // key the saved rule is stored under
         QLabel*      name = nullptr;
         QComboBox*   target = nullptr;
+        QString      extra;                     // placeholder shown when the
+                                                // live target is not in the list
         class QPushButton* forget = nullptr;    // shown only while a rule exists
         QWidget*     holder = nullptr;
     };

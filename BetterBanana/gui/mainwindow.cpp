@@ -1158,13 +1158,30 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
         row->forget->setToolTip(rule.isEmpty()
             ? QString()
             : QString("Auto-routed to %1 whenever it starts.\nClick to forget the rule.").arg(rule));
-        if (row->target->count() != devIds.size() && !row->target->view()->isVisible()) {
+        // A stream whose current target is not one of the offered entries used
+        // to leave the combo sitting on its first item, reading as a route that
+        // does not exist -- and one stray click there would save a rule saying
+        // so. Two ways in: the session manager is not routing the stream at all
+        // (source/sink is PW_ID_ANY, as for Discord's screen-share capture,
+        // which bb-stream-guard wires by port id), or the target is real but
+        // deliberately absent from the list, like the capture-only stream bus.
+        // Name the actual state instead, on an entry that carries no id, so
+        // picking it moves nothing and remembers nothing.
+        const QString extra = devIds.contains(s.target)
+            ? QString()
+            : (s.target.isEmpty() ? QStringLiteral("- not routed by BetterBanana -")
+                                  : s.target + "  (not selectable here)");
+        const int wantCount = devIds.size() + (extra.isEmpty() ? 0 : 1);
+        if (!row->target->view()->isVisible()
+            && (row->target->count() != wantCount || row->extra != extra)) {
+            row->extra = extra;
             row->target->clear();
+            if (!extra.isEmpty()) row->target->addItem(extra, QString());
             for (int i = 0; i < devIds.size(); ++i)
                 row->target->addItem(devLabels.value(i), devIds.at(i));
         }
         if (!row->target->view()->isVisible()) {
-            const int want = row->target->findData(s.target);
+            const int want = extra.isEmpty() ? row->target->findData(s.target) : 0;
             if (want >= 0 && want != row->target->currentIndex())
                 row->target->setCurrentIndex(want);
         }
