@@ -24,7 +24,7 @@ SND_LD   := $(shell pkg-config --libs sndfile)
 
 .PHONY: all engine gui ctl tests clean run install install-system check-deps dist
 
-all: engine ctl tests
+all: engine gui ctl tests
 
 VERSION := 0.1.0
 DISTNAME := betterbanana-$(VERSION)
