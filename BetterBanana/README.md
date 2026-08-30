@@ -203,6 +203,39 @@ changes made outside the app, and there is a shell equivalent:
     bb-ctl autostart engine off
     bb-ctl autostart gui on
 
+## The watchdog
+
+The engine's worst failure is not a crash. When the PipeWire graph is torn down
+underneath it, the engine keeps running — same PID, heartbeat still ticking — so
+`bb-ctl status` answers, `systemctl` reports the unit active, and every check you
+would think to make says the mixer is fine. Its nodes are simply gone from the
+graph. No audio moves and nothing notices.
+
+`bb-health` watches the only thing that settles it: whether the engine's nodes
+are actually in the graph. When they are not, it restarts the engine and puts
+your configuration back.
+
+    systemctl --user status betterbanana-health
+    journalctl --user -u betterbanana-health -f
+
+It keeps its own config snapshot (`~/.config/betterbanana/lastgood.bbp`), taken
+whenever the mixer looks healthy, rather than trusting `autosave.bbp` — autosave
+is only written when the GUI exits, so it may be stale or hold a preset you
+loaded once and forgot. Your default sink and source are recorded alongside it,
+because a PipeWire restart resets those and they are normally `bb_vaio` and
+`bb_b1`; losing them quietly sends every application to the wrong device.
+
+Repairs are rate-limited and give up after a few consecutive failures, so an
+engine that is genuinely broken produces a loud log instead of a restart loop.
+Snapshots are only taken while the mixer is healthy, so a bad state never
+overwrites a good one.
+
+To save or restore config yourself at any time:
+
+    bb-ctl preset save <name|path>
+    bb-ctl preset load <name|path>
+    bb-ctl preset list
+
 ## If PipeWire restarts
 
 Restarting PipeWire — or a package update doing it for you — destroys every node

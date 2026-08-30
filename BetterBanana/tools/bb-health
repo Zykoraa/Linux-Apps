@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Watchdog for the BetterBanana engine: notice when the mixer has silently died.
+
+The engine's failure mode is not a crash -- it is worse than that. When the
+PipeWire graph is torn down underneath it (a PipeWire restart, a package update,
+a driver reload) the engine keeps running: same PID, heartbeat still ticking, so
+`bb-ctl status` answers happily and systemd still reports the unit active. Its
+nodes are simply gone from the graph. Nothing is wrong except that no audio moves
+anywhere, and nothing in the system notices.
+
+This checks the only thing that actually matters -- are the engine's nodes really
+in the PipeWire graph -- and repairs the mixer when they are not, whatever the
+cause:
+
+    nodes missing -> restart the engine -> restore the last known-good config
+
+The restore matters because a restarted engine loads autosave.bbp, which is only
+written when the GUI exits, and may be stale or hold a preset you loaded once and
+forgot. This keeps its own snapshot instead, taken via `bb-ctl preset save`
+whenever the mixer looks healthy, so a repair puts back what you were actually
+using rather than whatever autosave happened to contain.
+
+Default sink and source are snapshotted too. A PipeWire restart resets them, and
+because they are usually bb_vaio and bb_b1, losing them quietly sends every
+application to the wrong device.
+
+Repairs are rate-limited and give up after a few consecutive failures, so a
+genuinely broken engine produces a loud log rather than a restart loop.
+
+Environment:
+    BB_HEALTH_INTERVAL     seconds between checks           (default 5)
+    BB_HEALTH_SNAPSHOT     seconds between snapshots        (default 60)
+    BB_HEALTH_COOLDOWN     min seconds between repairs      (default 60)
+    BB_HEALTH_MAX_REPAIRS  consecutive failures before backoff (default 4)
+    BB_HEALTH_BBCTL        path to bb-ctl
+    BB_HEALTH_STATE        snapshot path
+"""
+import os
+import subprocess
+import sys
+import time
+
+INTERVAL = float(os.environ.get("BB_HEALTH_INTERVAL", "5"))
+SNAP_EVERY = float(os.environ.get("BB_HEALTH_SNAPSHOT", "60"))
+COOLDOWN = float(os.environ.get("BB_HEALTH_COOLDOWN", "60"))
+MAX_REPAIRS = int(os.environ.get("BB_HEALTH_MAX_REPAIRS", "4"))
+BBCTL = os.environ.get("BB_HEALTH_BBCTL", os.path.expanduser("~/.local/bin/bb-ctl"))
+CONFIG_DIR = os.path.expanduser("~/.config/betterbanana")
+STATE = os.environ.get("BB_HEALTH_STATE", os.path.join(CONFIG_DIR, "lastgood.bbp"))
+DEFAULTS = os.path.join(CONFIG_DIR, "lastgood-defaults")
+UNIT = "betterbanana-engine.service"
+
+# Virtual endpoints the engine always publishes, regardless of how the user has
+# routed things. Bus nodes (bb_a1..) are deliberately excluded: they only exist
+# while that bus has a device assigned, so their absence is not a fault.
+REQUIRED_SINKS = ("bb_vaio", "bb_aux", "bb_cable1")
+REQUIRED_SOURCES = ("bb_b1", "bb_b2")
+
+
+def log(msg):
+    print(f"bb-health: {msg}", flush=True)
+
+
+def run(*args, timeout=15):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        log(f"command {args[0]} failed: {e}")
+        return None
+
+
+def out(*args):
+    r = run(*args)
+    return r.stdout if r else ""
+
+
+def engine_enabled():
+    r = run("systemctl", "--user", "is-active", UNIT)
+    return bool(r) and r.stdout.strip() == "active"
+
+
+def graph_alive():
+    """True if PipeWire is answering at all -- distinguishes 'engine is broken'
+    from 'the whole audio stack is down or still starting'."""
+    return bool(out("pactl", "info").strip())
+
+
+def nodes_present():
+    sinks = {l.split()[1] for l in out("pactl", "list", "sinks", "short").splitlines() if len(l.split()) > 1}
+    srcs = {l.split()[1] for l in out("pactl", "list", "sources", "short").splitlines() if len(l.split()) > 1}
+    missing = [n for n in REQUIRED_SINKS if n not in sinks]
+    missing += [n for n in REQUIRED_SOURCES if n not in srcs]
+    return missing
+
+
+def snapshot(last_status):
+    """Save config if it looks healthy and has changed since the last snapshot."""
+    status = out(BBCTL, "status")
+    if not status.strip() or status == last_status:
+        return last_status
+    r = run(BBCTL, "preset", "save", STATE)
+    if not r or r.returncode != 0:
+        return last_status
+    sink = out("pactl", "get-default-sink").strip()
+    source = out("pactl", "get-default-source").strip()
+    if sink and source:
+        try:
+            with open(DEFAULTS, "w") as f:
+                f.write(f"{sink}\n{source}\n")
+        except OSError as e:
+            log(f"could not write defaults: {e}")
+    return status
+
+
+def restore():
+    if os.path.exists(STATE):
+        r = run(BBCTL, "preset", "load", STATE)
+        log("restored last known-good config" if r and r.returncode == 0
+            else "could not restore config snapshot")
+    else:
+        log("no config snapshot yet; engine kept whatever autosave held")
+
+    try:
+        with open(DEFAULTS) as f:
+            sink, source = [l.strip() for l in f.read().splitlines()[:2]]
+        if sink:
+            run("pactl", "set-default-sink", sink)
+        if source:
+            run("pactl", "set-default-source", source)
+        log(f"restored defaults: sink={sink} source={source}")
+    except (OSError, ValueError):
+        pass
+
+
+def repair(missing):
+    log(f"engine nodes missing from the graph: {', '.join(missing)} - restarting engine")
+    r = run("systemctl", "--user", "restart", UNIT, timeout=45)
+    if not r or r.returncode != 0:
+        log("engine restart FAILED")
+        return False
+    # Give the engine time to publish its nodes before judging the result.
+    for _ in range(12):
+        time.sleep(1)
+        if not nodes_present():
+            restore()
+            log("engine recovered")
+            return True
+    log("engine restarted but its nodes did not come back")
+    return False
+
+
+def main():
+    last_status = ""
+    last_snap = 0.0
+    last_repair = 0.0
+    failures = 0
+    missing_streak = 0
+
+    while True:
+        try:
+            if engine_enabled() and graph_alive():
+                missing = nodes_present()
+
+                if missing:
+                    # One bad reading proves nothing: the graph is briefly
+                    # inconsistent while devices come and go.
+                    missing_streak += 1
+                else:
+                    missing_streak = 0
+                    if failures:
+                        log("engine healthy again")
+                    failures = 0
+                    now = time.time()
+                    if now - last_snap >= SNAP_EVERY:
+                        last_snap = now
+                        last_status = snapshot(last_status)
+
+                if missing_streak >= 2:
+                    now = time.time()
+                    if failures >= MAX_REPAIRS:
+                        # Stop hammering something that is genuinely broken.
+                        if now - last_repair >= COOLDOWN * 10:
+                            failures = 0
+                    elif now - last_repair >= COOLDOWN:
+                        last_repair = now
+                        missing_streak = 0
+                        if repair(missing):
+                            failures = 0
+                        else:
+                            failures += 1
+                            if failures >= MAX_REPAIRS:
+                                log(f"giving up after {failures} failed repairs - "
+                                    f"backing off. Check: journalctl --user -u {UNIT}")
+        except Exception as e:
+            log(f"unexpected error: {e}")
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+[Unit]
+Description=betterbanana engine watchdog
+Documentation=https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana
+After=pipewire.service pipewire-pulse.service betterbanana-engine.service
+Wants=pipewire.service
+# Deliberately NOT PartOf=pipewire.service: this is what repairs the engine after
+# the graph is torn down, so it has to outlive that event rather than restart
+# alongside it.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bb-health
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target
