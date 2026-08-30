@@ -4,6 +4,12 @@ Documentation=https://github.com/local/betterbanana
 # PipeWire must be up first: the engine publishes its nodes into that graph.
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service
+# Restarting PipeWire destroys every node in the graph, including this engine's.
+# The engine does not reconnect and does not exit either -- it keeps running with
+# its heartbeat ticking while the mixer has silently vanished from the graph, so
+# Restart=on-failure never fires. PartOf ties it to PipeWire's lifecycle: restart
+# PipeWire and the engine restarts with it, rebuilding its nodes.
+PartOf=pipewire.service
 
 [Service]
 Type=simple

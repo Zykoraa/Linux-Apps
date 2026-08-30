@@ -203,6 +203,35 @@ changes made outside the app, and there is a shell equivalent:
     bb-ctl autostart engine off
     bb-ctl autostart gui on
 
+## If PipeWire restarts
+
+Restarting PipeWire — or a package update doing it for you — destroys every node
+in the graph, the engine's included. The engine does not reconnect, and it does
+not exit either: it keeps running with its heartbeat ticking, so `bb-ctl status`
+still answers and the service still reads `active` while the mixer has silently
+disappeared from the graph. Nothing looks wrong except that no audio moves.
+
+The shipped unit sets `PartOf=pipewire.service`, so systemd restarts the engine
+whenever PipeWire restarts and the nodes come back on their own. If you are
+running an older install, or the engine ends up in this state anyway:
+
+    systemctl --user restart betterbanana-engine
+
+A PipeWire restart also resets things outside BetterBanana that it cannot restore
+for you — card profiles, and your default sink and source:
+
+    pactl set-card-profile <card> <profile>
+    pactl set-default-sink bb_vaio
+    pactl set-default-source bb_b1
+
+Bluetooth headsets are worth watching here. They offer either high-quality
+stereo playback (A2DP) or the mono headset profile with a microphone, never both
+at once. If anything claims the headset's mic — including assigning it to a
+strip — the device drops to the headset profile and everything you hear through
+it turns tinny and mono. Set your defaults back first, then reconnect it:
+
+    bluetoothctl disconnect <mac> && sleep 4 && bluetoothctl connect <mac>
+
 ## Keyboard shortcuts
 
 `packaging/` is wired into Hyprland via `~/.config/hypr/config/betterbanana.lua`:
