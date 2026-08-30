@@ -1,0 +1,21 @@
+# makepkg build artifacts
+pkg/
+src/
+*.pkg.tar.*
+*.tar.zst
+
+# Python
+__pycache__/
+*.py[cod]
+
+# compiled payloads / runtime artifacts
+*.so
+glory_injected.log
+
+# personal image (may be copyrighted — add your own locally)
+netanyahu.jpg
+
+# editor / OS cruft
+*.swp
+.DS_Store
+Thumbs.db

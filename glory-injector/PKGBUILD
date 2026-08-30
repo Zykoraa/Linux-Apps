@@ -1,0 +1,42 @@
+# Maintainer: ltyndall164 <ltyndall164@gmail.com>
+pkgname=glory-injector
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Themed shared-object (.so) injector for running processes (gdb/dlopen)"
+arch=('any')
+license=('custom')
+depends=('python' 'tk' 'gdb')
+optdepends=('hyprland: Applications tab (window list via hyprctl)'
+            'python-pillow: Netanyahu button image'
+            'polkit: elevate gdb via pkexec when not run as root')
+source=('glory_injector_linux.py'
+        'glory-injector'
+        'glory-injector.desktop'
+        'glory-injector.svg'
+        'payload_example.c')
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+package() {
+    cd "$srcdir"
+
+    # Application code + example payload
+    install -Dm644 glory_injector_linux.py \
+        "$pkgdir/usr/share/$pkgname/glory_injector_linux.py"
+    install -Dm644 payload_example.c \
+        "$pkgdir/usr/share/$pkgname/payload_example.c"
+
+    # Launcher on PATH (its ../share/$pkgname lookup finds the app)
+    install -Dm755 glory-injector "$pkgdir/usr/bin/$pkgname"
+
+    # Desktop entry (Exec/Icon by name resolve system-wide)
+    install -Dm644 glory-injector.desktop \
+        "$pkgdir/usr/share/applications/$pkgname.desktop"
+
+    # Scalable icon
+    install -Dm644 glory-injector.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+}

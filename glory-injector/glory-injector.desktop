@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Glory Injector
+GenericName=Shared-object injector
+Comment=Inject .so libraries into running processes (gdb/dlopen)
+Exec=glory-injector
+Icon=glory-injector
+Terminal=false
+Categories=Development;Utility;
+Keywords=inject;so;dll;dlopen;ptrace;gdb;hyprland;
+StartupNotify=true
+StartupWMClass=GloryInjector

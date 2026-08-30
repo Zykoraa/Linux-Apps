@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="gi-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#0a0e1a"/>
+    </linearGradient>
+    <linearGradient id="gi-star" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6aa0ff"/>
+      <stop offset="1" stop-color="#0038B8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52"
+        fill="url(#gi-bg)" stroke="#263050" stroke-width="4"/>
+  <circle cx="128" cy="128" r="94" fill="none"
+          stroke="#C9A84C" stroke-width="3" opacity="0.45"/>
+  <g fill="none" stroke="url(#gi-star)" stroke-width="12" stroke-linejoin="round">
+    <polygon points="128,50 60.45,167 195.55,167"/>
+    <polygon points="128,206 60.45,89 195.55,89"/>
+  </g>
+</svg>

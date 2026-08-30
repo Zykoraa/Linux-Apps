@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Glory Injector launcher — locates and runs the app with the right Python.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF")"
+
+# Search order: env override, user install dir, next to this script, sibling share dir
+CANDIDATES=(
+    "${GLORY_DIR:-}"
+    "$HOME/.local/share/glory-injector"
+    "$SELF_DIR"
+    "$SELF_DIR/../share/glory-injector"
+)
+
+APP=""
+for d in "${CANDIDATES[@]}"; do
+    if [ -n "$d" ] && [ -f "$d/glory_injector_linux.py" ]; then
+        APP="$d/glory_injector_linux.py"
+        break
+    fi
+done
+
+if [ -z "$APP" ]; then
+    echo "glory-injector: cannot find glory_injector_linux.py" >&2
+    echo "  set GLORY_DIR to the folder containing it, or run install.sh" >&2
+    exit 1
+fi
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+    echo "glory-injector: python not found (install: sudo pacman -S python)" >&2
+    exit 1
+fi
+
+exec "$PY" "$APP" "$@"

@@ -1,0 +1,68 @@
+# Builds the Arch package inside an Arch container. When you push a version tag
+# (e.g. v1.0.0) it attaches the built .pkg.tar.zst to a GitHub Release; manual
+# runs just build it and upload it as a downloadable workflow artifact.
+#
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# Then any Arch/CachyOS PC can install the prebuilt package directly, e.g.:
+#   sudo pacman -U https://github.com/Zykoraa/Linux-Apps/releases/download/v1.0.0/glory-injector-1.0.0-1-any.pkg.tar.zst
+#
+# Monorepo note: if PKGBUILD lives in a subfolder, set PKG_DIR below to it.
+
+name: Glory Injector — Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG_DIR: glory-injector
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel git sudo
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create non-root build user
+        run: |
+          useradd -m builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Build package
+        working-directory: ${{ env.PKG_DIR }}
+        run: sudo -u builder makepkg -s --noconfirm
+
+      - name: Locate package
+        id: pkg
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          f="$(ls -1 *.pkg.tar.zst | head -n1)"
+          echo "file=${{ env.PKG_DIR }}/$f" >> "$GITHUB_OUTPUT"
+          echo "Built $f"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glory-injector-pkg
+          path: ${{ steps.pkg.outputs.file }}
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.file }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
