@@ -1,0 +1,22 @@
+-- BetterBanana mixer bindings for Hyprland (Lua config, not hyprlang).
+--
+-- Not installed automatically. To use it:
+--   cp betterbanana.lua.example ~/.config/hypr/config/betterbanana.lua
+--   echo 'require("config.betterbanana")' >> ~/.config/hypr/hyprland.lua
+-- Delete that file and the require() line to remove the binds again.
+--
+-- XF86AudioMicMute is deliberately left alone -- most desktop shells already
+-- bind it, and stealing it here would fight them.
+
+local mainMod = "SUPER"
+local home = os.getenv("HOME")
+local ctl = home .. "/.local/bin/bb-ctl "
+
+-- Mute/unmute the microphone strip (HARDWARE INPUT 1) without leaving your game.
+hl.bind(mainMod .. " + M", hl.dsp.exec_cmd(ctl .. "strip 0 mute toggle"), { locked = true })
+
+-- Toggle sidechain ducking (music steps back while you talk).
+hl.bind(mainMod .. " + SHIFT + M", hl.dsp.exec_cmd(ctl .. "duck toggle"), { locked = true })
+
+-- Bring up the mixer.
+hl.bind(mainMod .. " + SHIFT + V", hl.dsp.exec_cmd(home .. "/.local/bin/bb-gui"))

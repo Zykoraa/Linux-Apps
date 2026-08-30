@@ -79,9 +79,9 @@ Two things worth knowing when moving between machines:
   from another PC will come up with unassigned inputs and outputs. The engine
   falls back to matching a device by its description, which covers the same
   hardware on a different USB port, but not different hardware.
-- **The Hyprland keybindings are not part of the package.** Copy
-  `packaging/`-style binds yourself, or lift
-  `~/.config/hypr/config/betterbanana.lua` across.
+- **The Hyprland keybindings are not installed for you.** `install.sh` never
+  touches another app's config. `packaging/betterbanana.lua.example` is a
+  ready-made copy — see [Keyboard shortcuts](#keyboard-shortcuts).
 
 ## Install
 
@@ -282,7 +282,14 @@ it:
 
 ## Keyboard shortcuts
 
-`packaging/` is wired into Hyprland via `~/.config/hypr/config/betterbanana.lua`:
+`packaging/betterbanana.lua.example` binds the mixer to Hyprland. It is *not*
+installed by `install.sh`; drop it in yourself:
+
+    cp packaging/betterbanana.lua.example ~/.config/hypr/config/betterbanana.lua
+    echo 'require("config.betterbanana")' >> ~/.config/hypr/hyprland.lua
+
+That config is Lua-based, not hyprlang, so the binds use `hl.bind` and
+`hl.dsp.exec_cmd`. On a hyprlang setup, translate them into `bind = ` lines.
 
 | Key | Action |
 |---|---|
