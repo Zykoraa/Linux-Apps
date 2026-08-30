@@ -688,7 +688,12 @@ void VbanDialog::apply()
 // HiFi__Line__sink") are unreadable, so the lists show pactl's `description`
 // ("UMC202HD 192k Line A") and keep node.name only as the stored value.
 // ---------------------------------------------------------------------------
-struct DevEntry { QString id, label; };
+// The stream bus is a null sink: audio played into it is inaudible, because
+// nothing routes it back out. It is a legitimate BUS target (that is its whole
+// purpose) but never a place to send an application's playback.
+static const char* const kStreamSinkName = "betterbanana_stream";
+
+struct DevEntry { QString id, label; bool captureOnly = false; };
 
 static QString pactlRun(const QStringList& args)
 {
@@ -716,7 +721,13 @@ static QVector<DevEntry> listDevices(bool sinks, bool own)
         const bool ours = id.startsWith("bb_");
         const bool vbanIn = id.startsWith("bb_vban_in_");
         if (ours && !own && !vbanIn) continue;
-        v.append({ id, label });
+        // The property is authoritative; the name is the fallback, because
+        // PipeWire only re-reads pipewire.conf.d at startup and an existing
+        // install will not carry the property until it is restarted.
+        const bool captureOnly =
+            o.value("properties").toObject().value("betterbanana.capture-only").toString() == "true"
+            || id == QLatin1String(kStreamSinkName);
+        v.append({ id, label, captureOnly });
     }
     return v;
 }
@@ -963,6 +974,7 @@ static void listTargets(bool playback, QStringList& ids, QStringList& labels)
         ? QStringList{ "bb_vaio", "bb_aux", "bb_cable1", "bb_cable2", "bb_cable3" }
         : QStringList{ "bb_b1", "bb_b2" };
     for (const DevEntry& d : promote(listDevices(playback, true), prefer)) {
+        if (playback && d.captureOnly) continue;
         ids << d.id;
         labels << (prefer.contains(d.id) ? ("\u2192 " + d.label) : d.label);
     }
@@ -1534,6 +1546,13 @@ void MainWindow::refreshDevices()
 // per stream, so a manual move afterwards is respected.
 void MainWindow::applyAppRules()
 {
+    // A rule saved before the stream bus was excluded from the target list can
+    // still point at it, and re-applying that rule silences the app every time
+    // the mixer opens. Drop such a rule instead of honouring it.
+    QSet<QString> captureOnly;
+    for (const DevEntry& d : listDevices(true, true))
+        if (d.captureOnly) captureOnly.insert(d.id);
+
     QSet<int> seen;
     for (bool pb : { true, false }) {
         for (const StreamInfo& s : listStreams(pb)) {
@@ -1543,6 +1562,7 @@ void MainWindow::applyAppRules()
             m_ruledStreams.insert(key);
             const QString want = ruleFor(s.app, pb);
             if (want.isEmpty() || want == s.target) continue;
+            if (pb && captureOnly.contains(want)) { setRule(s.app, pb, QString()); continue; }
             pactlRun({ pb ? "move-sink-input" : "move-source-output",
                        QString::number(s.index), want });
         }
