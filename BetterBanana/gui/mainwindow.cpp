@@ -1111,6 +1111,7 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
             Row nr;
             nr.index = s.index;
             nr.playback = playback;
+            nr.app = s.app;
             nr.holder = new QWidget;
             auto* h = new QHBoxLayout(nr.holder);
             h->setContentsMargins(0, 0, 0, 0);
@@ -1131,14 +1132,32 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
                 // Remember it, so the app lands here again next time it plays.
                 setRule(app, pb, id);
             });
+            // A running app's saved rule is otherwise unreachable: the
+            // REMEMBERED list below deliberately skips apps that are live, so
+            // a bad rule would keep re-routing this stream with nothing in the
+            // UI to point at, let alone remove.
+            nr.forget = new QPushButton("Forget");
+            nr.forget->setFixedWidth(64);
+            nr.forget->hide();
+            connect(nr.forget, &QPushButton::clicked, this, [this, app, pb] {
+                setRule(app, pb, QString());
+                m_memShown.clear();
+                refresh();
+            });
             h->addWidget(nr.name, 0, Qt::AlignVCenter);
             h->addWidget(nr.target, 1, Qt::AlignVCenter);
+            h->addWidget(nr.forget, 0, Qt::AlignVCenter);
             lay->addWidget(nr.holder);
             m_rows.append(nr);
             row = &m_rows.last();
         }
 
         row->name->setText(s.label);
+        const QString rule = ruleFor(row->app, playback);
+        row->forget->setVisible(!rule.isEmpty());
+        row->forget->setToolTip(rule.isEmpty()
+            ? QString()
+            : QString("Auto-routed to %1 whenever it starts.\nClick to forget the rule.").arg(rule));
         if (row->target->count() != devIds.size() && !row->target->view()->isVisible()) {
             row->target->clear();
             for (int i = 0; i < devIds.size(); ++i)

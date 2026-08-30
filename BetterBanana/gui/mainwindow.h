@@ -194,8 +194,10 @@ private:
     struct Row {
         int          index = -1;
         bool         playback = true;
+        QString      app;                       // key the saved rule is stored under
         QLabel*      name = nullptr;
         QComboBox*   target = nullptr;
+        class QPushButton* forget = nullptr;    // shown only while a rule exists
         QWidget*     holder = nullptr;
     };
     void rebuild(bool playback, const QVector<struct StreamInfo>& streams,
