@@ -71,10 +71,12 @@ def parse_bus_row(line):
 
     A row is "<label> <gain> <mute> <mono> <eq> <device>", but both the label and
     the device may contain spaces ("(dont change)", "(virtual source)"), so anchor
-    on the one unambiguous part: a float followed by three integers.
+    on a float followed by three integers -- and take the LAST such block on the
+    line, not the first. A device name never contains one, but a bus label is free
+    to: naming a bus "0.0 0 0 0 x" would otherwise hijack the parse.
     """
     f = line.split()
-    for i in range(len(f) - 4):
+    for i in range(len(f) - 5, -1, -1):
         try:
             float(f[i])
             for j in (1, 2, 3):

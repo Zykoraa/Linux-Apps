@@ -56,10 +56,14 @@ def run(*args):
 
 
 def parse_bus_row(line):
-    """Device from one bus row, or None. Label and device may contain spaces, so
-    anchor on the numeric block: a float followed by three integers."""
+    """Device and label from one bus row, or None.
+
+    Label and device may both contain spaces, so anchor on a float followed by
+    three integers -- and take the LAST such block on the line. A device name
+    never contains one; a bus label is free to, and would otherwise hijack it.
+    """
     f = line.split()
-    for i in range(len(f) - 4):
+    for i in range(len(f) - 5, -1, -1):
         try:
             float(f[i])
             for j in (1, 2, 3):
