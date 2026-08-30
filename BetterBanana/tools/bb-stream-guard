@@ -66,12 +66,32 @@ def run(*args):
         return ""
 
 
+def parse_bus_row(line):
+    """Device name from one bus row, or None if the line is not a bus row.
+
+    A row is "<label> <gain> <mute> <mono> <eq> <device>", but both the label and
+    the device may contain spaces ("(dont change)", "(virtual source)"), so anchor
+    on the one unambiguous part: a float followed by three integers.
+    """
+    f = line.split()
+    for i in range(len(f) - 4):
+        try:
+            float(f[i])
+            for j in (1, 2, 3):
+                int(f[i + j])
+        except ValueError:
+            continue
+        return " ".join(f[i + 4:]).strip()
+    return None
+
+
 def mixer_state():
     """(aux_buses, stream_bus, all_buses) as node names, e.g. ({'bb_a1'}, 'bb_a3')."""
     text = run(BBCTL, "status")
     aux_buses, stream_bus, section = set(), None, None
     all_buses = set()
     strip_rows = []
+    bus_rows = []
 
     for line in text.splitlines():
         head = line.split()[:1]
@@ -89,12 +109,19 @@ def mixer_state():
             if m:
                 strip_rows.append(m.groups())
         elif section == "bus":
-            f = line.split()
-            # A1  <gain> <mute> <mono> <eq> <device...>
-            if len(f) >= 6 and re.fullmatch(r"A[1-9]", f[0]):
-                all_buses.add(f"bb_a{f[0][1:]}")
-                if " ".join(f[5:]).strip() == STREAM_SINK:
-                    stream_bus = f"bb_a{f[0][1:]}"
+            row = parse_bus_row(line)
+            if row is None:
+                continue
+            bus_rows.append(row)
+
+    # Buses print in a fixed order -- A1 A2 A3 B1 B2 -- and only the A buses can
+    # carry a device. Position is the only reliable identifier: the first column
+    # holds the bus LABEL, which the user is free to rename, so matching on "A1"
+    # finds nothing the moment anyone renames a bus.
+    for i, dev in enumerate(bus_rows[:3], start=1):
+        all_buses.add(f"bb_a{i}")
+        if dev == STREAM_SINK:
+            stream_bus = f"bb_a{i}"
 
     if len(strip_rows) > AUX_STRIP_INDEX:
         for i, flag in enumerate(strip_rows[AUX_STRIP_INDEX], start=1):

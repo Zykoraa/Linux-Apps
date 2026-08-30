@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""bb-stream-setup - configure the stream bus for Discord screen sharing.
+
+Screen sharing needs one output bus pointed at the stream sink, and the strips
+you want viewers to hear routed to it. Doing that by hand is three or four
+bb-ctl commands and one easy mistake -- routing AUX to the stream bus, which
+makes everyone in the call hear themselves echoed.
+
+This does it in one command, and refuses to make the mistake:
+
+    bb-stream-setup              # set it up (or report it is already set up)
+    bb-stream-setup --dry-run    # show what it would do, change nothing
+    bb-stream-setup --bus-only   # claim the bus, leave strip routing alone
+
+It is safe to re-run. It never reassigns a bus that already has a device, never
+routes the AUX strip, and never overwrites a bus label you chose yourself.
+
+Options:
+    --bus A1|A2|A3   use this bus instead of picking a free one
+    --sink NAME      stream sink name (default betterbanana_stream)
+    --bus-only       do not touch strip routing
+    --dry-run        print the commands instead of running them
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+DEFAULT_SINK = "betterbanana_stream"
+# The AUX strip carries the voices of the people in your call. Routing it to the
+# stream bus is the one configuration that breaks a stream for everyone else.
+AUX_STRIP = 4
+# The VAIO strip is the virtual sink applications play into.
+VAIO_STRIP = 3
+ROUTING_RE = re.compile(r"\bA1([-*])\s+A2([-*])\s+A3([-*])\s+B1[-*]\s+B2[-*]")
+UNSET = ("(unassigned)", "-", "")
+
+
+def die(msg, hint=""):
+    print(f"error: {msg}", file=sys.stderr)
+    if hint:
+        print(hint, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def bbctl_path():
+    return (os.environ.get("BB_SETUP_BBCTL")
+            or shutil.which("bb-ctl")
+            or os.path.expanduser("~/.local/bin/bb-ctl"))
+
+
+def run(*args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=15).stdout
+
+
+def parse_bus_row(line):
+    """Device from one bus row, or None. Label and device may contain spaces, so
+    anchor on the numeric block: a float followed by three integers."""
+    f = line.split()
+    for i in range(len(f) - 4):
+        try:
+            float(f[i])
+            for j in (1, 2, 3):
+                int(f[i + j])
+        except ValueError:
+            continue
+        return " ".join(f[i + 4:]).strip(), " ".join(f[:i]).strip()
+    return None
+
+
+def mixer_state(bbctl):
+    """(bus rows for A1..A3, [(routing flags, source)] per strip)."""
+    text = run(bbctl, "status")
+    if "STRIP" not in text:
+        die("the engine is not responding.",
+            "  Start it with:  systemctl --user start betterbanana-engine")
+    section, buses, strips = None, [], []
+    for line in text.splitlines():
+        head = line.split()[:1]
+        if head == ["STRIP"]:
+            section = "strip"
+            continue
+        if head == ["BUS"]:
+            section = "bus"
+            continue
+        if not line.strip():
+            if section == "bus" and buses:
+                section = None      # the bus table ended; ignore what follows
+            continue
+        if section == "strip":
+            m = ROUTING_RE.search(line)
+            if m:
+                src = line.split("<-", 1)[1].strip() if "<-" in line else ""
+                strips.append((m.groups(), src))
+        elif section == "bus":
+            row = parse_bus_row(line)
+            if row:
+                buses.append(row)
+    return buses[:3], strips
+
+
+def sink_exists(name):
+    return any(f.split("\t")[:2][1:] == [name]
+               for f in run("pactl", "list", "sinks", "short").splitlines()
+               if "\t" in f)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
+    ap.add_argument("--bus", choices=["A1", "A2", "A3"])
+    ap.add_argument("--sink", default=DEFAULT_SINK)
+    ap.add_argument("--bus-only", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    bbctl = bbctl_path()
+    if not os.access(bbctl, os.X_OK):
+        die(f"bb-ctl not found at {bbctl}", "  Set BB_SETUP_BBCTL to its path.")
+
+    if not sink_exists(args.sink):
+        die(f'the stream sink "{args.sink}" does not exist yet.',
+            "  It is created by ~/.config/pipewire/pipewire.conf.d/99-bb-stream.conf,\n"
+            "  which PipeWire only reads at startup. Log out and back in, then\n"
+            "  re-run this. Nothing has been changed.")
+
+    buses, strips = mixer_state(bbctl)
+    if len(buses) < 3:
+        die("could not read the bus table from 'bb-ctl status'.")
+
+    devices = [d for d, _ in buses]
+    labels = [l for _, l in buses]
+
+    def do(*cmd):
+        print("   ", " ".join(cmd))
+        if not args.dry_run:
+            run(*cmd)
+
+    # ---------------------------------------------------------- pick the bus --
+    already = next((i for i, d in enumerate(devices) if d == args.sink), None)
+    if already is not None:
+        idx = already
+        print(f"Stream bus is already A{idx + 1} -> {args.sink}")
+    else:
+        if args.bus:
+            idx = int(args.bus[1]) - 1
+            if devices[idx] not in UNSET:
+                die(f'{args.bus} already outputs to "{devices[idx]}".',
+                    "  Free it first, or choose a different bus.")
+        else:
+            # Prefer the highest free bus: A1 is conventionally the one you listen to.
+            idx = next((i for i in (2, 1, 0) if devices[i] in UNSET), None)
+            if idx is None:
+                die("every output bus already has a device.",
+                    "  Free one, or pass --bus A1|A2|A3 to say which to use.")
+        print(f"Claiming A{idx + 1} as the stream bus -> {args.sink}")
+        do(bbctl, "route", "out", f"A{idx + 1}", args.sink)
+        # Only name it if the user has not named it themselves.
+        if labels[idx] in (f"A{idx + 1}", ""):
+            do(bbctl, "label", "bus", f"A{idx + 1}", "STREAM")
+
+    stream_bus = f"A{idx + 1}"
+
+    # ------------------------------------------------------- route the strips --
+    if args.bus_only:
+        print("\n--bus-only: strip routing left alone.")
+    else:
+        # Route application audio only. Copying "everything you hear" looks
+        # tempting but is wrong: your own microphone is usually monitored on the
+        # listening bus, and Discord already sends it as your voice -- viewers
+        # would hear you twice. So take the VAIO strip and any strip fed by a
+        # virtual cable, and leave physical inputs and AUX alone.
+        print(f"\nRouting application audio to {stream_bus}:")
+        changed = False
+        for i, (flags, src) in enumerate(strips):
+            if i == AUX_STRIP:
+                continue
+            is_vaio = (i == VAIO_STRIP)
+            is_cable = "cable" in src.lower()
+            if not (is_vaio and not src) and not is_cable:
+                continue            # a physical input, or an unassigned strip
+            if flags[idx] == "*":
+                continue            # already routed
+            do(bbctl, "strip", str(i), "bus", stream_bus, "1")
+            changed = True
+        if not changed:
+            print("    (nothing to add - already routed)")
+        print("\n  Microphones are not routed: Discord already sends your voice, "
+              "and viewers\n  would otherwise hear it twice. Add anything else "
+              f"yourself with:\n      bb-ctl strip <i> bus {stream_bus} 1")
+
+        if len(strips) > AUX_STRIP and strips[AUX_STRIP][0][idx] == "*":
+            print(f"\n  !! AUX is routed to {stream_bus}. Everyone in your call "
+                  "would hear themselves.\n     Removing it:")
+            do(bbctl, "strip", str(AUX_STRIP), "bus", stream_bus, "0")
+
+    if args.dry_run:
+        print("\n--dry-run: nothing was changed.")
+        return
+
+    print(f"\nDone. {stream_bus} feeds \"{args.sink}\"; bb-stream-guard attaches it "
+          "to Discord's\ncapture whenever you share your screen. Check it with: "
+          "bb-ctl status")
+
+
+if __name__ == "__main__":
+    main()

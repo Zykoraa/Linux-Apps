@@ -429,14 +429,29 @@ transmitted to viewers. `pw-link` matches ports by name, so linking a bus to
 evening: the routing is correct, the meters move, and your friends hear nothing.
 
 The fix is a dedicated stream bus that carries only what you want streamed, wired
-to every capture instance by port id. Point a spare bus at the `betterbanana_stream` null
-sink and route the strips you want shared to it:
+to every capture instance by port id. One command sets that up:
+
+    bb-stream-setup
+
+It claims a free output bus, points it at the `betterbanana_stream` null sink, and
+routes your application audio — the VAIO strip and anything fed by a virtual
+cable — to it. Microphones are left out on purpose: Discord already sends your
+voice, so streaming it as well means viewers hear you twice. AUX is never
+routed, and if it already was, the tool removes it.
+
+It is safe to re-run, it never takes a bus that already has a device, and
+`--dry-run` shows what it would do without touching anything. To do it by hand
+instead:
 
     bb-ctl route out A3 betterbanana_stream     # A3 becomes the stream bus
     bb-ctl strip 1 bus A3 1           # game / app audio -> stream
     bb-ctl strip 3 bus A3 1           # music -> stream
 
 **Never route AUX to the stream bus.** That is the echo, straight back.
+
+`bb-stream-setup` will refuse to run until `betterbanana_stream` exists. That
+sink comes from `99-bb-stream.conf`, and PipeWire only reads its configuration at
+startup — so on a fresh install, log out and back in first.
 
 | Bus | Carries | Who hears it |
 |---|---|---|
@@ -461,6 +476,52 @@ Two things that look like routing faults and are not:
   goes silent until something restarts the chain. The shipped
   `99-bb-stream.conf` disables suspend for `betterbanana_stream`, and the guard re-creates
   the bus if it disappears anyway.
+
+## Troubleshooting
+
+### An app plays into the wrong device, and changing its setting does nothing
+
+Two separate things decide where an application's audio goes: the device picked
+inside the app, and the device WirePlumber remembers for that app. **The
+remembered one wins.** If they disagree, the app asks politely for the right
+sink on every new stream and is dragged back to the old one — so changing the
+setting inside the app appears to do nothing at all, and the change seems to
+"not stick" across restarts.
+
+This is worth recognising quickly, because it looks exactly like a mixer fault:
+the strip is configured correctly, unmuted, and reads nothing.
+
+Compare what the app asked for against where it ended up:
+
+    pactl list sink-inputs | grep -E 'Sink:|target.object|application.name'
+
+`target.object` is the app's request; `Sink:` is where it actually is. Map the
+sink number with `pactl list sinks short`. If the two disagree, WirePlumber's
+saved state is overriding the app.
+
+The fix is to move the stream **while it is playing** — that updates the app and
+WirePlumber's memory together, where changing the setting in the app only does
+the first:
+
+    pactl move-sink-input <id> bb_aux
+
+Any volume mixer's "move to another device" does the same thing. WirePlumber
+persists the new target within a few seconds; its state lives in
+`~/.local/state/wireplumber/stream-properties`, but editing that by hand is
+pointless while WirePlumber is running — it rewrites the file itself.
+
+### Discord's voice is inaudible
+
+Usually the above, with Discord's output landing on the stream sink instead of
+`bb_aux`. Audio played into `betterbanana_stream` is heard only by the people
+watching your screen share, never by you — and if it is Discord's own output,
+everyone in the call hears themselves. Point Discord's output at **BetterBanana
+AUX**, and check with the `pactl` command above that it actually went there.
+
+### A newly installed sink or source does not exist
+
+PipeWire reads `~/.config/pipewire/pipewire.conf.d/*.conf` only at startup. A
+freshly installed `99-bb-stream.conf` has no effect until you log out and back in.
 
 ## Control from the shell
 
