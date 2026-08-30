@@ -259,11 +259,26 @@ for you — card profiles, and your default sink and source:
 
 Bluetooth headsets are worth watching here. They offer either high-quality
 stereo playback (A2DP) or the mono headset profile with a microphone, never both
-at once. If anything claims the headset's mic — including assigning it to a
-strip — the device drops to the headset profile and everything you hear through
-it turns tinny and mono. Set your defaults back first, then reconnect it:
+at once, and everything you hear through the headset profile is tinny and mono.
+
+WirePlumber switches to that profile automatically whenever an application starts
+recording — and the engine is always recording, so a mixer plus Bluetooth
+headphones means the switch fires constantly. If your microphone is a separate
+interface and you never want the headset's mic, turn it off once:
+
+    wpctl settings --save bluetooth.autoswitch-to-headset-profile false
+
+Assigning the headset's own microphone to a strip has the same effect and will
+override this, so leave that strip unassigned unless you really want the mono
+profile.
+
+After a PipeWire restart the headset often reconnects offering only HSP/HFP —
+A2DP is not in the profile list at all, so setting the profile fails with "No
+such entity". Renegotiate it with a full reconnect, then point the bus back at
+it:
 
     bluetoothctl disconnect <mac> && sleep 4 && bluetoothctl connect <mac>
+    bb-ctl route out A2 bluez_output.<mac>.1
 
 ## Keyboard shortcuts
 
