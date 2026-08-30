@@ -327,6 +327,57 @@ Note the two named from the mixer's point of view: VAIO and AUX are inputs *to
 the mixer*, so applications list them as **playback** devices. The only things
 you record *from* are `bb_b1` and `bb_b2`.
 
+### Screen sharing on Discord
+
+Sharing your screen while running a mixer breaks in two ways that are invisible
+from Discord's UI. `bb-stream-guard` — installed and enabled for you — fixes
+both, but it is worth knowing what it is doing.
+
+**Everyone hears themselves.** Discord's screen-share capture auto-links to
+every `bb_a*` output bus it can find. Your monitoring buses carry the AUX strip,
+so the voices of the people you are talking to get folded straight back into
+your stream and each of them hears their own echo.
+
+**Audio that is routed perfectly is still silent.** Discord runs *several* nodes
+all named `discord_capture` — four is normal — and only one is actually
+transmitted to viewers. `pw-link` matches ports by name, so linking a bus to
+"discord_capture" hits an instance at random. This is the one that wastes an
+evening: the routing is correct, the meters move, and your friends hear nothing.
+
+The fix is a dedicated stream bus that carries only what you want streamed, wired
+to every capture instance by port id. Point a spare bus at the `bb_stream` null
+sink and route the strips you want shared to it:
+
+    bb-ctl route out A3 bb_stream     # A3 becomes the stream bus
+    bb-ctl strip 1 bus A3 1           # game / app audio -> stream
+    bb-ctl strip 3 bus A3 1           # music -> stream
+
+**Never route AUX to the stream bus.** That is the echo, straight back.
+
+| Bus | Carries | Who hears it |
+|---|---|---|
+| A1 / A2 | everything, AUX included | you |
+| A3 | apps and music, no AUX | your viewers |
+
+The guard discovers the stream bus rather than assuming it: whichever bus you
+have assigned to `bb_stream` is the one it feeds to Discord, and every other bus
+is kept out. If you never set one up it still runs, and still stops the buses
+carrying AUX from reaching Discord — so the echo cannot happen either way.
+
+    systemctl --user status betterbanana-stream-guard
+    journalctl --user -u betterbanana-stream-guard -f
+
+Two things that look like routing faults and are not:
+
+- **An app that goes quiet is often just paused.** Check `Corked:` in
+  `pactl list sink-inputs`. Games under Wine open a new stream per sound and cork
+  between them, so `-99.9 dB` on a strip can simply mean nothing is playing.
+- **The stream bus can vanish.** A null sink with nothing playing gets suspended
+  as idle, and that takes BetterBanana's bus node down with it — the stream then
+  goes silent until something restarts the chain. The shipped
+  `99-bb-stream.conf` disables suspend for `bb_stream`, and the guard re-creates
+  the bus if it disappears anyway.
+
 ## Control from the shell
 
     ./build/bb-ctl status

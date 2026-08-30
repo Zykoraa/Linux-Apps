@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Keep Discord's screen-share capture wired to the right BetterBanana bus.
+
+Two things go wrong when you share your screen on Discord while running a
+Voicemeeter-style mixer, and neither is obvious from the Discord UI.
+
+1. ECHO. Discord auto-links its capture to every bb_a* output bus it can see.
+   Those buses carry the AUX strip -- the voice of the people you are talking to
+   -- so everyone in the call hears themselves played back inside your stream.
+
+2. THE WRONG CAPTURE NODE. Discord runs SEVERAL nodes all named
+   "discord_capture" (four is common) and only one of them is actually
+   transmitted to viewers. `pw-link` matches ports by NAME, so linking
+   "bus -> discord_capture" picks an instance by luck. Audio can be perfectly
+   routed and still be inaudible because it landed on an idle instance.
+
+This daemon fixes both. Every couple of seconds it:
+
+  * drops links into discord_capture from any bus the AUX strip feeds (fixes 1),
+  * attaches your dedicated stream bus to EVERY discord_capture instance,
+    addressed by port id rather than by name (fixes 2),
+  * re-creates the stream bus if it vanished. A null sink with nothing playing
+    gets suspended as idle, which tears down BetterBanana's output node for that
+    bus; the stream then goes silent until something restarts the chain.
+
+The stream bus is discovered, not hardcoded: it is whichever A-bus you have
+assigned to the stream sink (default "bb_stream"). If no bus is assigned to it,
+stream-bus management stays off and only the echo protection runs -- so this is
+safe to enable even if you never share your screen.
+
+Set up the stream bus by pointing an unused bus at the null sink and routing the
+strips you want streamed to it, leaving AUX off it:
+
+    bb-ctl route out A3 bb_stream
+    bb-ctl strip <app-strip> bus A3 1
+
+Environment:
+    BB_GUARD_STREAM_SINK  sink that marks the stream bus   (default bb_stream)
+    BB_GUARD_BLOCK        override auto-detected bus block list, e.g. "bb_a1 bb_a2"
+    BB_GUARD_INTERVAL     poll seconds                     (default 2)
+    BB_GUARD_BBCTL        path to bb-ctl                   (default ~/.local/bin/bb-ctl)
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+
+STREAM_SINK = os.environ.get("BB_GUARD_STREAM_SINK", "bb_stream")
+BLOCK_OVERRIDE = os.environ.get("BB_GUARD_BLOCK", "").split()
+INTERVAL = float(os.environ.get("BB_GUARD_INTERVAL", "2"))
+BBCTL = os.environ.get("BB_GUARD_BBCTL", os.path.expanduser("~/.local/bin/bb-ctl"))
+
+TARGET = "discord_capture"
+CHANNELS = ("FL", "FR")
+ROUTING_RE = re.compile(r"\bA1([-*])\s+A2([-*])\s+A3([-*])\s+B1[-*]\s+B2[-*]")
+# The AUX strip is the virtual input Discord's voice output plays into. It is the
+# last strip BetterBanana exposes, and the one that must never reach the stream.
+AUX_STRIP_INDEX = 4
+
+
+def run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+
+def mixer_state():
+    """(aux_buses, stream_bus, all_buses) as node names, e.g. ({'bb_a1'}, 'bb_a3')."""
+    text = run(BBCTL, "status")
+    aux_buses, stream_bus, section = set(), None, None
+    all_buses = set()
+    strip_rows = []
+
+    for line in text.splitlines():
+        head = line.split()[:1]
+        if head == ["STRIP"]:
+            section = "strip"
+            continue
+        if head == ["BUS"]:
+            section = "bus"
+            continue
+        if not line.strip():
+            continue
+
+        if section == "strip":
+            m = ROUTING_RE.search(line)
+            if m:
+                strip_rows.append(m.groups())
+        elif section == "bus":
+            f = line.split()
+            # A1  <gain> <mute> <mono> <eq> <device...>
+            if len(f) >= 6 and re.fullmatch(r"A[1-9]", f[0]):
+                all_buses.add(f"bb_a{f[0][1:]}")
+                if " ".join(f[5:]).strip() == STREAM_SINK:
+                    stream_bus = f"bb_a{f[0][1:]}"
+
+    if len(strip_rows) > AUX_STRIP_INDEX:
+        for i, flag in enumerate(strip_rows[AUX_STRIP_INDEX], start=1):
+            if flag == "*":
+                aux_buses.add(f"bb_a{i}")
+
+    return aux_buses, stream_bus, all_buses
+
+
+def ports(flag):
+    """{'bb_a3:output_FL': [port_id, ...]} for -o (outputs) or -i (inputs)."""
+    out = {}
+    for line in run("pw-link", "-I", flag).splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].isdigit():
+            out.setdefault(f[1], []).append(int(f[0]))
+    return out
+
+
+def links():
+    """[(link_id, out_port_id, in_port_id)] with direction normalised."""
+    found, cur = [], None
+    for line in run("pw-link", "-I", "-l").splitlines():
+        f = line.split()
+        if not f or not f[0].isdigit():
+            continue
+        if "|->" in line or "|<-" in line:
+            if len(f) >= 3 and f[2].isdigit() and cur is not None:
+                lid, peer = int(f[0]), int(f[2])
+                found.append((lid, cur, peer) if "|->" in line else (lid, peer, cur))
+        else:
+            cur = int(f[0])
+    return found
+
+
+def tick():
+    inputs = ports("-i")
+    cap = {c: inputs.get(f"{TARGET}:input_{c}", []) for c in CHANNELS}
+    if not any(cap.values()):
+        return  # nothing is capturing; nothing to police
+
+    aux_buses, stream_bus, all_buses = mixer_state()
+    outputs = ports("-o")
+
+    # A suspended null sink takes the bus node down with it. bb-ctl still knows
+    # the assignment, so re-issuing it brings the node back.
+    if stream_bus and not outputs.get(f"{stream_bus}:output_FL"):
+        run(BBCTL, "route", "out", f"A{stream_bus[-1]}", STREAM_SINK)
+        print(f"bb-stream-guard: {stream_bus} was missing - re-assigned to {STREAM_SINK}",
+              flush=True)
+        time.sleep(1)
+        outputs = ports("-o")
+
+    # With a stream bus configured, it is the ONLY bus allowed to feed Discord:
+    # any other bus either carries AUX (echo) or duplicates audio the stream bus
+    # already delivers (comb filtering). Without one, fall back to protecting
+    # against the echo alone and leave Discord's own capture untouched.
+    if BLOCK_OVERRIDE:
+        blocked = set(BLOCK_OVERRIDE)
+    elif stream_bus:
+        blocked = set(all_buses)
+    else:
+        blocked = set(aux_buses)
+    blocked.discard(stream_bus)
+
+    existing = links()
+    cap_ids = {i for ids in cap.values() for i in ids}
+
+    blocked_ids = set()
+    for bus in blocked:
+        for c in CHANNELS:
+            blocked_ids.update(outputs.get(f"{bus}:output_{c}", []))
+    for lid, o, i in existing:
+        if o in blocked_ids and i in cap_ids:
+            run("pw-link", "-d", str(lid))
+            print(f"bb-stream-guard: dropped link {lid} (bus carrying AUX -> {TARGET})",
+                  flush=True)
+
+    if not stream_bus:
+        return  # no stream bus configured; echo protection only
+
+    pairs = {(o, i) for _, o, i in existing}
+    for c in CHANNELS:
+        for src in outputs.get(f"{stream_bus}:output_{c}", []):
+            for dst in cap[c]:
+                if (src, dst) not in pairs:
+                    run("pw-link", str(src), str(dst))
+                    print(f"bb-stream-guard: attached {stream_bus}:output_{c} "
+                          f"({src}) -> {TARGET} port {dst}", flush=True)
+
+
+def main():
+    while True:
+        try:
+            tick()
+        except Exception as e:  # a transient graph read must never kill the guard
+            print(f"bb-stream-guard: {e}", file=sys.stderr, flush=True)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

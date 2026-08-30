@@ -1,0 +1,17 @@
+[Unit]
+Description=betterbanana Discord screen-share guard
+Documentation=https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana
+# Needs both the PipeWire graph and bb-ctl's engine to inspect and repair links.
+After=pipewire.service pipewire-pulse.service wireplumber.service betterbanana-engine.service
+Wants=pipewire.service betterbanana-engine.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bb-stream-guard
+Restart=always
+RestartSec=5
+# Idle polling of the PipeWire graph; keep it out of the way of audio threads.
+Nice=5
+
+[Install]
+WantedBy=default.target
