@@ -18,6 +18,11 @@ install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
 install -m755 "$ROOT/tools/bb-health" "$BIN/bb-health"
 install -m644 "$ROOT/packaging/betterbanana.svg"            "$ICONS/betterbanana.svg"
 install -m644 "$ROOT/packaging/betterbanana.desktop"        "$APPS/betterbanana.desktop"
+# A bare Exec= name only resolves if the *graphical* session has $BIN on PATH,
+# and it often does not: under uwsm, "uwsm aux prepare-env" rebuilds PATH from a
+# POSIX login shell, so a ~/.local/bin added by a fish/bash rc (or by
+# environment.d) is dropped. The launcher then fails with no error at all.
+sed -i "s|^Exec=bb-gui$|Exec=$BIN/bb-gui|" "$APPS/betterbanana.desktop"
 install -m644 "$ROOT/packaging/betterbanana-engine.service" "$UNITS/betterbanana-engine.service"
 install -m644 "$ROOT/packaging/betterbanana-stream-guard.service" "$UNITS/betterbanana-stream-guard.service"
 install -m644 "$ROOT/packaging/betterbanana-health.service" "$UNITS/betterbanana-health.service"

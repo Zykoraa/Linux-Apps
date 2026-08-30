@@ -116,6 +116,8 @@ install-system: engine gui ctl
 	  $(DESTDIR)$(PREFIX)/lib/systemd/user/betterbanana-engine.service
 	sed -i 's|%h/.local/bin/bb-engine|$(PREFIX)/bin/bb-engine|' \
 	  $(DESTDIR)$(PREFIX)/lib/systemd/user/betterbanana-engine.service
+	sed -i 's|^Exec=bb-gui$$|Exec=$(PREFIX)/bin/bb-gui|' \
+	  $(DESTDIR)$(PREFIX)/share/applications/betterbanana.desktop
 
 run: engine
 	./$(BUILD)/bb-engine
