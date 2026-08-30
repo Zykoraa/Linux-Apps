@@ -51,4 +51,4 @@ echo "Make sure $BIN is on your PATH."
 echo
 echo "Sharing your screen on Discord? Set up the stream bus so callers do not"
 echo "hear themselves echoed back (see README, 'Discord screen sharing'):"
-echo "    bb-ctl route out A3 bb_stream"
+echo "    bb-ctl route out A3 betterbanana_stream"
