@@ -15,7 +15,9 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 - 5×5 routing matrix, per-bus solo, per-strip gate / compressor / 3-band EQ
 - 3 virtual cables assignable to any hardware strip, plus VAIO and AUX
 - Sidechain ducking: music steps back while you talk
-- 6-band parametric EQ per bus with a live response curve
+- 12-band parametric EQ per bus: shelves, pass filters, preamp, draggable curve
+- Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
+- Headphone corrections for ~8850 models from the AutoEq database, searchable
 - Per-application routing that survives the app restarting
 - Recorder, 8×8 VBAN network audio, presets, 10 colour themes
 
@@ -163,14 +165,79 @@ the rest of the configuration. From the shell:
 
 ## Bus EQ
 
-Each bus has a six-band parametric EQ. The **EQ** button bypasses it;
-**right-click the EQ button** (or use **Engine → Bus EQ**) to open the editor:
-gain, frequency and Q per band over a live response curve. The curve is computed
-with the engine's own `Biquad`, so it shows what you actually hear. Frequency
-knobs are log-scaled across 20 Hz – 20 kHz.
+Each bus has a twelve-band parametric EQ. The **EQ** button bypasses the whole
+thing; **right-click the EQ button** (or use **Engine → Bus EQ**) to open the
+editor.
+
+Every band picks its own shape — **peak, low shelf, high shelf, high pass, low
+pass, notch, band pass** — and carries gain, frequency, Q and its own bypass.
+Above them sits a **preamp**, so a curve that boosts can be pulled back to where
+it cannot clip; **Auto** sets it to exactly clear the highest peak.
+
+Two ways to edit, on the same state:
+
+- **The curve.** Drag a numbered handle for frequency and gain, wheel over it
+  for Q, right-click to bypass that band, double-click to zero its gain. Each
+  band's own response is drawn faintly behind the summed curve.
+- **The table.** Type exact numbers. Frequency and Q step logarithmically, so
+  one notch is a semitone at 40 Hz and at 12 kHz.
+
+The curve is computed with the engine's own `Biquad`, so it shows what you
+actually hear, preamp included.
+
+Bands that are bypassed — or left as a flat peak — are dropped from the audio
+path entirely, so a twelve-band EQ using three bands costs three biquads.
 
 The per-strip **LOW / MID / HIGH** knobs are a separate, always-active 3-band EQ
 and need no enabling.
+
+### EQ profiles
+
+The **PROFILE** row saves and recalls just the EQ, separately from mixer
+presets. Twelve built-ins ship with it — Bass Boost, Loudness, Vocal Clarity,
+Speech / Podcast, Gaming (footsteps), De-harsh, Warm, Small Speakers and the
+rest — each with a preamp that keeps it clipping-safe.
+
+**Save as…** writes your own to `~/.config/betterbanana/eq/<name>.txt`, and
+**Import…** / **Export…** read and write the same files. That format *is*
+[Equalizer APO](https://sourceforge.net/projects/equalizerapo/)'s parametric
+export — the format Peace uses on Windows and AutoEq publishes — so profiles
+move between BetterBanana, Peace and anything else that speaks it, unchanged:
+
+    Preamp: -6.1 dB
+    Filter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70
+    Filter 2: ON PK Fc 8800 Hz Gain 5.1 dB Q 1.42
+
+A profile with more than twelve filters keeps the ones that shape the sound most
+— shelves and pass filters always, then the largest boosts and cuts.
+
+### Headphone EQ (AutoEq)
+
+**Headphone EQ…** in the EQ editor searches the
+[AutoEq](https://github.com/jaakkopasanen/AutoEq) database: measured corrections
+for roughly 8850 headphones and IEMs, from oratory1990, crinacle, Rtings,
+Innerfidelity and two dozen other measurers. Type a model, pick a measurement,
+and its parametric EQ — preamp included — lands on the bus.
+
+This is the equivalent of what Peace's database gives you on Windows. The index
+is cached in `~/.config/betterbanana/autoeq/`, so searching is instant and works
+offline; only downloading a profile needs the network. Every profile you apply
+is also saved into your own EQ directory, so it stays selectable afterwards.
+
+**If you switch between several pairs of headphones**, tick *"Re-apply
+automatically whenever this bus is set to …"*. The profile is then remembered
+against that **output device**, not the bus: point the bus at a different pair
+and its correction follows automatically.
+
+From the shell, `bb-autoeq` does the same thing and is easy to bind to a key:
+
+    bb-autoeq search hd 650             # what is available
+    bb-autoeq apply A2 hd 650           # download and apply to bus A2
+    bb-autoeq update                    # refresh the cached index
+    bb-autoeq list                      # profiles saved on this machine
+
+It downloads the profile and hands it to `bb-ctl eq load`, so the parsing, the
+band fitting and the preamp are the mixer's own code.
 
 ## Sidechain ducking
 
@@ -533,9 +600,18 @@ freshly installed `99-bb-stream.conf` has no effect until you log out and back i
     ./build/bb-ctl vban out 1 host 192.168.1.20 && ./build/bb-ctl vban out 1 on
     ./build/bb-ctl vban apply
 
+    ./build/bb-ctl eq list                      # built-in and saved profiles
+    ./build/bb-ctl eq load A1 "Bass Boost"      # a built-in, a saved one, or a file
+    ./build/bb-ctl eq load A2 ~/Downloads/HD650.txt
+    ./build/bb-ctl eq save A1 "speakers"        # keep the current curve
+    ./build/bb-ctl eq show A1                   # print it as Equalizer APO text
+    ./build/bb-ctl eq preamp A1                 # set a clipping-safe preamp
+    ./build/bb-ctl bus A1 band 0 6.0 105 0.7 ls # gain, freq, Q, shape
+
 ## Tests
 
-    ./build/test_dsp          # 24 DSP assertions, no audio server needed
+    ./build/test_dsp          # 30 DSP assertions, no audio server needed
+    ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./tests/integration.sh    # drives real audio through a running engine
 
 ## Design
@@ -566,7 +642,7 @@ binaries refuse to talk instead of silently writing to the wrong offsets.
 
 Working and verified: virtual devices, routing matrix, per-strip gate /
 compressor / 3-band EQ / audibility / Intellipan / mono / solo / mute / fader,
-per-bus EQ / mono / mute / fader, metering, hardware assignment, the tape deck,
-and VBAN send/receive.
+the 12-band per-bus EQ with profiles and AutoEq import, per-bus mono / mute /
+fader, metering, hardware assignment, the tape deck, and VBAN send/receive.
 
 Not implemented: the surround bus modes, which need buses wider than stereo.

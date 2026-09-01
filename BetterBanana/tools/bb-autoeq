@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Search the AutoEq headphone database from the shell and apply a correction.
+
+The mixer has the same thing behind the EQ button's "Headphone EQ..." dialog.
+This is the scriptable half of it, so switching headphones can be a keybind:
+
+    bb-autoeq apply A2 "hd 650"
+
+AutoEq publishes measured corrections for thousands of headphones and IEMs as
+Equalizer APO parametric files -- the same format Peace reads on Windows. This
+downloads one, keeps a copy in the profile directory, and hands it to
+`bb-ctl eq load`, so the parsing and the clipping-safe preamp are the mixer's
+own code rather than a second implementation that could drift from it.
+
+The index of what is available is cached on disk, so searching is instant and
+works offline once it has been fetched. Only `update` and `apply` need network.
+
+Commands:
+    bb-autoeq search <words...>        list matching headphones
+    bb-autoeq apply <bus> <words...>   apply the best match to a bus (A1..B2)
+    bb-autoeq update                   re-download the index
+    bb-autoeq list                     saved profiles on this machine
+
+Environment:
+    BB_AUTOEQ_INDEX   override the cached index path
+    BB_CTL            path to bb-ctl (default: bb-ctl on PATH)
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/"
+BUSES = ("A1", "A2", "A3", "B1", "B2")
+
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "betterbanana")
+INDEX = os.environ.get("BB_AUTOEQ_INDEX") or os.path.join(CONFIG, "autoeq", "INDEX.md")
+PROFILES = os.path.join(CONFIG, "eq")
+BB_CTL = os.environ.get("BB_CTL") or "bb-ctl"
+
+
+def parse_line(line):
+    """Split one index row into (name, path, credit), or None.
+
+    - [Sennheiser HD 650](./oratory1990/over-ear/Sennheiser%20HD%20650) by oratory1990
+
+    Nearly a third of the rows have brackets in the model name, and they survive
+    into the path unescaped -- "1MORE Aero (ANC Off)". So the closing paren of
+    the link is the LAST one on the row, not the first; matching the first drops
+    2500 headphones on the floor. No source or measurement rig contains one.
+    """
+    if not line.startswith("- ["):
+        return None
+    i = line.find("](./")
+    if i < 0:
+        return None
+    name = line[3:i]
+    rest = line[i + 4:]
+    j = rest.rfind(")")
+    if j < 0:
+        return None
+    path, credit = rest[:j], rest[j + 1:].strip()
+    if credit.startswith("by "):
+        credit = credit[3:]
+    if not name or not path:
+        return None
+    return name, path, credit
+
+
+def die(msg, code=1):
+    print(f"bb-autoeq: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "BetterBanana"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def update_index(quiet=False):
+    os.makedirs(os.path.dirname(INDEX), exist_ok=True)
+    try:
+        body = fetch(BASE + "INDEX.md")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"could not download the index: {e}")
+    tmp = INDEX + ".part"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, INDEX)
+    entries = load_index()
+    if not quiet:
+        print(f"{len(entries)} headphones indexed -> {INDEX}")
+    return entries
+
+
+def load_index(auto=True):
+    """Entries as (name, path, credit). Downloads the index if it is missing."""
+    if not os.path.exists(INDEX):
+        if not auto:
+            return []
+        print("no cached headphone list yet, downloading...", file=sys.stderr)
+        return update_index(quiet=True)
+    out = []
+    with open(INDEX, encoding="utf-8") as f:
+        for line in f:
+            row = parse_line(line.strip())
+            if row:
+                out.append(row)
+    return out
+
+
+def word_matches(hay, word):
+    """Substring match, except that a bare number must start a word.
+
+    Every row carries its source, and one of the sources is "oratory1990" -- so
+    a plain substring search for "990" matches the entire oratory1990 catalogue
+    and buries the Beyerdynamic DT 990. Letters stay loose, so "pods" still
+    finds AirPods.
+    """
+    if not word.isdigit():
+        return word in hay
+    at = hay.find(word)
+    while at >= 0:
+        if at == 0 or not hay[at - 1].isalnum():
+            return True
+        at = hay.find(word, at + 1)
+    return False
+
+
+def search(entries, words):
+    """All words must appear, case-insensitively, somewhere in the row."""
+    hits = []
+    lowered = [w.lower() for w in words]
+    for name, path, credit in entries:
+        hay = f"{name} {credit}".lower()
+        if all(word_matches(hay, w) for w in lowered):
+            hits.append((name, path, credit))
+    return hits
+
+
+def rank(hits, words):
+    """Prefer an exact name match, then a shorter name, then oratory1990.
+
+    Without this "hd 650" puts whichever source happens to sort first at the
+    top, and picks up "HD 650 (with pads X)" variants ahead of the plain one.
+    """
+    query = " ".join(words).lower()
+
+    def key(h):
+        name, path, credit = h
+        return (
+            name.lower() != query,
+            not name.lower().startswith(query),
+            "oratory1990" not in path,
+            len(name),
+            name,
+        )
+    return sorted(hits, key=key)
+
+
+def profile_url(path):
+    """The file is named after its folder, which is not always the display name."""
+    folder = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+    return BASE + path + "/" + urllib.parse.quote(folder + " ParametricEQ.txt")
+
+
+def cmd_search(words):
+    if not words:
+        die("search needs something to search for")
+    hits = rank(search(load_index(), words), words)
+    if not hits:
+        die("nothing matches that")
+    for name, path, credit in hits[:40]:
+        print(f"  {name}    [{credit or path.split('/')[0]}]")
+    if len(hits) > 40:
+        print(f"  ... and {len(hits) - 40} more")
+
+
+def cmd_apply(bus, words):
+    if bus.upper() not in BUSES:
+        die(f"bus must be one of {', '.join(BUSES)}")
+    bus = bus.upper()
+    if not words:
+        die("apply needs a headphone to look for")
+    if not shutil.which(BB_CTL) and not os.path.exists(BB_CTL):
+        die(f"{BB_CTL} not found; set BB_CTL or put it on PATH")
+
+    hits = rank(search(load_index(), words), words)
+    if not hits:
+        die("nothing matches that (try: bb-autoeq search ...)")
+    name, path, credit = hits[0]
+    if len(hits) > 1:
+        # Most alternatives are the same headphone measured by someone else, so
+        # name them by their measurer or the list reads as a stutter.
+        others = ", ".join(f"{h[0]} [{h[2]}]" for h in hits[1:4])
+        print(f"matched {len(hits)}; using \"{name}\" [{credit}]\n"
+              f"  others: {others}", file=sys.stderr)
+
+    try:
+        body = fetch(profile_url(path))
+    except (urllib.error.URLError, OSError) as e:
+        die(f"could not download the profile for {name}: {e}")
+
+    os.makedirs(PROFILES, exist_ok=True)
+    safe = name.replace("/", "-")
+    dest = os.path.join(PROFILES, safe + ".txt")
+    with open(dest, "wb") as f:
+        f.write(body)
+
+    # bb-ctl owns the parsing, the band fitting and the preamp, so the result is
+    # identical to loading the same profile from the mixer's own dialog.
+    r = subprocess.run([BB_CTL, "eq", "load", bus, dest],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(r.stderr.strip() or f"bb-ctl refused the profile ({dest})")
+    print(r.stdout.strip() or f"{bus} <- {name}")
+    print(f"saved as \"{safe}\" ({dest})")
+
+
+def cmd_list():
+    if not os.path.isdir(PROFILES):
+        print(f"no saved profiles yet ({PROFILES})")
+        return
+    names = sorted(f[:-4] for f in os.listdir(PROFILES) if f.endswith(".txt"))
+    if not names:
+        print(f"no saved profiles yet ({PROFILES})")
+        return
+    print(f"saved profiles in {PROFILES}:")
+    for n in names:
+        print(f"  {n}")
+    print(f"\napply one with:  {BB_CTL} eq load A1 \"<name>\"")
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = argv[1]
+    if cmd == "update":
+        update_index()
+    elif cmd == "search":
+        cmd_search(argv[2:])
+    elif cmd == "apply":
+        if len(argv) < 4:
+            die("usage: bb-autoeq apply <bus> <words...>")
+        cmd_apply(argv[2], argv[3:])
+    elif cmd == "list":
+        cmd_list()
+    else:
+        die(f"unknown command '{cmd}' (try --help)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)

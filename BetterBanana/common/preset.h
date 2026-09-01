@@ -15,7 +15,9 @@
 
 namespace bb {
 
-constexpr int kPresetVersion = 1;
+// 2 added the per-band filter type / bypass flag and the EQ preamp. Version 1
+// files still load: the extra fields are optional on the band line.
+constexpr int kPresetVersion = 2;
 
 inline std::string preset_dir()
 {
@@ -74,9 +76,11 @@ inline bool save_preset(const Shared* s, const char* path)
         fprintf(f, "bus.%d.mute %d\n", b, p.mute.load());
         fprintf(f, "bus.%d.mono %d\n", b, p.mono.load());
         fprintf(f, "bus.%d.eq %d\n", b, p.eq_on.load());
+        fprintf(f, "bus.%d.preamp %.3f\n", b, p.eq_preamp_db.load());
         for (int k = 0; k < kBusEqBands; ++k)
-            fprintf(f, "bus.%d.band.%d %.3f %.3f %.3f\n", b, k,
-                    p.eq_gain[k].load(), p.eq_freq[k].load(), p.eq_q[k].load());
+            fprintf(f, "bus.%d.band.%d %.3f %.3f %.3f %d %d\n", b, k,
+                    p.eq_gain[k].load(), p.eq_freq[k].load(), p.eq_q[k].load(),
+                    p.eq_type[k].load(), p.eq_band_on[k].load());
         if (b < kPhysBuses) {
             fprintf(f, "bus.%d.device %s\n", b, out[b]);
             if (outd[b][0]) fprintf(f, "bus.%d.devicedesc %s\n", b, outd[b]);
@@ -134,6 +138,14 @@ inline bool load_preset(Shared* s, const char* path)
     char hw[kHwStrips][kNameLen] = {}, out[kPhysBuses][kNameLen] = {};
     char hwd[kHwStrips][kNameLen] = {}, outd[kPhysBuses][kNameLen] = {};
     bool touched_routing = false;
+
+    // A version 1 preset only describes six bands and carries no preamp, and the
+    // band count may grow again later. Track what the file actually mentioned,
+    // so anything it does not is reset afterwards rather than left holding the
+    // tail of whatever curve was loaded before.
+    bool band_seen[kBuses][kBusEqBands] = {};
+    bool bus_had_eq[kBuses] = {};
+    bool preamp_seen[kBuses] = {};
 
     // VBAN entries and labels are written as they are parsed, so keep those
     // seqlocks held open for the whole pass; a reader simply retries.
@@ -224,9 +236,23 @@ inline bool load_preset(Shared* s, const char* path)
             }
         }
         else if (keyed2("bus.", ".band.", "", i, k) && i < kBuses && k < kBusEqBands) {
-            if (sscanf(val, "%f %f %f", &a, &b, &c) == 3) {
-                s->bus[i].eq_gain[k].store(a); s->bus[i].eq_freq[k].store(b); s->bus[i].eq_q[k].store(c);
+            int type = kEqPeak, on = 1;
+            const int got = sscanf(val, "%f %f %f %d %d", &a, &b, &c, &type, &on);
+            if (got >= 3) {
+                s->bus[i].eq_gain[k].store(a);
+                s->bus[i].eq_freq[k].store(b);
+                s->bus[i].eq_q[k].store(c);
+                s->bus[i].eq_type[k].store(got >= 4 && type >= 0 && type < kEqTypeCount
+                                           ? type : kEqPeak);
+                s->bus[i].eq_band_on[k].store(got >= 5 ? (on ? 1 : 0) : 1);
+                band_seen[i][k] = true;
+                bus_had_eq[i] = true;
             }
+        }
+        else if (keyed("bus.", ".preamp", i) && i < kBuses) {
+            s->bus[i].eq_preamp_db.store(atof(val));
+            preamp_seen[i] = true;
+            bus_had_eq[i] = true;
         }
         else if (keyed("bus.", ".gain", i) && i < kBuses) s->bus[i].gain_db.store(atof(val));
         else if (keyed("bus.", ".mute", i) && i < kBuses) s->bus[i].mute.store(atoi(val));
@@ -280,6 +306,22 @@ inline bool load_preset(Shared* s, const char* path)
         }
     }
     fclose(f);
+
+    static const float kSpread[kBusEqBands] = {
+        31, 62, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 12000, 16000
+    };
+    for (int b = 0; b < kBuses; ++b) {
+        if (!bus_had_eq[b]) continue;
+        for (int k = 0; k < kBusEqBands; ++k) {
+            if (band_seen[b][k]) continue;
+            s->bus[b].eq_gain[k].store(0.0f);
+            s->bus[b].eq_freq[k].store(kSpread[k]);
+            s->bus[b].eq_q[k].store(1.0f);
+            s->bus[b].eq_type[k].store(kEqPeak);
+            s->bus[b].eq_band_on[k].store(1);
+        }
+        if (!preamp_seen[b]) s->bus[b].eq_preamp_db.store(0.0f);
+    }
 
     if (touched_routing) {
         routing_write_begin(s->routing);

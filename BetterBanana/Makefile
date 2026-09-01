@@ -13,12 +13,13 @@ MOC ?= $(shell \
            /usr/lib64/qt6/libexec/moc /usr/bin/moc-qt6; do \
     [ -x "$$c" ] && echo "$$c" && exit 0; done; echo moc)
 BUILD    := build
-HDRS     := common/protocol.h common/preset.h
+HDRS     := common/protocol.h common/preset.h common/eqprofile.h engine/dsp.h
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)
-QT_CF    := $(shell pkg-config --cflags Qt6Widgets)
-QT_LD    := $(shell pkg-config --libs Qt6Widgets)
+# Qt6Network is only used by the AutoEq headphone browser in the EQ editor.
+QT_CF    := $(shell pkg-config --cflags Qt6Widgets Qt6Network)
+QT_LD    := $(shell pkg-config --libs Qt6Widgets Qt6Network)
 SND_CF   := $(shell pkg-config --cflags sndfile)
 SND_LD   := $(shell pkg-config --libs sndfile)
 
@@ -32,7 +33,7 @@ DISTNAME := betterbanana-$(VERSION)
 # Fail early and legibly instead of part-way through a build.
 check-deps:
 	@ok=1; \
-	for m in libpipewire-0.3 sndfile Qt6Widgets; do \
+	for m in libpipewire-0.3 sndfile Qt6Widgets Qt6Network; do \
 	  pkg-config --exists $$m 2>/dev/null \
 	    && printf '  ok   %-18s %s\n' "$$m" "$$(pkg-config --modversion $$m)" \
 	    || { printf '  MISSING  %s\n' "$$m"; ok=0; }; \
@@ -60,7 +61,7 @@ dist:
 
 engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
-tests:  $(BUILD)/test_dsp $(BUILD)/test_fader
+tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -79,6 +80,9 @@ $(BUILD)/bb-ctl: tools/bb-ctl.cpp $(HDRS) | $(BUILD)
 $(BUILD)/test_dsp: tests/test_dsp.cpp engine/dsp.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+$(BUILD)/test_eq: tests/test_eq.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 # GUI: moc the header that declares QObject subclasses, compile alongside.
 $(BUILD)/moc_mainwindow.cpp: gui/mainwindow.h | $(BUILD)
 	$(MOC) $< -o $@
@@ -86,11 +90,16 @@ $(BUILD)/moc_mainwindow.cpp: gui/mainwindow.h | $(BUILD)
 $(BUILD)/moc_knob.cpp: gui/knob.h | $(BUILD)
 	$(MOC) $< -o $@
 
-$(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
-                  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_knob.cpp $(HDRS) | $(BUILD)
+$(BUILD)/moc_eqdialog.cpp: gui/eqdialog.h | $(BUILD)
+	$(MOC) $< -o $@
+
+$(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/widgets.cpp \
+                  gui/theme.cpp gui/knob.cpp \
+                  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp $(BUILD)/moc_knob.cpp \
+                  gui/mainwindow.h gui/eqdialog.h $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
-	  gui/main.cpp gui/mainwindow.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
-	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_knob.cpp \
+	  gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp $(BUILD)/moc_knob.cpp \
 	  -o $@ $(QT_LD) -lrt -lpthread
 
 $(BUILD):

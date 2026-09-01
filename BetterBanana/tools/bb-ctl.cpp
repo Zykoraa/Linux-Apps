@@ -2,6 +2,7 @@
 // Maps the same shared-memory segment the GUI uses.
 #include "../common/protocol.h"
 #include "../common/preset.h"
+#include "../common/eqprofile.h"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,9 +18,8 @@
 
 using namespace bb;
 
-// dsp.h is engine-only; keep a local copy rather than pulling it in here.
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static int   clampi(int v, int lo, int hi)         { return v < lo ? lo : (v > hi ? hi : v); }
+// clampf comes from dsp.h via eqprofile.h; only the integer form is local.
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 // Header layout (magic, version, struct_size, engine_pid) is stable across
 // versions, so "quit" can find and signal the engine even when the rest of the
@@ -85,6 +85,15 @@ static void usage()
       "  strip <i> pan <-1..1>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
+      "  bus <b> preamp <dB>         EQ preamp, -24 .. +12\n"
+      "  bus <b> band <0..11> <gain> <freq> <Q> [type] [on]\n"
+      "                              type: pk ls hs hp lp notch bp\n"
+      "  eq list                     list built-in and saved EQ profiles\n"
+      "  eq show <b>                 print a bus EQ as Equalizer APO text\n"
+      "  eq load <b> <name|file>     apply a built-in, saved or APO/AutoEq file\n"
+      "  eq save <b> <name>          save a bus EQ as a named profile\n"
+      "  eq flat <b>                 reset a bus EQ to flat\n"
+      "  eq preamp <b>               set the preamp so the curve cannot clip\n"
       "  route in <1..3> <source-node-name|cable:0..2|->\n"
       "  route out <A1|A2|A3> <sink-node-name|->\n"
       "  rec file <path> | bus <A1..B2> | start | stop\n"
@@ -327,8 +336,105 @@ int main(int argc, char** argv)
         else if (w == "mute") p.mute.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "mono") p.mono.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "eq")   p.eq_on.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "preamp") p.eq_preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
+        else if (w == "band" && argc >= 8) {
+            const int k = atoi(argv[4]);
+            if (k < 0 || k >= kBusEqBands) {
+                std::fprintf(stderr, "band must be 0..%d\n", kBusEqBands - 1); return 1;
+            }
+            p.eq_gain[k].store(clampf(atof(argv[5]), -24.0f, 24.0f));
+            p.eq_freq[k].store(clampf(atof(argv[6]), 10.0f, 24000.0f));
+            p.eq_q[k].store(clampf(atof(argv[7]), 0.1f, 20.0f));
+            if (argc >= 9) {
+                const int t = eq_type_from_tag(argv[8]);
+                if (t < 0) { std::fprintf(stderr, "type: pk ls hs hp lp notch bp\n"); return 1; }
+                p.eq_type[k].store(t);
+            }
+            if (argc >= 10) p.eq_band_on[k].store(atoi(argv[9]) ? 1 : 0);
+        }
         else { usage(); return 1; }
         return 0;
+    }
+
+    if (cmd == "eq" && argc >= 3) {
+        const std::string w = argv[2];
+
+        // A bare name is a profile: a saved one first, then a built-in. Anything
+        // with a slash or a .txt suffix is taken as a literal file, so an AutoEq
+        // download can be applied straight from where it landed.
+        auto resolve = [](const std::string& n, EqProfile& out) -> bool {
+            const bool literal = n.find('/') != std::string::npos
+                              || (n.size() > 4 && n.compare(n.size() - 4, 4, ".txt") == 0);
+            if (literal) return eq_read_file(out, n.c_str());
+            const std::string path = eq_profile_dir() + "/" + n + ".txt";
+            if (eq_read_file(out, path.c_str())) { out.name = n; return true; }
+            return eq_factory_profile(n, out);
+        };
+
+        if (w == "list") {
+            std::printf("built-in:\n");
+            for (const EqFactoryPreset& fp : eq_factory_presets())
+                std::printf("  %s\n", fp.name);
+            DIR* d = opendir(eq_profile_dir().c_str());
+            if (!d) { std::printf("\nno saved profiles yet (%s)\n", eq_profile_dir().c_str()); return 0; }
+            std::printf("\nsaved in %s:\n", eq_profile_dir().c_str());
+            while (dirent* e = readdir(d)) {
+                std::string n = e->d_name;
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".txt") == 0)
+                    std::printf("  %s\n", n.substr(0, n.size() - 4).c_str());
+            }
+            closedir(d);
+            return 0;
+        }
+
+        // Everything past "list" names a bus first.
+        if (argc < 4) { usage(); return 1; }
+        const int b = bus_index(argv[3]);
+        if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+
+        if (w == "show") {
+            std::printf("%s", eq_format_apo(eq_capture_from_bus(s, b, kBusName[b])).c_str());
+            return 0;
+        }
+        if (w == "flat") {
+            EqProfile flat;
+            eq_apply_to_bus(s, b, flat);
+            std::printf("%s EQ reset to flat\n", kBusName[b]);
+            return 0;
+        }
+        if (w == "preamp") {
+            EqProfile cur = eq_capture_from_bus(s, b);
+            const float pa = eq_suggest_preamp(cur);
+            s->bus[b].eq_preamp_db.store(pa);
+            std::printf("%s preamp %.1f dB\n", kBusName[b], pa);
+            return 0;
+        }
+        if (w == "load" && argc >= 5) {
+            EqProfile prof;
+            if (!resolve(argv[4], prof)) {
+                std::fprintf(stderr, "bb-ctl: no EQ profile '%s' (try: bb-ctl eq list)\n", argv[4]);
+                return 1;
+            }
+            eq_apply_to_bus(s, b, prof);
+            s->bus[b].eq_on.store(1);
+            std::printf("%s <- %s (%zu bands, preamp %.1f dB)\n", kBusName[b],
+                        prof.name.empty() ? argv[4] : prof.name.c_str(),
+                        prof.bands.size(), prof.preamp);
+            return 0;
+        }
+        if (w == "save" && argc >= 5) {
+            mkdir(preset_dir().c_str(), 0755);
+            mkdir(eq_profile_dir().c_str(), 0755);
+            const std::string path = eq_profile_dir() + "/" + argv[4] + ".txt";
+            if (!eq_write_file(eq_capture_from_bus(s, b, argv[4]), path.c_str())) {
+                std::fprintf(stderr, "bb-ctl: cannot write %s\n", path.c_str());
+                return 1;
+            }
+            std::printf("saved %s\n", path.c_str());
+            return 0;
+        }
+        usage();
+        return 1;
     }
 
     if (cmd == "route" && argc >= 5) {

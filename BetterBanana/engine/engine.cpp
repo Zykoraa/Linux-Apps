@@ -147,27 +147,60 @@ struct StripDsp {
 struct BusDsp {
     Biquad     eq[kChan][kBusEqBands];
     SmoothGain gain[kChan];
+    SmoothGain pre[kChan];          // EQ preamp, so a boosted curve can be pulled back
     PeakMeter  meter[kChan];
     float c_g[kBusEqBands] = {}, c_f[kBusEqBands] = {}, c_q[kBusEqBands] = {};
+    int   c_t[kBusEqBands] = {}, c_on[kBusEqBands] = {};
+    // Compact list of the bands actually doing something. A twelve-band EQ with
+    // three real bands should cost three biquads per sample, not twelve.
+    int   active[kBusEqBands] = {};
+    int   n_active = 0;
     bool  init = false;
 
     void configure(float sr)
     {
         for (int c = 0; c < kChan; ++c) {
-            gain[c].configure(sr, 15.0f); gain[c].snap(1.0f); meter[c].configure(sr);
+            gain[c].configure(sr, 15.0f); gain[c].snap(1.0f);
+            pre[c].configure(sr, 15.0f);  pre[c].snap(1.0f);
+            meter[c].configure(sr);
         }
     }
     void update(const BusParams& p, float sr)
     {
+        bool rebuild = !init;
         for (int k = 0; k < kBusEqBands; ++k) {
-            const float g = p.eq_gain[k].load(std::memory_order_relaxed);
-            const float f = p.eq_freq[k].load(std::memory_order_relaxed);
-            const float q = p.eq_q[k].load(std::memory_order_relaxed);
-            if (!init || g != c_g[k] || f != c_f[k] || q != c_q[k]) {
-                for (int c = 0; c < kChan; ++c) eq[c][k].set_peaking(sr, f, q, g);
-                c_g[k] = g; c_f[k] = f; c_q[k] = q;
+            const float g  = p.eq_gain[k].load(std::memory_order_relaxed);
+            const float f  = p.eq_freq[k].load(std::memory_order_relaxed);
+            const float q  = p.eq_q[k].load(std::memory_order_relaxed);
+            const int   t  = p.eq_type[k].load(std::memory_order_relaxed);
+            const int   on = p.eq_band_on[k].load(std::memory_order_relaxed) ? 1 : 0;
+            if (!init || g != c_g[k] || f != c_f[k] || q != c_q[k]
+                      || t != c_t[k] || on != c_on[k]) {
+                const bool enabling = init && on && !c_on[k];
+                for (int c = 0; c < kChan; ++c) {
+                    // A band that sat bypassed still holds stale samples in its
+                    // delay line; clear them or switching it back on clicks.
+                    if (enabling) eq[c][k].reset();
+                    design_band(eq[c][k], t, sr, f, q, g);
+                }
+                c_g[k] = g; c_f[k] = f; c_q[k] = q; c_t[k] = t; c_on[k] = on;
+                rebuild = true;
             }
         }
+        if (rebuild) {
+            n_active = 0;
+            for (int k = 0; k < kBusEqBands; ++k) {
+                if (!c_on[k]) continue;
+                // A flat peak or shelf designs to a pure bypass, so it can be
+                // dropped from the chain outright.
+                const bool shelf_or_peak = c_t[k] == kEqPeak || c_t[k] == kEqLowShelf
+                                                            || c_t[k] == kEqHighShelf;
+                if (shelf_or_peak && std::fabs(c_g[k]) < 1e-4f) continue;
+                active[n_active++] = k;
+            }
+        }
+        const float pa = db_to_lin(p.eq_preamp_db.load(std::memory_order_relaxed));
+        for (int c = 0; c < kChan; ++c) pre[c].set_target(pa);
         init = true;
     }
 };
@@ -468,7 +501,10 @@ void Engine::mix_chunk(uint32_t n)
             float ch[kChan] = { L, R };
             for (int c = 0; c < kChan; ++c) {
                 float x = ch[c];
-                if (eq_on) for (int k = 0; k < kBusEqBands; ++k) x = d.eq[c][k].process(x);
+                if (eq_on) {
+                    x *= d.pre[c].next();
+                    for (int k = 0; k < d.n_active; ++k) x = d.eq[c][d.active[k]].process(x);
+                }
                 x *= d.gain[c].next();
                 // Safety limiter: transparent below -3 dBFS, soft-knee above,
                 // asymptotic to full scale so a hot matrix can never wrap.

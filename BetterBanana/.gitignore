@@ -2,3 +2,4 @@ build/
 *.tar.gz
 *.o
 *.bbp
+__pycache__/

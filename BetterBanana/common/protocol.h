@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 4;
+constexpr uint32_t kVersion    = 5;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -25,7 +25,7 @@ constexpr int kPhysBuses  = 3;                 // A1 A2 A3
 constexpr int kVirtBuses  = 2;                 // B1 B2
 constexpr int kBuses      = kPhysBuses + kVirtBuses;
 constexpr int kChan       = 2;
-constexpr int kBusEqBands = 6;
+constexpr int kBusEqBands = 12;
 constexpr int kNameLen    = 192;
 constexpr int kLabelLen   = 28;                // user-supplied strip/bus names
 constexpr int kVbanStreams = 8;                // Banana offers 8 in and 8 out
@@ -41,6 +41,14 @@ using au = std::atomic<uint32_t>;
 
 // Bus modes. The surround variants of the original need >2 channel buses;
 // stereo-only modes are implemented, the rest are reserved.
+// Filter shapes a bus EQ band can take. The names match the Equalizer APO /
+// Peace / AutoEq vocabulary so an imported profile maps across one-to-one:
+// PK, LSC/LS, HSC/HS, LPQ/LP, HPQ/HP, NO, BP.
+enum EqFilterType : int32_t {
+    kEqPeak = 0, kEqLowShelf, kEqHighShelf, kEqHighPass, kEqLowPass,
+    kEqNotch, kEqBandPass, kEqTypeCount
+};
+
 enum BusMode : int32_t {
     kBusNormal = 0, kBusAmix, kBusBmix, kBusRepeat, kBusComposite,
     kBusTvMix,  kBusUpMix21, kBusUpMix41, kBusUpMix61,
@@ -68,6 +76,9 @@ struct BusParams {
     af  eq_gain[kBusEqBands];
     af  eq_freq[kBusEqBands];
     af  eq_q[kBusEqBands];
+    ai  eq_type[kBusEqBands];     // EqFilterType
+    ai  eq_band_on[kBusEqBands];  // per-band bypass, independent of eq_on
+    af  eq_preamp_db;             // applied before the band chain
 };
 
 struct Meters {
@@ -256,11 +267,19 @@ inline void set_defaults(Shared* s)
         p.gain_db.store(0.0f);
         p.mute.store(0); p.mono.store(0); p.eq_on.store(0); p.sel.store(b == 0 ? 1 : 0);
         p.mode.store(kBusNormal);
-        static const float f[kBusEqBands] = { 60, 160, 400, 1000, 3000, 8000 };
+        // Twelve bands spread over the audible range. Every band starts as a
+        // flat peaking filter, which the engine bypasses, so a fresh state
+        // sounds exactly like no EQ at all.
+        static const float f[kBusEqBands] = {
+            31, 62, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 12000, 16000
+        };
+        p.eq_preamp_db.store(0.0f);
         for (int k = 0; k < kBusEqBands; ++k) {
             p.eq_gain[k].store(0.0f);
             p.eq_freq[k].store(f[k]);
             p.eq_q[k].store(1.0f);
+            p.eq_type[k].store(kEqPeak);
+            p.eq_band_on[k].store(1);
         }
     }
     routing_write_begin(s->routing);

@@ -141,19 +141,6 @@ private:
     InRow  m_in [bb::kVbanStreams];
 };
 
-// Draws the combined magnitude response of one bus's six parametric bands.
-// Uses the engine's own Biquad, so the curve matches what you actually hear.
-class EqCurve : public QWidget {
-public:
-    EqCurve(bb::Shared* shm, int bus, QWidget* parent = nullptr)
-        : QWidget(parent), m_shm(shm), m_bus(bus) { setMinimumHeight(120); }
-protected:
-    void paintEvent(QPaintEvent*) override;
-private:
-    bb::Shared* m_shm;
-    int m_bus;
-};
-
 // Sidechain ducker: key strips pull down every strip that has a duck depth.
 class DuckDialog : public QDialog {
     Q_OBJECT
@@ -166,17 +153,6 @@ private:
     QPushButton* m_on = nullptr;
     QLabel*      m_env = nullptr;
     QTimer*      m_timer = nullptr;
-};
-
-// Six-band parametric EQ editor for one bus.
-class BusEqDialog : public QDialog {
-    Q_OBJECT
-public:
-    BusEqDialog(bb::Shared* shm, int bus, QWidget* parent = nullptr);
-private:
-    bb::Shared* m_shm;
-    int      m_bus;
-    EqCurve* m_curve = nullptr;
 };
 
 // Per-application routing: move a playing app onto a BetterBanana strip, or
@@ -236,6 +212,7 @@ private slots:
 
 private:
     void writeRouting();
+    void applyDeviceEq(int bus, const QString& device);
     void readRouting();
     void applyAppRules();
     void buildMenus();

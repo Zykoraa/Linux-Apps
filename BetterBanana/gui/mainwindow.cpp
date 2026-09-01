@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "eqdialog.h"
 #include "theme.h"
 #include "../common/preset.h"
 #include "../engine/dsp.h"
@@ -744,142 +745,6 @@ static QVector<DevEntry> promote(QVector<DevEntry> in, const QStringList& first)
 }
 
 
-// --- bus EQ ----------------------------------------------------------------
-// Band frequency uses a log-mapped knob: 0..1000 spans 20 Hz .. 20 kHz.
-static float knobToFreq(int v) { return 20.0f * std::pow(1000.0f, v / 1000.0f); }
-static int   freqToKnob(float f)
-{
-    return int(std::lround(1000.0 * std::log(double(f) / 20.0) / std::log(1000.0)));
-}
-static QString fmtFreq(int v)
-{
-    const float f = knobToFreq(v);
-    return f >= 1000.0f ? QString::number(f / 1000.0, 'f', f < 10000 ? 2 : 1) + "k"
-                        : QString::number(f, 'f', 0);
-}
-
-void EqCurve::paintEvent(QPaintEvent*)
-{
-    const Theme& t = theme();
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing);
-    const QRectF r = rect().adjusted(1, 1, -1, -1);
-    p.fillRect(r, t.panelAlt);
-
-    const float sr = m_shm->samplerate.load();
-    const float maxDb = 18.0f;
-    auto yFor = [&](float db) { return r.center().y() - (db / maxDb) * (r.height() / 2 - 4); };
-
-    // Grid
-    p.setPen(QPen(t.border, 1.0, Qt::DotLine));
-    for (float db : { -12.0f, -6.0f, 6.0f, 12.0f }) p.drawLine(QPointF(r.left(), yFor(db)), QPointF(r.right(), yFor(db)));
-    for (float f : { 100.0f, 1000.0f, 10000.0f }) {
-        const double x = r.left() + r.width() * freqToKnob(f) / 1000.0;
-        p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
-    }
-    p.setPen(QPen(t.textDim, 1.0));
-    p.drawLine(QPointF(r.left(), yFor(0)), QPointF(r.right(), yFor(0)));
-
-    // Build the six bands exactly as the engine does, then sum their responses.
-    bb::Biquad band[kBusEqBands];
-    for (int k = 0; k < kBusEqBands; ++k)
-        band[k].set_peaking(sr,
-                            m_shm->bus[m_bus].eq_freq[k].load(),
-                            m_shm->bus[m_bus].eq_q[k].load(),
-                            m_shm->bus[m_bus].eq_gain[k].load());
-
-    QPainterPath path;
-    const int steps = int(r.width());
-    for (int i = 0; i <= steps; ++i) {
-        const float f = knobToFreq(int(1000.0 * i / std::max(steps, 1)));
-        float db = 0.0f;
-        for (int k = 0; k < kBusEqBands; ++k) db += band[k].magnitude_db(sr, f);
-        const QPointF pt(r.left() + i, yFor(std::clamp(db, -maxDb, maxDb)));
-        if (i == 0) path.moveTo(pt); else path.lineTo(pt);
-    }
-    const bool on = m_shm->bus[m_bus].eq_on.load() != 0;
-    p.setPen(QPen(on ? t.accent : t.textDim, 2.0));
-    p.drawPath(path);
-
-    p.setPen(QPen(t.border, 1.0));
-    p.setBrush(Qt::NoBrush);
-    p.drawRect(r);
-}
-
-BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
-    : QDialog(parent), m_shm(shm), m_bus(bus)
-{
-    setWindowTitle(QString("Bus %1 - parametric EQ").arg(kBusLabel[bus]));
-    auto* root = new QVBoxLayout(this);
-
-    m_curve = new EqCurve(m_shm, m_bus);
-    root->addWidget(m_curve);
-
-    auto* grid = new QGridLayout;
-    grid->setSpacing(3);
-    grid->addWidget(makeLabel("GAIN", "caption", Qt::AlignRight), 1, 0);
-    grid->addWidget(makeLabel("FREQ", "caption", Qt::AlignRight), 2, 0);
-    grid->addWidget(makeLabel("Q",    "caption", Qt::AlignRight), 3, 0);
-
-    BusParams& p = m_shm->bus[m_bus];
-    QVector<Knob*> gainKnobs;
-    for (int k = 0; k < kBusEqBands; ++k) {
-        grid->addWidget(makeLabel(QString::number(k + 1), "caption"), 0, k + 1);
-
-        auto* g = new Knob(-150, 150, 0, true, " dB");
-        g->setMinimumWidth(50);
-        gainKnobs.push_back(g);
-        g->setValue(int(std::lround(p.eq_gain[k].load() * 10)));
-        connect(g, &Knob::valueChanged, this, [this, &p, k](int v) {
-            p.eq_gain[k].store(v / 10.0f);
-            m_curve->update();
-        });
-
-        auto* f = new Knob(0, 1000, freqToKnob(p.eq_freq[k].load()), false, QString());
-        f->setFormatter(fmtFreq);
-        f->setValue(freqToKnob(p.eq_freq[k].load()));
-        connect(f, &Knob::valueChanged, this, [this, &p, k](int v) {
-            p.eq_freq[k].store(knobToFreq(v));
-            m_curve->update();
-        });
-
-        auto* q = new Knob(30, 800, int(std::lround(p.eq_q[k].load() * 100)), false, QString());
-        q->setScale(0.01);
-        q->setDecimals(2);
-        connect(q, &Knob::valueChanged, this, [this, &p, k](int v) {
-            p.eq_q[k].store(v / 100.0f);
-            m_curve->update();
-        });
-
-        grid->addWidget(g, 1, k + 1, Qt::AlignHCenter);
-        grid->addWidget(f, 2, k + 1, Qt::AlignHCenter);
-        grid->addWidget(q, 3, k + 1, Qt::AlignHCenter);
-    }
-    root->addLayout(grid);
-
-    auto* btns = new QHBoxLayout;
-    auto* on = makeToggle("EQ ON", "eq", 24);
-    on->setChecked(p.eq_on.load() != 0);
-    connect(on, &QPushButton::toggled, this, [this, &p](bool b) {
-        p.eq_on.store(b ? 1 : 0);
-        m_curve->update();
-    });
-    auto* flat = new QPushButton("Flatten");
-    connect(flat, &QPushButton::clicked, this, [this, gainKnobs] {
-        // Move the knobs; their handlers write the params and redraw the curve.
-        for (Knob* k : gainKnobs) k->setValue(0);
-        m_curve->update();
-    });
-    btns->addWidget(on);
-    btns->addWidget(flat);
-    btns->addStretch();
-    auto* close = new QPushButton("Close");
-    connect(close, &QPushButton::clicked, this, &QDialog::accept);
-    btns->addWidget(close);
-    root->addLayout(btns);
-    resize(560, 340);
-}
-
 DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(shm)
 {
     setWindowTitle("Sidechain ducking");
@@ -1347,7 +1212,11 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     for (int b = 0; b < kBuses; ++b) {
         auto* w = new BusWidget(m_shm, b, b < kPhysBuses, kBusLabel[b]);
         connect(w, &BusWidget::routingChanged, this,
-                [this](int idx, const QString& n) { m_busOut[idx] = n; writeRouting(); });
+                [this](int idx, const QString& n) {
+                    m_busOut[idx] = n;
+                    writeRouting();
+                    applyDeviceEq(idx, n);
+                });
         connect(w, &BusWidget::eqEditRequested, this, &MainWindow::openBusEq);
         m_buses.push_back(w);
         outRow->addWidget(w);
@@ -1543,6 +1412,20 @@ void MainWindow::readRouting()
         m_busOut[b] = QString::fromUtf8(out[b]);
         m_buses[b]->setDeviceValue(m_busOut[b]);
     }
+}
+
+// An EQ profile remembered through the headphone browser belongs to the device,
+// not to the bus: point A2 at a different pair and its correction follows. Only
+// a real change of the combo reaches here - setDeviceList and setDeviceValue
+// both block the combo's signals - so this never fires on a device refresh.
+void MainWindow::applyDeviceEq(int bus, const QString& device)
+{
+    if (device.isEmpty()) return;
+    const QString name = AutoEqDialog::applyRemembered(m_shm, bus, device);
+    if (name.isEmpty()) return;
+    m_buses[bus]->pullFromShm();
+    statusBar()->showMessage(QString("%1: applied EQ profile \"%2\"")
+                             .arg(kBusLabel[bus], name), 6000);
 }
 
 void MainWindow::writeRouting()

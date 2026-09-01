@@ -17,6 +17,7 @@ install -m755 "$ROOT/build/bb-engine" "$ROOT/build/bb-gui" "$ROOT/build/bb-ctl" 
 install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
 install -m755 "$ROOT/tools/bb-health" "$BIN/bb-health"
 install -m755 "$ROOT/tools/bb-stream-setup" "$BIN/bb-stream-setup"
+install -m755 "$ROOT/tools/bb-autoeq" "$BIN/bb-autoeq"
 install -m644 "$ROOT/packaging/betterbanana.svg"            "$ICONS/betterbanana.svg"
 install -m644 "$ROOT/packaging/betterbanana.desktop"        "$APPS/betterbanana.desktop"
 # A bare Exec= name only resolves if the *graphical* session has $BIN on PATH,

@@ -118,6 +118,24 @@ struct Biquad {
                    1 + alpha, -2 * cw, 1 - alpha);
     }
 
+    // Constant-skirt-gain notch and band-pass, for completeness: Equalizer APO
+    // profiles occasionally use them, so an import must not silently drop one.
+    void set_notch(float sr, float freq, float q)
+    {
+        const float w = 2.0f * kPi * clampf(freq, 5.0f, sr * 0.49f) / sr;
+        const float cw = std::cos(w), sw = std::sin(w);
+        const float alpha = sw / (2.0f * std::max(q, 0.05f));
+        set_coeffs(1, -2 * cw, 1, 1 + alpha, -2 * cw, 1 - alpha);
+    }
+
+    void set_bandpass(float sr, float freq, float q)
+    {
+        const float w = 2.0f * kPi * clampf(freq, 5.0f, sr * 0.49f) / sr;
+        const float cw = std::cos(w), sw = std::sin(w);
+        const float alpha = sw / (2.0f * std::max(q, 0.05f));
+        set_coeffs(alpha, 0, -alpha, 1 + alpha, -2 * cw, 1 - alpha);
+    }
+
     // Magnitude response at `freq`, in dB. Used by the GUI's EQ curve and tests.
     float magnitude_db(float sr, float freq) const
     {
@@ -131,6 +149,23 @@ struct Biquad {
         return static_cast<float>(10.0 * std::log10(n2 / d2));
     }
 };
+
+// Designs a band from an EqFilterType. Kept here rather than in the engine so
+// the GUI's curve and the engine's audio path can never disagree about what a
+// given band does. `type` is a bb::EqFilterType; the header does not include
+// protocol.h, so it is taken as a plain int.
+inline void design_band(Biquad& bq, int type, float sr, float freq, float q, float gain_db)
+{
+    switch (type) {
+        case 1:  bq.set_lowshelf (sr, freq, q, gain_db); break;
+        case 2:  bq.set_highshelf(sr, freq, q, gain_db); break;
+        case 3:  bq.set_highpass (sr, freq, q);          break;
+        case 4:  bq.set_lowpass  (sr, freq, q);          break;
+        case 5:  bq.set_notch    (sr, freq, q);          break;
+        case 6:  bq.set_bandpass (sr, freq, q);          break;
+        default: bq.set_peaking  (sr, freq, q, gain_db); break;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // One-pole smoothed gain. Removes zipper noise when a fader moves.
