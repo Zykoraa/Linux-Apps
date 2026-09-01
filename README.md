@@ -43,6 +43,25 @@ cd Linux-Apps/glory-injector && ./install.sh
 Needs `python`, `tk` and `gdb`. Then launch **Glory Injector** from your app
 menu, or run `glory-injector`.
 
+## Mic Gain
+
+A microphone analyzer for PipeWire that tells you which knob to turn, and which
+way. Monitoring level and recording level are different knobs on a USB
+interface, so your ears cannot judge the one that gets recorded; this measures
+the signal on the way in and turns it into named instructions. Live meters, a
+log-frequency spectrum, and a guided `--calibrate` mode that writes a settings
+report. Understands an external channel strip such as a dbx 286s. →
+[full documentation](mic-gain/)
+
+**Any distro (user install, no root):**
+
+```sh
+git clone https://github.com/Zykoraa/Linux-Apps.git
+cd Linux-Apps/mic-gain && ./install.sh
+```
+
+Needs `python3` and PipeWire — no third-party libraries. Then run `mic-gain`.
+
 ---
 
 Each app builds independently — see its own README. Everything here is MIT

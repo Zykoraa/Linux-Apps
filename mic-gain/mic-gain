@@ -1,0 +1,1651 @@
+#!/usr/bin/env python3
+"""Microphone analyzer: set a channel strip by measurement, not by ear.
+
+Monitoring level and recording level are two different things, and on a USB
+interface they are two different knobs. The headphone dial on a UMC202HD sits
+after the converter, so turning it up makes a whisper-quiet mic sound perfect
+and turning it down makes a clipping mic sound tame. Ears cannot tell you where
+the gain belongs, by design: the level you hear is not the level that gets
+recorded. Put an external strip like a dbx 286s in front and it gets worse --
+now three knobs change the level and only one of them should.
+
+So measure the signal on the way in, and reduce it to instructions naming the
+control to move and the direction to move it.
+
+    mic-gain                 live analyzer -- meters, spectrum, diagnosis
+    mic-gain --calibrate     guided measurement -> a written settings report
+    mic-gain --list          show the inputs it can measure
+
+Everything is stdlib: pw-record delivers float32, struct.unpack decodes it, and
+a hand-rolled radix-2 FFT does the spectrum. The whole live view measures at
+about 6% of one core (the FFT is roughly half of that). No numpy, matching the
+other tools in this repo.
+
+The statistics are chosen to survive what makes naive meters lie:
+
+  * Speech level is a 300 ms sliding RMS, gated to drop the pauses between
+    words. An ungated average is mostly silence and reads absurdly low.
+  * The gate cannot be derived from the signal alone -- someone who talks
+    without pausing makes the "floor" land on speech and gates everything out
+    -- so it is also capped relative to the loud end, and --calibrate measures
+    a real floor during a dedicated silent phase.
+  * Headroom uses the 95th percentile of true sample peaks, so one chair creak
+    does not cost 6 dB of signal. The absolute maximum is kept for clipping.
+  * The gain recommendation is the smaller of "what centres the average" and
+    "what keeps peaks safe", because peaks ruin a take and the average only
+    makes it comfortable.
+  * Spectral analysis is speech-gated too. Analysing the whole stream measures
+    the room's air conditioning, not the voice.
+  * Channels are measured separately and a dead one is excluded, since on a
+    two-input interface the mic is usually on input 1 and input 2 is hiss.
+
+Tone findings are indications, not verdicts: each one prints the number it was
+derived from so it can be argued with. Level, peak, crest and clipping numbers
+are exact measurements.
+
+Environment:
+    MIC_SOURCE        default source name (overridden by --source)
+    MIC_PROFILE       default profile: voice | stream | safe
+    MIC_PREAMP        external channel strip, e.g. "dbx 286s"
+    MIC_DEG_PER_DB    knob degrees per dB for the "how far to turn" hint
+"""
+import argparse
+import cmath
+import collections
+import math
+import operator
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+RATE = 48000
+CHANNELS = 2
+BLOCK_FRAMES = 1024
+BLOCK_BYTES = BLOCK_FRAMES * CHANNELS * 4
+BLOCK_SECS = BLOCK_FRAMES / RATE
+RMS_WINDOW_SECS = 0.300
+CLIP_LEVEL = 0.999
+DB_FLOOR = -120.0
+
+FFT_SIZE = 2048
+FFT_EVERY = 2                      # blocks between transforms (~23 Hz)
+
+GATE_ABOVE_FLOOR = 12.0
+GATE_ABSOLUTE = -50.0
+GATE_BELOW_TOP = 20.0
+CHANNEL_ALIVE_PEAK = -60.0
+
+DEG_PER_DB = float(os.environ.get("MIC_DEG_PER_DB", "6.0"))
+DEG_PER_DB_KNOWN = "MIC_DEG_PER_DB" in os.environ
+
+PROFILES = {
+    "voice": (-18.0, -9.0, "recording / calls -- comfortable, lots of headroom"),
+    "stream": (-16.0, -7.0, "live streaming -- hotter, for OBS and Discord"),
+    "safe": (-22.0, -13.0, "maximum headroom -- loud rooms, shouty talkers"),
+}
+RMS_TOLERANCE = 3.0
+
+DB_MIN = -66.0
+DB_MAX = 0.0
+TICKS = [-60, -50, -40, -30, -24, -18, -12, -6, -3, 0]
+
+# Analysis bands. Boundaries follow what the controls on a channel strip
+# actually act on, not octave convention: 80 Hz because that is where the
+# high-pass filter sits, 5-9 kHz because that is de-esser territory.
+BANDS = [
+    ("rumble", 20, 80, "<80"),
+    ("low", 80, 200, "80-200"),
+    ("lowmid", 200, 500, "200-500"),
+    ("mid", 500, 2000, "500-2k"),
+    ("presence", 2000, 5000, "2k-5k"),
+    ("sibilance", 5000, 9000, "5k-9k"),
+    ("air", 9000, 16000, "9k-16k"),
+]
+
+SPECTRUM_LO = 40.0
+SPECTRUM_HI = 16000.0
+SPECTRUM_TOP = -12.0               # dB at the top of the spectrum plot
+SPECTRUM_RANGE = 60.0              # dB from top to bottom
+
+
+def dbfs(amplitude):
+    """Linear amplitude (0..1) to dBFS, floored instead of diverging at zero."""
+    if amplitude <= 1e-6:
+        return DB_FLOOR
+    return 20.0 * math.log10(amplitude)
+
+
+def power_db(power):
+    if power <= 1e-20:
+        return DB_FLOOR
+    return 10.0 * math.log10(power)
+
+
+def percentile(values_sorted, p):
+    if not values_sorted:
+        return None
+    k = (len(values_sorted) - 1) * p / 100.0
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return values_sorted[int(k)]
+    return values_sorted[lo] + (values_sorted[hi] - values_sorted[lo]) * (k - lo)
+
+
+def fmt_db(db, width=6):
+    if db is None or db <= DB_FLOOR:
+        return "--".rjust(width)
+    return f"{db:.1f}".rjust(width)
+
+
+# --------------------------------------------------------------------------
+# FFT
+# --------------------------------------------------------------------------
+
+def make_fft(n):
+    """Iterative radix-2 FFT with precomputed twiddles and bit-reversal.
+
+    Fast enough in pure Python: ~1.3 ms at n=2048 on this machine, so a live
+    spectrum at 23 transforms per second costs about 3% of one core.
+    """
+    levels = n.bit_length() - 1
+    rev = [0] * n
+    for i in range(n):
+        r, x = 0, i
+        for _ in range(levels):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        rev[i] = r
+    tw = [cmath.exp(-2j * math.pi * k / n) for k in range(n // 2)]
+
+    def fft(samples):
+        out = [samples[rev[i]] for i in range(n)]
+        size = 2
+        while size <= n:
+            half, step = size // 2, n // size
+            for i in range(0, n, size):
+                k = 0
+                for j in range(i, i + half):
+                    t = out[j + half] * tw[k]
+                    out[j + half] = out[j] - t
+                    out[j] = out[j] + t
+                    k += step
+            size *= 2
+        return out
+    return fft
+
+
+class Spectrum:
+    """Speech-gated spectral analysis, plus a live display spectrum.
+
+    Two products from the same transforms. The live one is smoothed and decays,
+    for something that looks like an analyzer; the accumulated one averages only
+    blocks loud enough to be speech, and is what the diagnosis reads -- averaging
+    everything would measure the room's air conditioning instead of the voice.
+    """
+
+    def __init__(self, size=FFT_SIZE, rate=RATE):
+        self.n = size
+        self.rate = rate
+        self.fft = make_fft(size)
+        self.window = [0.5 - 0.5 * math.cos(2 * math.pi * i / size)
+                       for i in range(size)]
+        # Hann coherent gain is 0.5, so this scale makes a full-scale sine
+        # read 0 dBFS at its bin.
+        self.scale = 4.0 / size
+        self.buf = collections.deque(maxlen=size)
+        self.bins = size // 2
+        self.freqs = [i * rate / size for i in range(self.bins)]
+        self.live = [DB_FLOOR] * self.bins
+        self.hold = [DB_FLOOR] * self.bins
+        self.accum = [0.0] * self.bins
+        self.frames = 0
+        self._since = 0
+        self.band_ranges = self._band_ranges()
+
+    def _band_ranges(self):
+        out = {}
+        for name, lo, hi, _ in BANDS:
+            a = max(1, int(lo * self.n / self.rate))
+            b = min(self.bins, int(hi * self.n / self.rate) + 1)
+            out[name] = (a, max(a + 1, b))
+        return out
+
+    def feed(self, samples, is_speech):
+        """Buffer a block; transform every FFT_EVERY blocks. Returns True if
+        a transform ran."""
+        self.buf.extend(samples)
+        self._since += 1
+        if self._since < FFT_EVERY or len(self.buf) < self.n:
+            return False
+        self._since = 0
+
+        data = list(self.buf)
+        spec = self.fft([complex(data[i] * self.window[i], 0.0)
+                         for i in range(self.n)])
+
+        decay = 1.5 * FFT_EVERY * BLOCK_SECS * 20.0    # dB per frame
+        for i in range(self.bins):
+            mag = abs(spec[i]) * self.scale
+            db = dbfs(mag)
+            self.live[i] = db if db > self.live[i] else max(
+                db, self.live[i] - decay)
+            self.hold[i] = db if db > self.hold[i] else max(
+                db, self.hold[i] - decay * 0.15)
+            if is_speech:
+                self.accum[i] += mag * mag
+        if is_speech:
+            self.frames += 1
+        return True
+
+    def reset(self):
+        self.accum = [0.0] * self.bins
+        self.frames = 0
+        self.live = [DB_FLOOR] * self.bins
+        self.hold = [DB_FLOOR] * self.bins
+
+    def band_levels(self):
+        """Speech-average energy per band, in dB relative to the total.
+
+        Relative rather than absolute on purpose: the whole point is tonal
+        balance, which must not move when the gain knob does.
+        """
+        if not self.frames:
+            return None
+        total = sum(self.accum[self.band_ranges["low"][0]:
+                              self.band_ranges["air"][1]])
+        if total <= 0:
+            return None
+        out = {}
+        for name, _, _, _ in BANDS:
+            a, b = self.band_ranges[name]
+            out[name] = power_db(sum(self.accum[a:b]) / total)
+        return out
+
+    def display(self, columns):
+        """Log-spaced (level dB, hold dB) pairs for the plot."""
+        if columns < 1:
+            return []
+        ratio = math.log(SPECTRUM_HI / SPECTRUM_LO)
+        edges = [SPECTRUM_LO * math.exp(ratio * i / columns)
+                 for i in range(columns + 1)]
+        out = []
+        for c in range(columns):
+            a = max(1, int(edges[c] * self.n / self.rate))
+            b = max(a + 1, int(edges[c + 1] * self.n / self.rate) + 1)
+            b = min(b, self.bins)
+            if a >= b:
+                out.append((DB_FLOOR, DB_FLOOR))
+                continue
+            out.append((max(self.live[a:b]), max(self.hold[a:b])))
+        return out
+
+
+# --------------------------------------------------------------------------
+# Metering
+# --------------------------------------------------------------------------
+
+class ChannelMeter:
+    """Running level statistics for one channel."""
+
+    HISTORY = 40000
+    HOLD_DECAY = 10.0 ** (-BLOCK_SECS)          # 20 dB/s peak-hold falloff
+
+    def __init__(self):
+        win = max(1, int(round(RMS_WINDOW_SECS / BLOCK_SECS)))
+        self.window = collections.deque(maxlen=win)
+        self.history = collections.deque(maxlen=self.HISTORY)
+        self.rms_db = DB_FLOOR
+        self.peak_db = DB_FLOOR
+        self.hold = 0.0
+        self.max_peak = 0.0
+        self.clip_samples = 0
+        self.blocks = 0
+
+    def process(self, samples):
+        n = len(samples)
+        peak = max(max(samples), -min(samples))
+        sumsq = sum(map(operator.mul, samples, samples))
+
+        self.window.append(sumsq / n)
+        self.rms_db = dbfs(math.sqrt(sum(self.window) / len(self.window)))
+        self.peak_db = dbfs(peak)
+
+        self.hold = max(peak, self.hold * self.HOLD_DECAY)
+        if peak > self.max_peak:
+            self.max_peak = peak
+        if peak >= CLIP_LEVEL:
+            self.clip_samples += sum(1 for x in samples
+                                     if x >= CLIP_LEVEL or x <= -CLIP_LEVEL)
+        self.blocks += 1
+        self.history.append((self.rms_db, self.peak_db))
+
+    @property
+    def hold_db(self):
+        return dbfs(self.hold)
+
+    @property
+    def max_peak_db(self):
+        return dbfs(self.max_peak)
+
+    def reset(self):
+        self.history.clear()
+        self.max_peak = 0.0
+        self.clip_samples = 0
+        self.blocks = 0
+
+    def live_gate(self):
+        """Is the signal right now loud enough to be speech?
+
+        Used to gate spectral accumulation in real time, where the full
+        history-based gate is not available yet.
+        """
+        if len(self.history) < 20:
+            return False
+        rms = sorted(r for r, _ in self.history)
+        floor = percentile(rms, 10.0)
+        top = percentile(rms, 95.0)
+        gate = min(max(floor + GATE_ABOVE_FLOOR, GATE_ABSOLUTE),
+                   top - GATE_BELOW_TOP)
+        return self.rms_db > gate
+
+    def summary(self, floor_db=None):
+        """Noise floor, gated speech level, speech peaks. All dBFS.
+
+        Pass floor_db when the floor was measured separately during a
+        known-silent phase: always a better estimate than one inferred from a
+        recording that may contain no silence at all.
+        """
+        hist = list(self.history)
+        out = {"floor": None, "speech_rms": None, "speech_peak_p95": None,
+               "crest": None, "speech_secs": 0.0, "max_peak": self.max_peak_db,
+               "clip_samples": self.clip_samples, "alive": False}
+        if not hist:
+            return out
+
+        rms_sorted = sorted(r for r, _ in hist)
+        floor = floor_db if floor_db is not None else percentile(rms_sorted, 10.0)
+        out["floor"] = floor
+        out["alive"] = self.max_peak_db > CHANNEL_ALIVE_PEAK
+
+        top = percentile(rms_sorted, 95.0)
+        gate = min(max(floor + GATE_ABOVE_FLOOR, GATE_ABSOLUTE),
+                   top - GATE_BELOW_TOP)
+        speech = [(r, p) for r, p in hist if r > gate]
+        if not speech:
+            return out
+
+        out["speech_secs"] = len(speech) * BLOCK_SECS
+        out["speech_rms"] = percentile(sorted(r for r, _ in speech), 50.0)
+        out["speech_peak_p95"] = percentile(sorted(p for _, p in speech), 95.0)
+        out["crest"] = out["speech_peak_p95"] - out["speech_rms"]
+        return out
+
+
+# --------------------------------------------------------------------------
+# Which knob
+# --------------------------------------------------------------------------
+
+class Knob:
+    """Which control the advice should name.
+
+    With an external channel strip there are three gain stages and only one is
+    the right one to move. The interface knob wants a fixed clean reference;
+    the strip's INPUT gain sets how hard its compressor works and changes the
+    sound; so the control that sets recording level is the strip's OUTPUT gain.
+    """
+
+    def __init__(self, name="the gain", deg_per_db=DEG_PER_DB, degrees=True,
+                 preamp=None):
+        self.name = name
+        self.deg_per_db = deg_per_db
+        self.degrees = degrees
+        self.preamp = preamp
+
+    @classmethod
+    def for_preamp(cls, label):
+        if not label:
+            return cls()
+        # No table of knob tapers: guessing degrees for a knob we have never
+        # seen would be a confident lie. Name it, and let MIC_DEG_PER_DB
+        # supply the taper if the user knows it.
+        return cls(f"the {label} OUTPUT gain", DEG_PER_DB, DEG_PER_DB_KNOWN,
+                   preamp=label)
+
+
+KNOB = Knob()
+
+
+def knob_hint(delta_db):
+    """Turn the recommendation into something you can do with your hand."""
+    mag = abs(delta_db)
+    direction = "clockwise" if delta_db > 0 else "counter-clockwise"
+    if mag < 1.0:
+        return "it is close enough -- leave it"
+    if mag < 2.5:
+        size = "a hair"
+    elif mag < 5.0:
+        size = "a small nudge"
+    elif mag < 10.0:
+        size = "a noticeable turn"
+    else:
+        size = "a big turn"
+    if not KNOB.degrees:
+        return f"{size} {direction}"
+    return f"{size} {direction} (~{mag * KNOB.deg_per_db:.0f} deg)"
+
+
+# --------------------------------------------------------------------------
+# Diagnosis
+# --------------------------------------------------------------------------
+
+OK, WARN, BAD = "ok", "warn", "bad"
+
+
+class Finding:
+    """One thing to change, or one thing confirmed fine.
+
+    `reading` always carries the number the finding came from, so a tone
+    heuristic can be argued with rather than taken on faith.
+    """
+
+    def __init__(self, area, severity, reading, control=None, action=None,
+                 why=None):
+        self.area = area
+        self.severity = severity
+        self.reading = reading
+        self.control = control
+        self.action = action
+        self.why = why
+
+    @property
+    def actionable(self):
+        return self.severity != OK and self.control is not None
+
+    @property
+    def short_control(self):
+        """The control without the strip's name, for a report already
+        headed by it."""
+        if self.control and KNOB.preamp:
+            prefix = f"the {KNOB.preamp} "
+            if self.control.startswith(prefix):
+                return self.control[len(prefix):]
+        return self.control or ""
+
+
+def diagnose_level(s, profile):
+    """Level, headroom and clipping -- exact measurements, not heuristics."""
+    target_rms, target_peak, _ = PROFILES[profile]
+
+    if not s["alive"]:
+        return [Finding("level", BAD, "no signal", KNOB.name,
+                        "check the signal path",
+                        "Nothing is reaching this input. Check the cable, the "
+                        "input selector, and 48V if the mic is a condenser.")]
+    if s["speech_rms"] is None:
+        return [Finding("level", WARN, "too quiet to measure", KNOB.name,
+                        "turn it up and talk",
+                        "There is a signal, but it never rises far enough "
+                        "above the noise to count as speech.")]
+
+    for_rms = target_rms - s["speech_rms"]
+    for_peak = target_peak - s["speech_peak_p95"]
+    delta = min(for_rms, for_peak)
+    out = []
+
+    if s["clip_samples"] > 0 or s["max_peak"] > -0.5:
+        down = max(abs(delta), 3.0)
+        out.append(Finding(
+            "level", BAD, f"{s['clip_samples']} clipped samples", KNOB.name,
+            f"turn DOWN at least {down:.0f} dB -- {knob_hint(-down)}",
+            "Samples are hitting full scale. That damage is permanent, and no "
+            "amount of headphone volume will reveal it."))
+    elif delta > RMS_TOLERANCE:
+        limit = ("peaks are still low too" if for_peak > for_rms
+                 else "peaks are what limit the rise")
+        out.append(Finding(
+            "level", WARN, f"speech at {s['speech_rms']:.1f} dBFS", KNOB.name,
+            f"turn UP about {delta:.0f} dB -- {knob_hint(delta)}",
+            f"Speech should average about {target_rms:.0f} dBFS; {limit}."))
+    elif delta < -RMS_TOLERANCE:
+        out.append(Finding(
+            "level", WARN, f"speech at {s['speech_rms']:.1f} dBFS", KNOB.name,
+            f"turn DOWN about {abs(delta):.0f} dB -- {knob_hint(delta)}",
+            f"Speech should average about {target_rms:.0f} dBFS, and running "
+            f"hot spends headroom you will want on a loud syllable."))
+    else:
+        held = "peaks" if for_peak < for_rms else "the average"
+        out.append(Finding("level", OK,
+                           f"speech {s['speech_rms']:.1f} dBFS, "
+                           f"peaks {s['speech_peak_p95']:.1f}",
+                           why=f"On target, with {held} the binding limit."))
+    return out
+
+
+def diagnose_dynamics(s, preamp):
+    """Crest factor -> the compressor section."""
+    crest = s["crest"]
+    if crest is None:
+        return []
+    comp = f"the {preamp} COMPRESSOR (Drive)" if preamp else "a compressor"
+    if crest > 17.0:
+        return [Finding(
+            "dynamics", WARN, f"crest {crest:.0f} dB -- uncompressed", comp,
+            "raise Drive until the gain-reduction meter moves on loud words",
+            "A crest factor this wide means nothing is levelling you. Quiet "
+            "words will sit in the noise and loud ones will eat the headroom.")]
+    if crest < 6.0:
+        return [Finding(
+            "dynamics", WARN, f"crest {crest:.0f} dB -- heavily compressed",
+            comp, "back Drive off, or lower Density",
+            "Almost no dynamic range left. This is where a voice starts to "
+            "sound flat and pumped, and room noise gets pulled up between "
+            "words.")]
+    return [Finding("dynamics", OK, f"crest {crest:.0f} dB",
+                    why="Healthy dynamic range for speech.")]
+
+
+def diagnose_noise(s, preamp):
+    """Noise floor and SNR -> the expander/gate."""
+    out = []
+    floor, rms = s["floor"], s["speech_rms"]
+    gate = f"the {preamp} EXPANDER/GATE" if preamp else "a gate"
+
+    if floor is not None and floor < -85.0:
+        out.append(Finding(
+            "noise", WARN, f"floor {floor:.0f} dBFS -- implausibly low", gate,
+            "trust the SNR below only if the gate is open",
+            "A floor this low is not a quiet room, it is an expander that has "
+            "closed. Real room noise is higher than this reads."))
+        return out
+    if rms is None or floor is None:
+        return out
+
+    snr = rms - floor
+    if snr < 25.0:
+        out.append(Finding(
+            "noise", BAD, f"SNR {snr:.0f} dB", gate,
+            "get closer to the mic first, then raise Threshold if needed",
+            "The noise is close enough to the voice that it will be audible "
+            "under everything. A gate hides it between words but not during "
+            "them -- distance and gain structure are the real fix."))
+    elif snr < 35.0:
+        out.append(Finding(
+            "noise", WARN, f"SNR {snr:.0f} dB", gate,
+            "raise Threshold until it closes between words",
+            "Workable, but there is audible hiss between phrases."))
+    else:
+        out.append(Finding("noise", OK, f"SNR {snr:.0f} dB",
+                           why="Voice sits well clear of the noise floor."))
+    return out
+
+
+def diagnose_tone(bands, preamp):
+    """Band balance -> high-pass, de-esser and enhancer.
+
+    Every threshold here is a heuristic on a ratio between bands, never on an
+    absolute level, so that turning the gain knob cannot change the answer.
+    Each finding reports its number so it can be disagreed with.
+    """
+    if not bands:
+        return []
+    out = []
+    hpf = f"the {preamp} 80 Hz HIGH-PASS" if preamp else "an 80 Hz high-pass"
+    deess = f"the {preamp} DE-ESSER" if preamp else "a de-esser"
+    enh = f"the {preamp} ENHANCER" if preamp else "an EQ"
+
+    rumble = bands["rumble"] - bands["low"]
+    if rumble > -10.0:
+        out.append(Finding(
+            "rumble", WARN if rumble < -4 else BAD,
+            f"sub-80 Hz is {rumble:+.0f} dB vs your fundamental", hpf,
+            "switch it in",
+            "That much energy below 80 Hz is desk thumps, footfall or HVAC, "
+            "not voice. It eats headroom and muddies everything above it."))
+    else:
+        out.append(Finding("rumble", OK, f"sub-80 Hz {rumble:+.0f} dB",
+                           why="Little below the voice, as it should be."))
+
+    sib = bands["sibilance"] - bands["presence"]
+    if sib > -3.0:
+        out.append(Finding(
+            "sibilance", WARN if sib < 0 else BAD,
+            f"5-9 kHz is {sib:+.0f} dB vs presence", deess,
+            "set Frequency near 6-7 kHz, then lower Threshold until the LED "
+            "blinks on hard S sounds only",
+            "Sibilance is close to the level of your presence band; a "
+            "balanced voice sits about 6-14 dB below it. This is the harsh "
+            "S and T sound."))
+    else:
+        out.append(Finding("sibilance", OK, f"5-9 kHz {sib:+.0f} dB",
+                           why="Sibilance is in proportion to the voice."))
+
+    mud = bands["lowmid"] - bands["mid"]
+    if mud > 6.0:
+        out.append(Finding(
+            "body", WARN, f"200-500 Hz is {mud:+.0f} dB vs midrange", enh,
+            "back off the mic a few inches, or reduce LF Detail",
+            "A large low-mid build-up is usually proximity effect from being "
+            "very close to a cardioid mic, and it reads as boxy or boomy."))
+    elif mud < -10.0:
+        out.append(Finding(
+            "body", WARN, f"200-500 Hz is {mud:+.0f} dB vs midrange", enh,
+            "try a little LF Detail",
+            "The voice is thin through the low mids, which usually means the "
+            "mic is far away or off-axis. This is the softest of these "
+            "readings -- a naturally bright voice can measure the same way, "
+            "so trust your ears over it."))
+    else:
+        out.append(Finding("body", OK, f"200-500 Hz {mud:+.0f} dB",
+                           why="Low mids are in proportion."))
+
+    air = bands["air"] - bands["presence"]
+    if air < -28.0:
+        out.append(Finding(
+            "air", WARN, f"9-16 kHz is {air:+.0f} dB vs presence", enh,
+            "add a little HF Detail",
+            "Very little top end. Some of that is the microphone itself, so "
+            "add sparingly and stop before the sibilance finding flips."))
+    return out
+
+
+def diagnose(summary, bands, profile, preamp):
+    """Everything, most consequential first."""
+    findings = (diagnose_level(summary, profile)
+                + diagnose_noise(summary, preamp)
+                + diagnose_dynamics(summary, preamp)
+                + diagnose_tone(bands, preamp))
+    rank = {BAD: 0, WARN: 1, OK: 2}
+    return sorted(findings, key=lambda f: rank[f.severity])
+
+
+def headline(findings):
+    """(state, text) summarising the findings for the top of a panel."""
+    todo = [f for f in findings if f.actionable]
+    level = next((f for f in findings if f.area == "level"), None)
+    if level is not None and level.severity == BAD:
+        return (BAD, level.reading.upper() if "clip" in level.reading
+                else "NO SIGNAL")
+    if not todo:
+        return (OK, "ALL GOOD")
+    if any(f.severity == BAD for f in todo):
+        return (BAD, f"{len(todo)} to fix")
+    return (WARN, f"{len(todo)} to adjust")
+
+
+# --------------------------------------------------------------------------
+# Sources and capture
+# --------------------------------------------------------------------------
+
+def _run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def list_sources():
+    states = {}
+    for line in _run(["pactl", "list", "short", "sources"]).splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 5:
+            states[parts[1]] = parts[-1].strip()
+
+    sources, cur = [], None
+    for line in _run(["pactl", "list", "sources"]).splitlines():
+        if line.startswith("Source #"):
+            cur = {"name": "", "desc": "", "monitor": None, "volume_db": None}
+            sources.append(cur)
+        elif cur is not None:
+            s = line.strip()
+            if s.startswith("Name: "):
+                cur["name"] = s[6:]
+            elif s.startswith("Description: "):
+                cur["desc"] = s[13:]
+            elif s.startswith("Monitor of Sink: "):
+                v = s[17:]
+                cur["monitor"] = None if v == "n/a" else v
+            elif s.startswith("Volume: ") and cur["volume_db"] is None:
+                m = re.search(r"(-?\d+(?:\.\d+)?) dB", s)
+                if m:
+                    cur["volume_db"] = float(m.group(1))
+    for s in sources:
+        s["state"] = states.get(s["name"], "")
+        s["kind"] = ("monitor" if s["monitor"]
+                     else "hardware" if s["name"].startswith("alsa_input.")
+                     else "virtual")
+    return sources
+
+
+def default_source():
+    return _run(["pactl", "get-default-source"]).strip()
+
+
+def pick_source(sources):
+    """Guess the microphone.
+
+    A score, not a rule, because every signal is only suggestive: hardware
+    beats virtual, already RUNNING is almost certainly the mic wired into your
+    chain, USB beats onboard, and a webcam is a mic of last resort.
+    """
+    best, best_score = None, -1
+    for s in sources:
+        if s["kind"] != "hardware":
+            continue
+        blob = (s["name"] + " " + s["desc"]).lower()
+        score = 0
+        if s["state"] == "RUNNING":
+            score += 4
+        if "usb" in blob:
+            score += 2
+        if not any(w in blob for w in ("webcam", "camera", "hdmi")):
+            score += 1
+        if score > best_score:
+            best, best_score = s, score
+    return best["name"] if best else default_source()
+
+
+def find(sources, name):
+    return next((s for s in sources if s["name"] == name), None)
+
+
+class Capture:
+    """A pw-record process delivering interleaved float32 blocks."""
+
+    def __init__(self, target, latency="25ms"):
+        self.target, self.latency = target, latency
+        self.proc = self.err = self.err_path = None
+
+    def __enter__(self):
+        import tempfile
+        fd, self.err_path = tempfile.mkstemp(prefix="bb-mic-", suffix=".err")
+        self.err = os.fdopen(fd, "w+")
+        self.proc = subprocess.Popen(
+            ["pw-record", "--target", self.target, "--rate", str(RATE),
+             "--channels", str(CHANNELS), "--format", "f32",
+             "--latency", self.latency, "-"],
+            stdout=subprocess.PIPE, stderr=self.err, bufsize=0)
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        try:
+            self.err.close()
+        except OSError:
+            pass
+        if self.err_path:
+            try:
+                os.unlink(self.err_path)
+            except OSError:
+                pass
+        return False
+
+    def stderr_text(self):
+        try:
+            self.err.flush()
+            self.err.seek(0)
+            return self.err.read().strip()
+        except OSError:
+            return ""
+
+    def read_block(self):
+        want, chunks = BLOCK_BYTES, []
+        while want:
+            b = self.proc.stdout.read(want)
+            if not b:
+                return None
+            chunks.append(b)
+            want -= len(b)
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def unpack_block(raw):
+    frames = struct.unpack(f"<{len(raw) // 4}f", raw)
+    return frames[0::2], frames[1::2]
+
+
+# --------------------------------------------------------------------------
+# Presentation
+# --------------------------------------------------------------------------
+
+class Palette:
+    def __init__(self, enabled):
+        self.on = enabled
+
+    def __call__(self, code, text):
+        return f"\033[{code}m{text}\033[0m" if self.on else text
+
+
+SEVERITY_COLOUR = {OK: "32", WARN: "33", BAD: "31"}
+
+
+class Glyphs:
+    """Drawing characters, with an ASCII fallback.
+
+    Every box-drawing, block and geometric-shape character here is East Asian
+    "ambiguous" width. Terminals overwhelmingly render them narrow, which is
+    what the frame padding assumes, but a terminal configured for wide
+    ambiguous characters would shear every panel. --ascii is the escape hatch.
+    """
+
+    UNICODE = dict(
+        tl="╭", tr="╮", bl="╰", br="╯", v="│", h="─",
+        fill="█", hold="│", empty="·", band="─", tlo="├", thi="┤",
+        tpeak="△", tick="┬", bars=" ▁▂▃▄▅▆▇█", dot="·", vtick="│", sep="·",
+        ok="●", warn="▲", bad="■", arrow="▶", ell="…")
+    ASCII = dict(
+        tl="+", tr="+", bl="+", br="+", v="|", h="-",
+        fill="#", hold="|", empty=".", band="-", tlo="[", thi="]",
+        tpeak="^", tick="+", bars=" .:-=+*%#", dot=".", vtick="|", sep="-",
+        ok="o", warn="!", bad="X", arrow=">", ell="...")
+
+    def __init__(self, ascii_only=False):
+        self.__dict__.update(self.ASCII if ascii_only else self.UNICODE)
+
+    @property
+    def marks(self):
+        return {OK: self.ok, WARN: self.warn, BAD: self.bad}
+
+
+G = Glyphs()
+
+
+def zone_code(db):
+    """Colour for a meter column representing this level."""
+    if db < -30:
+        return "36"
+    if db < -12:
+        return "32"
+    if db < -6:
+        return "92"
+    if db < -3:
+        return "33"
+    return "31"
+
+
+def term_width(default=100):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def ellipsize(text, width):
+    if len(text) <= width:
+        return text
+    cut = text[:max(width - 1, 1)]
+    space = cut.rfind(" ")
+    if space > width // 2:
+        cut = cut[:space]
+    return cut.rstrip(" .,-") + G.ell
+
+
+def wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+class LevelMeter:
+    """The horizontal dBFS scale, its bars, and the target markers."""
+
+    def __init__(self, width, palette):
+        self.w = width
+        self.c = palette
+
+    def pos(self, db):
+        db = min(max(db, DB_MIN), DB_MAX)
+        return int(round((db - DB_MIN) / (DB_MAX - DB_MIN) * (self.w - 1)))
+
+    def db_at(self, col):
+        return DB_MIN + (DB_MAX - DB_MIN) * col / (self.w - 1)
+
+    def ruler(self):
+        ticks, labels = [" "] * self.w, [" "] * self.w
+        last_start = self.w + 1
+        for db in reversed(TICKS):
+            p = self.pos(db)
+            text = str(db)
+            start = min(max(p - len(text) // 2, 0), self.w - len(text))
+            if start + len(text) >= last_start:
+                continue
+            ticks[p] = G.tick
+            labels[start:start + len(text)] = list(text)
+            last_start = start
+        return "".join(labels), "".join(ticks)
+
+    def bar(self, rms_db, hold_db, lo_db, hi_db):
+        fill = self.pos(rms_db) if rms_db > DB_MIN else -1
+        hold = self.pos(hold_db) if hold_db > DB_MIN else -1
+        lo, hi = self.pos(lo_db), self.pos(hi_db)
+        out = []
+        for i in range(self.w):
+            db = self.db_at(i)
+            if i <= fill:
+                out.append(self.c(zone_code(db), G.fill))
+            elif i == hold:
+                out.append(self.c(zone_code(db) + ";1", G.hold))
+            elif lo <= i <= hi:
+                out.append(self.c("32;2", G.band))
+            else:
+                out.append(self.c("2", G.empty))
+        return "".join(out)
+
+    def targets(self, lo_db, hi_db, peak_db):
+        row = [" "] * self.w
+        lo, hi = self.pos(lo_db), self.pos(hi_db)
+        for i in range(lo, hi + 1):
+            row[i] = G.band
+        row[lo], row[hi] = G.tlo, G.thi
+        label = "level"
+        if hi - lo >= len(label) + 2:
+            start = (lo + hi - len(label)) // 2 + 1
+            row[start:start + len(label)] = list(label)
+        p = self.pos(peak_db)
+        if 0 <= p < self.w and row[p] == " ":
+            row[p] = G.tpeak
+        return "".join(row)
+
+
+def spectrum_plot(spec, columns, height, palette, flagged=()):
+    """The analyzer display: log-frequency columns, block-character heights.
+
+    Returns plot rows plus a frequency axis. Bands named in `flagged` get their
+    axis label highlighted, so a de-esser finding is visible as a lit-up
+    region of the spectrum rather than only as text.
+    """
+    c = palette
+    data = spec.display(columns)
+    rows = []
+    for r in range(height):
+        # Row 0 is the top of the plot.
+        row_top = SPECTRUM_TOP - (SPECTRUM_RANGE * r / height)
+        row_bot = SPECTRUM_TOP - (SPECTRUM_RANGE * (r + 1) / height)
+        cells = []
+        for db, hold in data:
+            if db >= row_top:
+                ch = G.fill
+            elif db <= row_bot:
+                ch = " "
+            else:
+                frac = (db - row_bot) / (row_top - row_bot)
+                ch = G.bars[max(1, min(8, int(frac * 8 + 0.5)))]
+            if ch == " " and row_bot < hold <= row_top:
+                cells.append(c("2", G.dot))
+            else:
+                cells.append(c(zone_code(db), ch) if ch != " " else " ")
+        rows.append("".join(cells))
+
+    axis = [" "] * columns
+    marks = [" "] * columns
+    for hz, text in ((50, "50"), (100, "100"), (200, "200"), (500, "500"),
+                     (1000, "1k"), (2000, "2k"), (4000, "4k"), (8000, "8k"),
+                     (16000, "16k")):
+        if not SPECTRUM_LO <= hz <= SPECTRUM_HI:
+            continue
+        frac = math.log(hz / SPECTRUM_LO) / math.log(SPECTRUM_HI / SPECTRUM_LO)
+        p = min(columns - 1, max(0, int(frac * columns)))
+        start = min(max(p - len(text) // 2, 0), columns - len(text))
+        if all(axis[start + i] == " " for i in range(len(text))):
+            axis[start:start + len(text)] = list(text)
+            marks[p] = G.vtick
+
+    # Highlight the frequency span of any flagged band.
+    spans = []
+    for name, lo, hi, _ in BANDS:
+        if name not in flagged:
+            continue
+        f0 = math.log(max(lo, SPECTRUM_LO) / SPECTRUM_LO)
+        f1 = math.log(min(hi, SPECTRUM_HI) / SPECTRUM_LO)
+        d = math.log(SPECTRUM_HI / SPECTRUM_LO)
+        spans.append((int(f0 / d * columns), int(f1 / d * columns)))
+
+    def paint(line):
+        if not spans:
+            return c("2", line)
+        out = []
+        for i, ch in enumerate(line):
+            hot = any(a <= i <= b for a, b in spans)
+            out.append(c("33", ch) if hot else c("2", ch))
+        return "".join(out)
+
+    return rows, paint("".join(marks)), paint("".join(axis))
+
+
+class Screen:
+    """In-place redraw of a variable-height panel, without clearing scrollback."""
+
+    def __init__(self, stream=sys.stdout):
+        self.out = stream
+        self.last_n = 0
+
+    def __enter__(self):
+        self.out.write("\033[?25l")
+        return self
+
+    def __exit__(self, *exc):
+        self.out.write("\033[?25h")
+        self.out.flush()
+        return False
+
+    def draw(self, lines):
+        buf = [f"\033[{self.last_n}A"] if self.last_n else []
+        for ln in lines:
+            buf.append("\033[2K" + ln + "\n")
+        extra = self.last_n - len(lines)
+        if extra > 0:
+            buf.extend(["\033[2K\n"] * extra)
+            buf.append(f"\033[{extra}A")
+        self.last_n = len(lines)
+        self.out.write("".join(buf))
+        self.out.flush()
+
+
+class Keys:
+    """Non-blocking single keypresses, when stdin is a terminal."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.saved = None
+
+    def __enter__(self):
+        if self.fd is not None:
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        return False
+
+    def get(self):
+        if self.fd is None:
+            return None
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+
+# --------------------------------------------------------------------------
+# The live panel
+# --------------------------------------------------------------------------
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def vlen(text):
+    """Visible width, ignoring colour escapes."""
+    return len(ANSI_RE.sub("", text))
+
+
+class Frame:
+    """A titled box that pads around colour codes correctly."""
+
+    def __init__(self, width, palette):
+        self.w = width
+        self.c = palette
+        self.lines = []
+
+    def top(self, left, right):
+        inner = self.w - 2
+        text = f"{G.h} {left} "
+        tail = f" {right} {G.h}" if right else G.h
+        fill = max(0, inner - len(text) - len(tail))
+        self.lines.append(self.c("2", G.tl + text + G.h * fill + tail + G.tr))
+
+    def bottom(self, hint):
+        inner = self.w - 2
+        tail = f"{G.h} {hint} " if hint else ""
+        fill = max(0, inner - len(tail))
+        self.lines.append(self.c("2", G.bl + tail + G.h * fill + G.br))
+
+    def row(self, content=""):
+        pad = max(0, self.w - 4 - vlen(content))
+        bar = self.c("2", G.v)
+        self.lines.append(f"{bar} {content}{' ' * pad} {bar}")
+
+    def section(self, title, note=""):
+        line = self.c("1", title)
+        if note:
+            line += self.c("2", f"   {note}")
+        self.row(line)
+
+
+def build_live(meters, lead, spec, findings, profile, palette, width,
+               elapsed, source_desc, view, warn):
+    c = palette
+    target_rms, target_peak, _ = PROFILES[profile]
+    lo, hi = target_rms - RMS_TOLERANCE, target_rms + RMS_TOLERANCE
+    s = meters[lead].summary()
+    inner = width - 4
+
+    right = f"{source_desc}"
+    if KNOB.preamp:
+        right += f" {G.sep} {KNOB.preamp}"
+    right += f" {G.sep} {int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}"
+
+    f = Frame(width, palette)
+    f.top("mic analyzer", ellipsize(right, max(20, inner - 20)))
+
+    if view in ("level", "full"):
+        f.row()
+        f.section("LEVEL")
+        mwidth = min(max(inner - 22, 30), 67)
+        lm = LevelMeter(mwidth, palette)
+        labels, ticks = lm.ruler()
+        f.row("    " + c("2", labels))
+        f.row("    " + c("2", ticks))
+        for i, m in enumerate(meters):
+            live = m.summary()["alive"]
+            tag = c("1" if i == lead else "2", f" {'LR'[i]}  ")
+            if not live and i != lead:
+                body = c("2", f"{G.h} silent {G.h}".ljust(mwidth))
+                suffix = c("2", "    --") + c("2", "     ")
+            else:
+                body = lm.bar(m.rms_db, m.hold_db, lo, hi)
+                suffix = c("1", fmt_db(m.rms_db)) + c("2", " dBFS")
+            f.row(tag + body + "  " + suffix)
+        f.row("    " + c("2", lm.targets(lo, hi, target_peak)))
+
+    if view in ("spectrum", "full"):
+        f.row()
+        note = "speech only" if spec.frames else "waiting for speech"
+        f.section("SPECTRUM", note)
+        swidth = min(max(inner - 8, 30), 72)
+        height = 8 if view == "spectrum" else 6
+        hot = {fd.area for fd in findings if fd.severity != OK}
+        area_band = {"rumble": "rumble", "sibilance": "sibilance",
+                     "body": "lowmid", "air": "air"}
+        flagged = {band for area, band in area_band.items() if area in hot}
+        rows, marks, axis = spectrum_plot(spec, swidth, height, palette,
+                                          flagged)
+        top_lbl = f"{SPECTRUM_TOP:.0f}"
+        bot_lbl = f"{SPECTRUM_TOP - SPECTRUM_RANGE:.0f}"
+        for i, r in enumerate(rows):
+            gutter = (top_lbl if i == 0 else
+                      bot_lbl if i == len(rows) - 1 else "")
+            f.row(c("2", gutter.rjust(4)) + " " + r)
+        f.row("     " + marks)
+        f.row("     " + axis)
+
+    f.row()
+    left_w = 24
+    read = [("speech", s["speech_rms"], "dBFS"),
+            ("peaks", s["speech_peak_p95"], "dBFS"),
+            ("crest", s["crest"], "dB"),
+            ("floor", s["floor"], "dBFS"),
+            ("SNR", (s["speech_rms"] - s["floor"])
+             if s["speech_rms"] is not None and s["floor"] is not None
+             else None, "dB")]
+    left_rows = [c("1", "READINGS")]
+    for name, val, unit in read:
+        left_rows.append(f" {name:<7}" + c("1", fmt_db(val)) + c("2", f" {unit}"))
+    clips = sum(m.summary()["clip_samples"] for m in meters)
+    left_rows.append(" clips  " + (c("1;31", f"{clips:>6}") if clips
+                                   else c("2", "     0")))
+
+    right_rows = [c("1", "DIAGNOSIS")]
+    for fd in findings[:len(left_rows) - 1]:
+        mark = c(SEVERITY_COLOUR[fd.severity], G.marks[fd.severity])
+        text = fd.action if fd.actionable else fd.reading
+        right_rows.append(f"{mark} {fd.area:<10}"
+                          + c("2" if fd.severity == OK else "0",
+                              ellipsize(text, max(10, inner - left_w - 14))))
+
+    for i in range(max(len(left_rows), len(right_rows))):
+        l = left_rows[i] if i < len(left_rows) else ""
+        r = right_rows[i] if i < len(right_rows) else ""
+        f.row(l + " " * max(1, left_w - vlen(l)) + r)
+
+    state, text = headline(findings)
+    top = next((fd for fd in findings if fd.actionable), None)
+    f.row()
+    line = c(SEVERITY_COLOUR[state] + ";1", f"{G.arrow} {text}")
+    if top is not None:
+        line += "  " + ellipsize(f"{top.short_control}: {top.action}",
+                                 max(20, inner - vlen(line) - 2))
+    f.row(line)
+    if warn:
+        f.row(c("2", warn))
+    f.row()
+    f.bottom(f" {G.sep} ".join(("q quit", "r reset", "1 level",
+                                "2 spectrum", "3 full")))
+    return f.lines
+
+
+def run_live(cap, args, palette, source_desc, warn):
+    meters = [ChannelMeter(), ChannelMeter()]
+    spec = Spectrum()
+    view = args.view
+    start = time.monotonic()
+    last_draw = 0.0
+    findings = []
+
+    with Keys() as keys, Screen() as screen:
+        while True:
+            raw = cap.read_block()
+            if raw is None:
+                break
+            left, right = unpack_block(raw)
+            meters[0].process(left)
+            meters[1].process(right)
+            lead = 0 if meters[0].max_peak >= meters[1].max_peak else 1
+            spec.feed((left, right)[lead], meters[lead].live_gate())
+
+            k = keys.get()
+            if k in ("q", "Q", "\x03"):
+                break
+            if k in ("r", "R"):
+                for m in meters:
+                    m.reset()
+                spec.reset()
+                start = time.monotonic()
+            if k == "1":
+                view = "level"
+            elif k == "2":
+                view = "spectrum"
+            elif k == "3":
+                view = "full"
+
+            now = time.monotonic()
+            if now - last_draw >= 1 / 20:
+                last_draw = now
+                findings = diagnose(meters[lead].summary(), spec.band_levels(),
+                                    args.profile, KNOB.preamp)
+                width = min(term_width(), 108)
+                screen.draw(build_live(meters, lead, spec, findings,
+                                       args.profile, palette, width,
+                                       now - start, source_desc, view, warn))
+    return meters, spec
+
+
+# --------------------------------------------------------------------------
+# Guided calibration
+# --------------------------------------------------------------------------
+
+def phase(cap, seconds, meters, spec, message, palette, out, floor=None):
+    start, last = time.monotonic(), 0.0
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= seconds:
+            break
+        raw = cap.read_block()
+        if raw is None:
+            break
+        left, right = unpack_block(raw)
+        meters[0].process(left)
+        meters[1].process(right)
+        if spec is not None:
+            lead = 0 if meters[0].max_peak >= meters[1].max_peak else 1
+            gate = (meters[lead].rms_db >
+                    max(floor + GATE_ABOVE_FLOOR, GATE_ABSOLUTE)
+                    if floor is not None else meters[lead].live_gate())
+            spec.feed((left, right)[lead], gate)
+        now = time.monotonic()
+        if now - last >= 0.1:
+            last = now
+            level = max(meters[0].rms_db, meters[1].rms_db)
+            filled = int(min(max((level + 60) / 60, 0), 1) * 24)
+            bar = (palette(zone_code(level), G.fill * filled)
+                   + palette("2", G.empty * (24 - filled)))
+            out.write(f"\r\033[2K  {message}  {seconds - elapsed:4.1f}s  {bar} "
+                      f" {fmt_db(level)} dBFS")
+            out.flush()
+    out.write("\r\033[2K")
+    out.flush()
+
+
+def run_calibrate(cap, args, palette, source_desc, warn):
+    c = palette
+    out = sys.stderr if args.json else sys.stdout
+    say = lambda t="": print(t, file=out)
+    while True:
+        quiet = [ChannelMeter(), ChannelMeter()]
+        speech = [ChannelMeter(), ChannelMeter()]
+        spec = Spectrum()
+
+        say()
+        say(c("1", "  Step 1 of 2 — silence."))
+        say(c("2", "  Stop typing and stay quiet. Measuring the noise floor."))
+        phase(cap, args.duration_quiet, quiet, None,
+              "listening to the room", c, out)
+
+        floors = [m.summary()["floor"] for m in quiet]
+        lead_q = 0 if quiet[0].max_peak >= quiet[1].max_peak else 1
+        say(c("2", f"  noise floor: L {fmt_db(floors[0])} dBFS   "
+                   f"R {fmt_db(floors[1])} dBFS"))
+        say()
+        say(c("1", "  Step 2 of 2 — talk."))
+        say(c("2", "  Speak normally, the way you actually would on a call or "
+                   "stream, for the whole countdown."))
+        phase(cap, args.duration_speech, speech, spec,
+              "measuring your voice", c, out, floor=floors[lead_q])
+
+        if not args.json:
+            report(quiet, speech, spec, args, c, source_desc, warn)
+
+        if args.json or not sys.stdin.isatty():
+            return quiet, speech, spec
+        print(c("2", "  Adjust the settings, then press Enter to measure "
+                     "again — or Ctrl-C to finish."))
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return quiet, speech, spec
+
+
+def lead_channel(summaries):
+    live = [i for i, s in enumerate(summaries) if s["alive"]] or [0]
+    return max(live, key=lambda i: summaries[i]["speech_rms"]
+               if summaries[i]["speech_rms"] is not None else DB_FLOOR)
+
+
+def report(quiet, speech, spec, args, c, source_desc, warn):
+    target_rms, target_peak, desc = PROFILES[args.profile]
+    qfloors = [m.summary()["floor"] for m in quiet]
+    summaries = [m.summary(qfloors[i]) for i, m in enumerate(speech)]
+    lead = lead_channel(summaries)
+    s = summaries[lead]
+    bands = spec.band_levels()
+    findings = diagnose(s, bands, args.profile, KNOB.preamp)
+    width = min(term_width(), 84)
+
+    print()
+    chain = f" · via {KNOB.preamp}" if KNOB.preamp else ""
+    print("  " + c("1", "RESULT") + c("2", f"   {source_desc} · channel "
+                                          f"{'LR'[lead]}{chain} · {args.profile}"))
+    print(c("2", f"          {desc}"))
+    print()
+
+    def row(label, value, unit, note=""):
+        val = fmt_db(value)
+        print((f"    {label:<16}" + c("1", val) + c("2", f" {unit:<5}")
+               + c("2", f"  {note}")).rstrip())
+
+    print("  " + c("1", "LEVEL"))
+    row("speech level", s["speech_rms"], "dBFS", f"target {target_rms:+.0f} "
+        f"±{RMS_TOLERANCE:.0f}")
+    row("peaks (p95)", s["speech_peak_p95"], "dBFS", f"target {target_peak:+.0f}")
+    row("loudest peak", s["max_peak"], "dBFS",
+        f"{-s['max_peak']:.1f} dB of headroom left"
+        if s["max_peak"] > DB_FLOOR else "")
+    row("crest factor", s["crest"], "dB", crest_note(s["crest"]))
+    if s["clip_samples"]:
+        print(f"    {'clipped':<16}" + c("1;31", f"{s['clip_samples']:>6}")
+              + c("2", " samples"))
+    print()
+
+    print("  " + c("1", "NOISE"))
+    row("noise floor", qfloors[lead], "dBFS", floor_note(qfloors[lead]))
+    snr = (s["speech_rms"] - qfloors[lead]
+           if s["speech_rms"] is not None and qfloors[lead] is not None else None)
+    row("signal / noise", snr, "dB", snr_note(snr))
+    print()
+
+    if bands:
+        print("  " + c("1", "TONE") + c("2", "   share of speech energy, "
+                                             "relative to the whole voice"))
+        peak_band = max(BANDS, key=lambda b: bands[b[0]])[0]
+        area_band = {"rumble": "rumble", "sibilance": "sibilance",
+                     "body": "lowmid", "air": "air"}
+        hot = {area_band[f.area]: f.severity for f in findings
+               if f.area in area_band and f.severity != OK}
+        for name, _, _, label in BANDS:
+            v = bands[name]
+            n = max(0, min(26, int((v + 40) / 40 * 26)))
+            colour = SEVERITY_COLOUR[hot[name]] if name in hot else "36;2"
+            bar = c(colour, G.fill * n)
+            tag = ("  <- most energy" if name == peak_band else
+                   "  <- flagged" if name in hot else "")
+            print((f"    {name:<10}{label:>8}  " + c("1", f"{v:6.1f}")
+                   + c("2", " dB  ") + bar + c("2", tag)).rstrip())
+        print()
+
+    todo = [f for f in findings if f.actionable]
+    strip = KNOB.preamp or "your chain"
+    if todo:
+        print("  " + c("1", f"WHAT TO CHANGE ON {strip.upper()}"))
+        print()
+        body_w = min(width - 10, 68)
+        for i, fd in enumerate(todo, 1):
+            colour = SEVERITY_COLOUR[fd.severity]
+            print(f"    {c(colour + ';1', str(i) + '.')}  "
+                  + c("1", fd.short_control))
+            for line in wrap(fd.action, body_w):
+                print(f"        {c(colour, line)}")
+            for line in wrap(fd.why, body_w):
+                print(c("2", f"        {line}"))
+            print(c("2", f"        measured: {fd.reading}"))
+            print()
+    else:
+        print("  " + c("1;32", f"{G.arrow} NOTHING TO CHANGE"))
+        print(c("2", "    Every reading is inside its target range."))
+        print()
+
+    fine = [f for f in findings if f.severity == OK]
+    if fine and todo:
+        print(c("2", "    Already fine: "
+                     + ", ".join(f.area for f in fine) + "."))
+        print()
+    if warn:
+        print(c("2", f"    {warn}"))
+        print()
+
+
+def crest_note(crest):
+    if crest is None:
+        return ""
+    if crest < 6:
+        return "heavily compressed"
+    if crest < 12:
+        return "compressed"
+    if crest < 18:
+        return "natural speech dynamics"
+    return "very dynamic — nothing is compressing"
+
+
+def floor_note(floor):
+    if floor is not None and floor < -85.0:
+        return "suspiciously low — a gate is probably closing"
+    return ""
+
+
+def snr_note(snr):
+    if snr is None:
+        return ""
+    if snr >= 45:
+        return "excellent"
+    if snr >= 35:
+        return "good"
+    if snr >= 25:
+        return "audible hiss"
+    return "noisy — mic too far away, or gain too low"
+
+
+def emit_json(quiet, speech, spec, profile):
+    import json
+    qfloors = [m.summary()["floor"] for m in quiet]
+    summaries = [m.summary(qfloors[i]) for i, m in enumerate(speech)]
+    lead = lead_channel(summaries)
+    s = dict(summaries[lead])
+    bands = spec.band_levels()
+    findings = diagnose(summaries[lead], bands, profile, KNOB.preamp)
+    state, text = headline(findings)
+    s.update({
+        "channel": "LR"[lead], "profile": profile, "preamp": KNOB.preamp,
+        "state": state, "headline": text, "bands": bands,
+        "findings": [{"area": f.area, "severity": f.severity,
+                      "reading": f.reading, "control": f.control,
+                      "action": f.action, "why": f.why} for f in findings],
+    })
+    print(json.dumps(s, indent=2))
+
+
+# --------------------------------------------------------------------------
+
+def show_list(sources, c):
+    default, auto = default_source(), pick_source(sources)
+    print()
+    print("  " + c("1", "Inputs this can measure"))
+    print()
+    for s in sorted(sources, key=lambda x: (x["kind"] != "hardware",
+                                            x["kind"] != "virtual", x["name"])):
+        marks = []
+        if s["name"] == auto:
+            marks.append(c("1;32", "auto"))
+        if s["name"] == default:
+            marks.append(c("36", "system default"))
+        note = ("  " + " ".join(marks)) if marks else ""
+        print(f"    {c('1', s['name'])}{note}")
+        print(f"      {c('2', s['desc'])}")
+        print(f"      {c('2', s['kind'] + ', ' + (s['state'].lower() or 'unknown'))}")
+    print()
+    print(c("2", "  A hardware source measures the signal at the interface, "
+                 "which is what the"))
+    print(c("2", "  gain controls. A virtual one (bb_b1) measures what "
+                 "applications record,"))
+    print(c("2", "  after BetterBanana's processing."))
+    print()
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="mic-gain",
+        description="Analyze a microphone and say which control to change.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  mic-gain                       live analyzer: meters, spectrum, diagnosis
+  mic-gain --calibrate           guided measurement -> a settings report
+  mic-gain --list                show the inputs it can measure
+  mic-gain --preamp 'dbx 286s'   name that strip's controls in the advice
+  mic-gain -s bb_b1              measure what applications actually record
+  mic-gain -p stream             aim for streaming levels instead
+
+keys in the live view:
+  q  quit          1  level only
+  r  reset stats   2  spectrum only        3  full
+
+gain staging with an external channel strip:
+  Three knobs can change the level and only one of them should. Set the
+  interface gain once to a clean reference and leave it (use the 1/4" TRS side
+  of the combo jack, which is the line input -- an XLR cable puts the strip's
+  line-level output into the interface's own mic preamp, stacking two of them).
+  Set the strip's INPUT gain for the compression you want, watching its gain
+  reduction meter, because that knob changes the sound and not just the level.
+  Then set recording level with the strip's OUTPUT gain -- the knob --preamp
+  makes this tool point at.
+
+what is measured versus what is inferred:
+  Level, peak, crest and clipping are exact. The tone findings are heuristics
+  on ratios between frequency bands, and each one prints the number it came
+  from so you can disagree with it. Nothing tonal is measured outside speech.
+
+The knob-degree hints assume roughly 50 dB over a 300 degree sweep, which is
+the interface knob; with --preamp they are suppressed unless MIC_DEG_PER_DB
+is set, since the taper of an unknown knob is not worth guessing.""")
+    p.add_argument("-s", "--source", default=os.environ.get("MIC_SOURCE"),
+                   help="source to measure (default: auto-detect the mic)")
+    p.add_argument("-p", "--profile", choices=sorted(PROFILES),
+                   default=os.environ.get("MIC_PROFILE", "voice"),
+                   help="what you are levelling for (default: voice)")
+    p.add_argument("-c", "--calibrate", action="store_true",
+                   help="guided measurement and a written settings report")
+    p.add_argument("-l", "--list", action="store_true",
+                   help="list candidate sources and exit")
+    p.add_argument("--preamp", default=os.environ.get("MIC_PREAMP"),
+                   metavar="NAME",
+                   help="external preamp / channel strip between mic and "
+                        "interface (e.g. 'dbx 286s'). Names its controls in "
+                        "the advice, and points level changes at its OUTPUT "
+                        "gain rather than the interface")
+    p.add_argument("--view", choices=("level", "spectrum", "full"),
+                   default="full", help="starting live view (default: full)")
+    p.add_argument("--duration-quiet", type=float, default=5.0, metavar="SEC",
+                   help="silence phase length (default: 5)")
+    p.add_argument("--duration-speech", type=float, default=15.0, metavar="SEC",
+                   help="speech phase length (default: 15)")
+    p.add_argument("--latency", default="25ms",
+                   help="capture latency passed to pw-record (default: 25ms)")
+    p.add_argument("--json", action="store_true",
+                   help="with --calibrate, print the result as JSON")
+    p.add_argument("--ascii", action="store_true",
+                   help="draw with ASCII only, for terminals that render "
+                        "box-drawing characters double-width")
+    p.add_argument("--no-color", action="store_true", help="disable colour")
+    args = p.parse_args()
+
+    global KNOB, G
+    KNOB = Knob.for_preamp(args.preamp)
+    G = Glyphs(args.ascii)
+
+    colour = (sys.stdout.isatty() and not args.no_color
+              and not os.environ.get("NO_COLOR"))
+    c = Palette(colour)
+
+    sources = list_sources()
+    if not sources:
+        print("No audio sources found. Is PipeWire running?", file=sys.stderr)
+        return 1
+
+    if args.list:
+        show_list(sources, c)
+        return 0
+
+    target = args.source or pick_source(sources)
+    info = find(sources, target)
+    if info is None and args.source:
+        print(f"No source named {target!r}. Try --list.", file=sys.stderr)
+        return 1
+
+    desc = info["desc"] if info else target
+    warn = ""
+    if info and info["volume_db"] not in (None, 0.0):
+        warn = (f"note: this source has {info['volume_db']:+.1f} dB of software "
+                f"volume on top of the hardware controls")
+    if info and info["kind"] == "monitor":
+        warn = "note: this is a monitor of an output, not a microphone input"
+
+    try:
+        with Capture(target, args.latency) as cap:
+            first = cap.read_block()
+            if first is None:
+                err = cap.stderr_text()
+                print(f"Could not capture from {target!r}.", file=sys.stderr)
+                if err:
+                    print(err, file=sys.stderr)
+                return 1
+            del first   # 21 ms, discarded: it only proved the stream opened
+            if args.calibrate:
+                quiet, speech, spec = run_calibrate(cap, args, c, desc, warn)
+                if args.json:
+                    emit_json(quiet, speech, spec, args.profile)
+            else:
+                run_live(cap, args, c, desc, warn)
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
