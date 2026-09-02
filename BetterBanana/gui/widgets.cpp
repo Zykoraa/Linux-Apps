@@ -287,8 +287,10 @@ void LevelMeter::paintEvent(QPaintEvent*)
     // of motion. setLevels keeps the repaints coming while it is latched.
     if (m_clipped) {
         const int ch = bbui::px(5);
+        // Floored at 0.45: the first version swung to zero, so for part of
+        // every cycle the one indicator that matters was not there at all.
         const double phase = (m_clock.elapsed() % 900) / 900.0;
-        const double k = 0.55 + 0.45 * std::cos(phase * 2.0 * M_PI);
+        const double k = 0.72 + 0.28 * std::cos(phase * 2.0 * M_PI);
         p.fillRect(0, top, w, ch, bbcolor::mix(t.well, t.meterPeak, k));
         p.fillRect(0, top + ch, w, 1, bbcolor::onColor(t.meterPeak));
     }
@@ -305,7 +307,8 @@ void LevelMeter::paintEvent(QPaintEvent*)
             f.setBold(true);
             bbui::makeTabular(f);
             p.setFont(f);
-            const QString txt = QString::number(int(std::lround(hp)));
+            const int ip = int(std::lround(hp));
+            const QString txt = ip > 0 ? "+" + QString::number(ip) : QString::number(ip);
             const QRect box(0, top + (m_clipped ? bbui::px(7) : 1), w, bbui::px(11));
             // The halo is the trough colour, not black: a black outline on a
             // light theme reads as a smudge rather than a number.
@@ -374,8 +377,13 @@ void EqThumb::paintEvent(QPaintEvent*)
             if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
         }
         // A bypassed block still shows its shape, so you can see what turning it
-        // on would do - just not as though it were doing it.
-        p.setPen(QPen(m_on ? t.eqOn : bbcolor::mix(t.eqOn, t.well, 0.62), 1.6));
+        // on would do - just not as though it were doing it. Dashed rather than
+        // faded: fading it to 0.62 toward the trough made it a smudge in every
+        // theme, where a dashed line at full contrast reads as a line that is
+        // deliberately not in circuit.
+        QPen pen(m_on ? t.eqOn : bbcolor::ensureContrast(t.eqOn, t.well, 2.4), 1.6);
+        if (!m_on) { pen.setStyle(Qt::DashLine); pen.setDashPattern({ 4, 3 }); }
+        p.setPen(pen);
         p.setBrush(Qt::NoBrush);
         p.drawPath(path);
     }
@@ -385,11 +393,21 @@ void EqThumb::paintEvent(QPaintEvent*)
     p.drawRoundedRect(r, bbui::radWell(), bbui::radWell());
 
     if (!m_on) {
+        // Bottom-left, on a plate: it used to be painted over the curve it was
+        // describing, in the corner the curve most often occupies.
         QFont f = p.font();
         f.setPixelSize(qMax(7, bbui::fs(8)));
+        f.setBold(true);
         p.setFont(f);
-        p.setPen(bbcolor::ensureContrast(t.textDim, t.well, 3.0));
-        p.drawText(r.adjusted(4, 2, -4, 0), Qt::AlignLeft | Qt::AlignTop, "EQ OFF");
+        const QString tag = "BYPASS";
+        const QRectF box = QFontMetricsF(f).boundingRect(tag)
+                               .adjusted(-3, -1, 3, 1)
+                               .translated(r.left() + 4, r.bottom() - 5);
+        p.setPen(Qt::NoPen);
+        p.setBrush(t.well);
+        p.drawRoundedRect(box, 2, 2);
+        p.setPen(bbcolor::ensureContrast(t.textDim, t.well, bbcolor::kTextFloor));
+        p.drawText(box, Qt::AlignCenter, tag);
     }
 }
 

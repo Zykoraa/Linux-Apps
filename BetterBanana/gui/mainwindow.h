@@ -48,6 +48,8 @@ public:
     void setTravel(int px);
     bool isHardware() const { return m_hardware; }
     int  meterTop() const;
+    int  leadPad() const;
+    void setLeadPad(int px);
     void refreshBusTips(const QStringList& names);
 
 signals:
@@ -90,6 +92,8 @@ private:
     ReductionBar* m_compGr = nullptr;
     ReductionBar* m_duckGr = nullptr;
     QVector<QPushButton*> m_busBtns;
+    class QSpacerItem* m_lead = nullptr;
+    class QVBoxLayout* m_root = nullptr;
 };
 
 // One output bus: A1..A3 drive hardware, B1/B2 are virtual sources.

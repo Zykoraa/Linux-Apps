@@ -173,10 +173,24 @@ QString buildStyleSheet(const Theme& t)
     // A strip that is not soloed while something else is, and a strip whose
     // device is named but not attached. Both are states the engine already
     // knew about and the window never showed.
-    s += QString("QWidget[role=\"card\"][dim=\"true\"],"
-                 "QWidget[role=\"cardVirtual\"][dim=\"true\"]"
-                 "{background:%1;border-color:%2;}")
-            .arg(c(bbcolor::mix(t.panel, t.bg, 0.75)), c(bbcolor::mix(t.border, t.bg, 0.6)));
+    // A strip that a solo elsewhere has silenced. The first attempt blended
+    // toward bg and measured 1.03:1 against an undimmed card - which is to say
+    // it showed nothing. This steps away from the card in the direction there
+    // is room, and marks the edge in the solo colour so the reason is legible
+    // and not only the effect.
+    {
+        const QColor dimCard = bbcolor::nudge(t.panel, t.dark ? -7.0 : 7.0);
+        s += QString("QWidget[role=\"card\"][dim=\"true\"],"
+                     "QWidget[role=\"cardVirtual\"][dim=\"true\"]"
+                     "{background:%1;border-color:%2;}")
+                .arg(c(dimCard), c(bbcolor::mix(t.solo, t.panel, 0.55)));
+        // Deliberately no descendant rule for the labels inside a dimmed card.
+        // A "QWidget[role=...] QLabel" selector makes QStyleSheetStyle take
+        // over every label in every strip, and it then computes their size
+        // hints through the stylesheet box model - which widened the card's
+        // layout minimum from 140px to 166px, for all ten of them, whether or
+        // not anything was ever soloed. The plate and the edge carry the state.
+    }
     s += QString("QLabel[role=\"header\"][nodev=\"true\"],"
                  "QLabel[role=\"headerA\"][nodev=\"true\"]"
                  "{background:%1;color:%2;}")

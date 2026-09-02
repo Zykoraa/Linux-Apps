@@ -27,9 +27,40 @@ namespace bbui {
 // bigger than their desktop's idea of 100%.
 inline double& scaleRef() { static double s = 1.0; return s; }
 inline double  scale()             { return scaleRef(); }
-inline void    setScale(double s)  { scaleRef() = std::clamp(s, 1.0, 2.0); }
 
-inline int px(int v) { return int(std::lround(v * scale())); }
+// How much bigger the desktop's own font is than the 10pt this design was laid
+// out against.
+//
+// Point size, not pixel size, deliberately. A font's pixel size already carries
+// the display's DPI, and Qt6 has separately scaled the whole UI for that - so
+// deriving geometry from it counts the same scaling twice and made the window
+// 23% wider on a 115dpi offscreen surface than on a 96dpi one, for the same
+// user preference. Point size is what the user actually chose.
+//
+// Cached: px() is called from every constructor and several paintEvents.
+inline double& fontRatioRef() { static double r = -1.0; return r; }
+inline double  fontRatio()
+{
+    double& r = fontRatioRef();
+    if (r < 0.0) {
+        const QFont f = QGuiApplication::font();
+        r = f.pointSizeF() > 0.0
+                ? std::clamp(f.pointSizeF() / 10.0, 0.85, 2.0)
+                : std::clamp(std::max(9, f.pixelSize()) / 13.0, 0.85, 2.0);
+    }
+    return r;
+}
+
+inline void setScale(double s)
+{
+    scaleRef() = std::clamp(s, 1.0, 2.0);
+    fontRatioRef() = -1.0;              // re-measure against the current font
+}
+
+// Sizes track the type, not just the interface-size preference. They used to be
+// decoupled, so a desktop asking for a 16px font grew every label by 23% inside
+// boxes that stayed exactly where they were.
+inline int px(int v) { return int(std::lround(v * fontRatio() * scale())); }
 
 // --- spacing, base 4 ------------------------------------------------------
 
@@ -67,11 +98,7 @@ inline int radCard() { return px(6); }   // cards and group boxes
 //
 // Anchored to the desktop's own font size so today's proportions are preserved
 // at the common 13px default and everything grows together above it.
-inline double typeK()
-{
-    const int base = std::max(9, QFontInfo(QGuiApplication::font()).pixelSize());
-    return std::clamp(base / 13.0, 0.85, 2.0) * scale();
-}
+inline double typeK() { return fontRatio() * scale(); }
 
 inline int fs(double logical)
 {

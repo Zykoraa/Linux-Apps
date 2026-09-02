@@ -172,6 +172,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
     setProperty("role", hardware ? "card" : "cardVirtual");
     setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QVBoxLayout(this);
+    m_root = root;
     root->setContentsMargins(bbui::gapS() + 1, bbui::gapS() + 2, bbui::gapS() + 1, bbui::gapS() + 2);
     root->setSpacing(bbui::gapS());
     m_header = makeHeader(labelFor(shm, true, index, title), "header");
@@ -286,6 +287,12 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
     }
 
     {   // Fader + meter
+        // A virtual strip has no gate/comp grid, so without this its meter
+        // starts 76px above a hardware strip's and the bridge stops reading
+        // across. MainWindow measures the tallest card and pads the rest.
+        m_lead = new QSpacerItem(0, 0, QSizePolicy::Minimum, QSizePolicy::Fixed);
+        root->addItem(m_lead);
+
         auto* row = new QHBoxLayout;
         row->setSpacing(0);          // the meter is the fader's companion
         m_fader = new Fader(-600, 120, 0);
@@ -357,6 +364,16 @@ static void restyle(QWidget* w, const char* name, bool on)
     w->style()->unpolish(w);
     w->style()->polish(w);
     w->update();
+}
+
+int  StripWidget::leadPad() const  { return m_lead ? m_lead->geometry().height() : 0; }
+
+void StripWidget::setLeadPad(int px)
+{
+    if (!m_lead || px < 0) return;
+    if (m_lead->sizeHint().height() == px) return;
+    m_lead->changeSize(0, px, QSizePolicy::Minimum, QSizePolicy::Fixed);
+    m_root->invalidate();
 }
 
 void StripWidget::setTravel(int px)
@@ -2601,7 +2618,12 @@ void MainWindow::tick()
             for (auto* s : m_strips) s->setTravel(want);
             for (auto* b : m_buses)  b->setTravel(want);
         }
-        const int top = m_strips.first()->meterTop();
-        for (auto* b : m_buses) b->setLeadPad(top - (b->meterTop() - b->leadPad()));
+        // Every card, not just the buses: the tallest pre-fader stack sets the
+        // line and everything else is padded up to it.
+        int top = 0;
+        for (auto* w : m_strips) top = qMax(top, w->meterTop() - w->leadPad());
+        for (auto* b : m_buses)  top = qMax(top, b->meterTop() - b->leadPad());
+        for (auto* w : m_strips) w->setLeadPad(top - (w->meterTop() - w->leadPad()));
+        for (auto* b : m_buses)  b->setLeadPad(top - (b->meterTop() - b->leadPad()));
     }
 }

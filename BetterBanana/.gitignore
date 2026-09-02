@@ -1,4 +1,7 @@
 build/
+# Parallel builds: `make BUILD=build-x` is how several jobs share one tree
+# without racing each other over build/.
+build-*/
 *.tar.gz
 *.o
 *.bbp
