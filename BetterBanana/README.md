@@ -17,6 +17,8 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 - Sidechain ducking: music steps back while you talk
 - 12-band parametric EQ on **every strip and every bus**: shelves, pass filters,
   preamp, draggable curve over a live spectrum analyser
+- Voice changer per input strip: pitch shift, drive, ring mod, bit crush,
+  chorus and echo, with presets
 - Undo and redo across the whole mixer, however a change was made
 - Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
 - Headphone corrections for ~8850 models from the AutoEq database, searchable
@@ -269,6 +271,65 @@ From the shell, `bb-autoeq` does the same thing and is easy to bind to a key:
 
 It downloads the profile and hands it to `bb-ctl eq load`, so the parsing, the
 band fitting and the preamp are the mixer's own code.
+
+## Voice changer
+
+Every input strip has one, behind the **FX** button next to its EQ — left-click
+to bypass, right-click to edit, or **Engine → Voice changer**. It sits *after*
+that strip's EQ and *before* its fader, so the EQ cleans the real voice going in
+rather than the artefacts coming out, and the fader still means level.
+
+| Control | What it does |
+|---|---|
+| **PITCH** | ±12 semitones. Zero is a true bypass. |
+| **DRIVE** | tanh saturation, normalised so it changes shape rather than level |
+| **RING** / **RING MIX** | ring modulator — the robot voice. 0 Hz is off. |
+| **BITS** / **HOLD** | bit depth and sample-and-hold, separately |
+| **CHORUS** / **CH RATE** / **CH MIX** | modulated delay, for thickening or detune |
+| **ECHO** / **FEEDBACK** / **ECHO MIX** | up to 1 s |
+| **GAIN** | makeup, because most of the above change the level |
+
+Ten presets ship with it — Chipmunk, Squeaky, Deep, Demon, Robot, Alien, Lo-fi,
+Cave, Detuned and Off — and the combo drops to *(custom)* the moment you move a
+knob off one. Everything a preset does is reachable by hand; they exist so the
+first thing you do is not stare at twelve knobs.
+
+    bb-ctl fx list                          # what is available
+    bb-ctl strip 0 fx preset "Demon"
+    bb-ctl strip 0 fx pitch -5              # or set it by hand
+    bb-ctl strip 0 fx echo 160 0.45 0.4
+    bb-ctl strip 0 fx show
+    bb-ctl strip 0 fx off
+
+**A telephone or radio voice is an EQ recipe, not an effect** — a high pass at
+300 Hz and a low pass at 3.4 kHz on the strip's own EQ is the whole trick. No
+preset touches your EQ, because silently rewriting a curve you tuned would be a
+nasty surprise.
+
+### How the pitch shifter works, and what it costs
+
+It is a delay-line shifter: one read head sweeps through a buffer at the pitch
+ratio, and a second head takes over across a short crossfade each time the first
+runs out of window. No FFT on the audio thread, no allocation, no dependency.
+
+Two consequences worth knowing:
+
+- **It adds about 20 ms**, on top of the engine's own buffering. Your listeners
+  will not notice — they are further away than that already — but *you* hearing
+  yourself through it will. Use your interface's direct monitoring for your own
+  ears and take the strip off the bus feeding your headphones, so the effect
+  only sits on the path going out.
+- **There is a faint warble on speech** that a phase vocoder would not have, at
+  the rate the head wraps: about 8 Hz for a five-semitone shift. That is the
+  price of the cheap algorithm, and it is why the crossfade is short rather than
+  the more obvious half-window overlap — two heads summed the whole time sit a
+  fixed distance apart and cancel each other wherever that distance is a half
+  period, which sounds hollow. `tests/test_voicefx.cpp` measures the result with
+  the analyser's own FFT and checks the shifted tone is the dominant partial.
+
+Pitch is not formant-corrected, so a large shift sounds like tape speed rather
+than a different-sized person. Doing better means a phase vocoder with spectral
+envelope warping, or linking RubberBand — which is GPL, and this is MIT.
 
 ## Analysing a microphone
 
@@ -723,8 +784,9 @@ strip** (`s0`–`s4`), because they are the same kind of block:
 
     ./build/test_dsp          # 30 DSP assertions, no audio server needed
     ./build/test_eq           # 45 EQ profile / import / preset assertions
-    ./build/test_preset       # 44 preset, startup and per-device assertions
+    ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
+    ./build/test_voicefx      # 22 voice changer assertions, pitch measured by FFT
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
 
@@ -762,7 +824,8 @@ binaries refuse to talk instead of silently writing to the wrong offsets.
 Working and verified: virtual devices, routing matrix, per-strip gate /
 compressor / tone knobs / audibility / Intellipan / mono / solo / mute / fader,
 the 12-band parametric EQ on every strip and bus with profiles, AutoEq import
-and a live spectrum analyser, undo across the whole mixer, per-bus mono / mute /
-fader, metering, hardware assignment, the tape deck, and VBAN send/receive.
+and a live spectrum analyser, the per-strip voice changer, undo across the whole
+mixer, per-bus mono / mute / fader, metering, hardware assignment, the tape deck,
+and VBAN send/receive.
 
 Not implemented: the surround bus modes, which need buses wider than stereo.

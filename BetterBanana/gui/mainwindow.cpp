@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "eqdialog.h"
+#include "fxdialog.h"
 #include "theme.h"
 #include "../common/preset.h"
 #include "../engine/dsp.h"
@@ -202,7 +203,9 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         root->addLayout(g);
 
         // The three knobs are a fixed tone control; the twelve-band parametric
-        // lives behind this button, exactly as it does on a bus.
+        // and the voice changer live behind these two, as the bus EQ does.
+        auto* row = new QHBoxLayout;
+        row->setSpacing(2);
         m_eqBtn = makeToggle("EQ", "eq", 19);
         m_eqBtn->setToolTip("Twelve-band parametric EQ, after the tone knobs.\n"
                             "Left-click: enable/bypass.  Right-click: edit.");
@@ -210,7 +213,18 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         connect(m_eqBtn, &QPushButton::customContextMenuRequested, this,
                 [this](const QPoint&) { emit eqEditRequested(m_index); });
         connect(m_eqBtn, &QPushButton::toggled, this, [&p](bool b){ p.eq.on.store(b ? 1 : 0); });
-        root->addWidget(m_eqBtn);
+        row->addWidget(m_eqBtn);
+
+        m_fxBtn = makeToggle("FX", "solo", 19);
+        m_fxBtn->setToolTip("Voice changer: pitch, drive, ring mod, crush, "
+                            "chorus, echo.\n"
+                            "Left-click: enable/bypass.  Right-click: edit.");
+        m_fxBtn->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_fxBtn, &QPushButton::customContextMenuRequested, this,
+                [this](const QPoint&) { emit fxEditRequested(m_index); });
+        connect(m_fxBtn, &QPushButton::toggled, this, [&p](bool b){ p.fx.on.store(b ? 1 : 0); });
+        row->addWidget(m_fxBtn);
+        root->addLayout(row);
     }
 
     {   // Mono / Solo / Mute
@@ -357,6 +371,7 @@ void StripWidget::pullFromShm()
     m_mono->setChecked(p.mono.load()); m_solo->setChecked(p.solo.load());
     m_mute->setChecked(p.mute.load());
     if (m_eqBtn) m_eqBtn->setChecked(p.eq.on.load() != 0);
+    if (m_fxBtn) m_fxBtn->setChecked(p.fx.on.load() != 0);
     for (int b = 0; b < m_busBtns.size(); ++b) m_busBtns[b]->setChecked(p.bus_on[b].load() != 0);
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     static const char* kDefault[kStrips] = {
@@ -1265,6 +1280,7 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
                     applyDeviceStrip(idx, n);
                 });
         connect(s, &StripWidget::eqEditRequested, this, &MainWindow::openStripEq);
+        connect(s, &StripWidget::fxEditRequested, this, &MainWindow::openStripFx);
         connect(s, &StripWidget::statusMessage, this,
                 [this](const QString& t) { statusBar()->showMessage(t, 7000); });
         m_strips.push_back(s);
@@ -1357,6 +1373,17 @@ void MainWindow::openStripEq(int strip)
     // -1: a microphone has no measured headphone correction to look up.
     EqEditorDialog(m_shm, &m_shm->strip[strip].eq, spec_strip_src(strip),
                    labelFor(m_shm, true, strip, kDefault[strip]), -1, this).exec();
+    m_strips[strip]->pullFromShm();
+}
+
+void MainWindow::openStripFx(int strip)
+{
+    if (strip < 0 || strip >= kStrips) return;
+    static const char* kDefault[kStrips] = {
+        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
+        "BetterBanana VAIO", "BetterBanana AUX"
+    };
+    VoiceFxDialog(m_shm, strip, labelFor(m_shm, true, strip, kDefault[strip]), this).exec();
     m_strips[strip]->pullFromShm();
 }
 
@@ -1557,6 +1584,17 @@ void MainWindow::buildMenus()
     for (int i = 0; i < kStrips; ++i)
         inEq->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
                         this, [this, i] { openStripEq(i); });
+
+    auto* fxMenu = eng->addMenu("&Voice changer");
+    connect(fxMenu, &QMenu::aboutToShow, this, [this, fxMenu] {
+        fxMenu->clear();
+        for (int i = 0; i < kStrips; ++i)
+            fxMenu->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+                              this, [this, i] { openStripFx(i); });
+    });
+    for (int i = 0; i < kStrips; ++i)
+        fxMenu->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+                          this, [this, i] { openStripFx(i); });
 
     auto* eqMenu = eng->addMenu("&Bus EQ");
     connect(eqMenu, &QMenu::aboutToShow, this, [this, eqMenu] {

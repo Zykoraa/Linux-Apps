@@ -21,11 +21,12 @@
 
 namespace bb {
 
-// 3 added the per-strip parametric EQ, and the two strip fields (mono-source
-// fold, limiter ceiling) that had never been written. 2 added the per-band
-// filter type / bypass flag and the bus EQ preamp. Both still load: every
-// field a file omits is reset to its default rather than left over.
-constexpr int kPresetVersion = 3;
+// 4 added the per-strip voice changer. 3 added the per-strip parametric EQ,
+// and the two strip fields (mono-source fold, limiter ceiling) that had never
+// been written. 2 added the per-band filter type / bypass flag and the bus EQ
+// preamp. All still load: every field a file omits is reset to its default
+// rather than left over from whatever was loaded before.
+constexpr int kPresetVersion = 4;
 
 inline std::string preset_dir()
 {
@@ -120,6 +121,51 @@ inline bool read_band(EqParams& p, int k, const char* val)
     return true;
 }
 
+// The voice changer, under whatever key prefix the caller uses: "strip.0.fx"
+// in a preset, plain "fx" in a per-device strip snapshot.
+inline void write_fx(std::string& out, const std::string& kp, const VoiceFx& p)
+{
+    addf(out, "%son %d\n",          kp.c_str(), p.on.load());
+    addf(out, "%spitch %.3f\n",     kp.c_str(), p.pitch.load());
+    addf(out, "%sdrive %.3f\n",     kp.c_str(), p.drive.load());
+    addf(out, "%sring %.3f %.4f\n", kp.c_str(), p.ring_hz.load(), p.ring_mix.load());
+    addf(out, "%scrush %d %d\n",    kp.c_str(), p.bits.load(), p.downsample.load());
+    addf(out, "%secho %.3f %.4f %.4f\n", kp.c_str(),
+         p.echo_ms.load(), p.echo_fb.load(), p.echo_mix.load());
+    addf(out, "%schorus %.3f %.4f %.4f\n", kp.c_str(),
+         p.chorus_ms.load(), p.chorus_hz.load(), p.chorus_mix.load());
+    addf(out, "%sgain %.3f\n",      kp.c_str(), p.gain_db.load());
+}
+
+// `what` is the part of the key after the prefix: "on", "pitch", "ring", ...
+inline bool read_fx(VoiceFx& p, const char* what, const char* val)
+{
+    float a = 0, b = 0, c = 0;
+    int   ia = 0, ib = 0;
+    if      (!std::strcmp(what, "on"))    p.on.store(atoi(val) ? 1 : 0);
+    else if (!std::strcmp(what, "pitch")) p.pitch.store(atof(val));
+    else if (!std::strcmp(what, "drive")) p.drive.store(atof(val));
+    else if (!std::strcmp(what, "gain"))  p.gain_db.store(atof(val));
+    else if (!std::strcmp(what, "ring")) {
+        if (sscanf(val, "%f %f", &a, &b) != 2) return false;
+        p.ring_hz.store(a); p.ring_mix.store(b);
+    }
+    else if (!std::strcmp(what, "crush")) {
+        if (sscanf(val, "%d %d", &ia, &ib) != 2) return false;
+        p.bits.store(ia); p.downsample.store(ib < 1 ? 1 : ib);
+    }
+    else if (!std::strcmp(what, "echo")) {
+        if (sscanf(val, "%f %f %f", &a, &b, &c) != 3) return false;
+        p.echo_ms.store(a); p.echo_fb.store(b); p.echo_mix.store(c);
+    }
+    else if (!std::strcmp(what, "chorus")) {
+        if (sscanf(val, "%f %f %f", &a, &b, &c) != 3) return false;
+        p.chorus_ms.store(a); p.chorus_hz.store(b); p.chorus_mix.store(c);
+    }
+    else return false;
+    return true;
+}
+
 // Anything the file did not mention goes back to its default, so a preset
 // written by an older version fully determines the state rather than leaving
 // the tail of whatever curve happened to be loaded before.
@@ -175,6 +221,7 @@ inline std::string preset_serialize(const Shared* s)
         out += "\n";
         detail::addf(out, "strip.%d.duck %d %.3f\n", i, p.duck_key.load(), p.duck_depth_db.load());
         detail::write_eq(out, "strip", i, p.eq);
+        detail::write_fx(out, "strip." + std::to_string(i) + ".fx", p.fx);
         if (i < kHwStrips) {
             detail::addf(out, "strip.%d.device %s\n", i, hw[i]);
             if (hwd[i][0]) detail::addf(out, "strip.%d.devicedesc %s\n", i, hwd[i]);
@@ -247,6 +294,7 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
 
     bool bus_band_seen[kBuses][kEqBands] = {}, bus_eq_seen[kBuses] = {}, bus_pre_seen[kBuses] = {};
     bool str_band_seen[kStrips][kEqBands] = {}, str_eq_seen[kStrips] = {}, str_pre_seen[kStrips] = {};
+    bool str_fx_seen[kStrips] = {};
 
     // VBAN entries and labels are written as they are parsed, so keep those
     // seqlocks held open for the whole pass; a reader simply retries.
@@ -289,6 +337,22 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
             idx = (int)v;
             return true;
         };
+        // Like keyed(), but hands back whatever follows a fixed middle - used by
+        // the voice changer, whose keys share one prefix and vary after it.
+        auto keyed_rest = [&](const char* prefix, const char* mid, int& idx,
+                              const char*& rest) {
+            const size_t plen = std::strlen(prefix);
+            if (std::strncmp(key, prefix, plen) != 0) return false;
+            const char* q = key + plen;
+            char* endp = nullptr;
+            const long v = std::strtol(q, &endp, 10);
+            if (endp == q) return false;
+            const size_t mlen = std::strlen(mid);
+            if (std::strncmp(endp, mid, mlen) != 0) return false;
+            idx = (int)v;
+            rest = endp + mlen;
+            return true;
+        };
         auto keyed2 = [&](const char* prefix, const char* mid, const char* suffix,
                           int& idx, int& jdx) {
             const size_t plen = std::strlen(prefix);
@@ -311,8 +375,12 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         float a = 0, b = 0, c = 0;
         int ia = 0, ib = 0, ic = 0, id = 0;
         char name[64] = {};
+        const char* rest = nullptr;
 
-        if      (keyed("strip.", ".gain", i) && i < kStrips) s->strip[i].gain_db.store(atof(val));
+        if      (keyed_rest("strip.", ".fx", i, rest) && i < kStrips) {
+            if (detail::read_fx(s->strip[i].fx, rest, val)) str_fx_seen[i] = true;
+        }
+        else if (keyed("strip.", ".gain", i) && i < kStrips) s->strip[i].gain_db.store(atof(val));
         else if (keyed("strip.", ".mute", i) && i < kStrips) s->strip[i].mute.store(atoi(val));
         else if (keyed("strip.", ".solo", i) && i < kStrips) s->strip[i].solo.store(atoi(val));
         else if (keyed("strip.", ".monosrc", i) && i < kStrips) s->strip[i].mono_source.store(atoi(val) ? 1 : 0);
@@ -437,6 +505,9 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
     for (int i = 0; i < kStrips; ++i) {
         if (str_eq_seen[i]) detail::reset_unseen(s->strip[i].eq, str_band_seen[i], str_pre_seen[i]);
         else                eq_set_defaults(s->strip[i].eq);
+        // Same for the voice changer: a preset written before v4 describes none,
+        // so it must clear rather than leave one running from a previous load.
+        if (!str_fx_seen[i]) fx_set_defaults(s->strip[i].fx);
     }
 
     if (touched_routing) {
@@ -551,6 +622,7 @@ inline std::string strip_serialize(const StripParams& p)
         detail::addf(out, "band.%d %.3f %.3f %.3f %d %d\n", k,
                      p.eq.gain[k].load(), p.eq.freq[k].load(), p.eq.q[k].load(),
                      p.eq.type[k].load(), p.eq.band_on[k].load());
+    detail::write_fx(out, "fx", p.fx);
     return out;
 }
 
@@ -560,7 +632,7 @@ inline bool strip_deserialize(StripParams& p, const std::string& text)
     if (sscanf(text.c_str(), "betterbanana-strip %d", &ver) != 1 || ver > kPresetVersion)
         return false;
 
-    bool band_seen[kEqBands] = {}, preamp_seen = false;
+    bool band_seen[kEqBands] = {}, preamp_seen = false, fx_seen = false;
     size_t pos = text.find('\n');
     pos = pos == std::string::npos ? text.size() : pos + 1;
 
@@ -610,8 +682,12 @@ inline bool strip_deserialize(StripParams& p, const std::string& text)
             const int k = atoi(key + 5);
             if (detail::read_band(p.eq, k, val)) band_seen[k] = true;
         }
+        else if (!std::strncmp(key, "fx", 2)) {
+            if (detail::read_fx(p.fx, key + 2, val)) fx_seen = true;
+        }
     }
     detail::reset_unseen(p.eq, band_seen, preamp_seen);
+    if (!fx_seen) fx_set_defaults(p.fx);
     return true;
 }
 

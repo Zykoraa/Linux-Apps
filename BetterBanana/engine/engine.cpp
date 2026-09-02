@@ -15,6 +15,7 @@
 #include "../common/preset.h"
 #include "dsp.h"
 #include "spectrum.h"
+#include "voicefx.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -180,6 +181,7 @@ struct StripDsp {
     Compressor comp[kChan];
     Biquad     eq_lo[kChan], eq_mid[kChan], eq_hi[kChan], aud[kChan];
     EqChain    par;                 // the twelve-band block, after the tone knobs
+    VoiceFxChain fx;                // the voice changer, after the EQ
     SmoothGain gain[kChan];
     PeakMeter  pre[kChan], post[kChan];
     float c_gate = -1, c_comp = -1, c_aud = -1;
@@ -193,6 +195,7 @@ struct StripDsp {
             pre[c].configure(sr); post[c].configure(sr);
         }
         par.configure(sr);
+        fx.configure(sr);
     }
     void update(const StripParams& p, float sr)
     {
@@ -213,6 +216,7 @@ struct StripDsp {
         }
         c_gate = g; c_comp = k; c_aud = a; c_lo = lo; c_mid = md; c_hi = hi;
         par.update(p.eq, sr);
+        fx.update(p.fx, sr);
     }
 };
 
@@ -413,6 +417,7 @@ void Engine::mix_chunk(uint32_t n)
         float pl, pr; pan_gains(p.pan_x.load(std::memory_order_relaxed), pl, pr);
 
         const bool par_on   = p.eq.on.load(std::memory_order_relaxed) != 0;
+        const bool fx_on    = p.fx.on.load(std::memory_order_relaxed) != 0;
         for (int c = 0; c < kChan; ++c) d.gain[c].set_target(muted ? 0.0f : glin);
 
         float pre_pk[kChan] = {0, 0}, post_pk[kChan] = {0, 0};
@@ -438,6 +443,10 @@ void Engine::mix_chunk(uint32_t n)
                 // before the fader, so its preamp trims the EQ rather than the
                 // level you set by hand.
                 if (par_on) x = d.par.process(c, x);
+                // The voice changer sits after the EQ, so the EQ cleans the
+                // real voice going in rather than the artefacts coming out,
+                // and before the fader, so the fader still means level.
+                if (fx_on)  x = d.fx.process(c, x);
                 x *= d.gain[c].next();
                 x *= (c == 0 ? pl : pr) * 1.41421356f;   // pan law is unity at centre
 

@@ -3,6 +3,7 @@
 #include "../common/protocol.h"
 #include "../common/preset.h"
 #include "../common/eqprofile.h"
+#include "../common/fxpreset.h"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -86,11 +87,20 @@ static void usage()
       "  strip <i> preamp <dB>       parametric preamp, -24 .. +12\n"
       "  strip <i> band <0..11> <gain> <freq> <Q> [type] [on]\n"
       "  strip <i> pan <-1..1>\n"
+      "  strip <i> fx on|off|show\n"
+      "  strip <i> fx preset <name>       voice changer preset (bb-ctl fx list)\n"
+      "  strip <i> fx pitch <semitones>   -12 .. +12, 0 is off\n"
+      "  strip <i> fx drive <0..10> | gain <dB>\n"
+      "  strip <i> fx ring <Hz> <mix>     ring modulator, 0 Hz is off\n"
+      "  strip <i> fx crush <bits> <n>    bit depth (0 off), sample-hold (1 off)\n"
+      "  strip <i> fx echo <ms> <fb> <mix>\n"
+      "  strip <i> fx chorus <ms> <Hz> <mix>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
       "  bus <b> preamp <dB>         EQ preamp, -24 .. +12\n"
       "  bus <b> band <0..11> <gain> <freq> <Q> [type] [on]\n"
       "                              type: pk ls hs hp lp notch bp\n"
+      "  fx list                     list voice changer presets\n"
       "  eq list                     list built-in and saved EQ profiles\n"
       "  eq show <t>                 print an EQ as Equalizer APO text\n"
       "  eq load <t> <name|file>     apply a built-in, saved or APO/AutoEq file\n"
@@ -127,6 +137,52 @@ static int bus_index(const char* s)
     for (int b = 0; b < kBuses; ++b) if (strcasecmp(s, kBusName[b]) == 0) return b;
     if (s[0] >= '0' && s[0] <= '4' && s[1] == 0) return s[0] - '0';
     return -1;
+}
+
+// The voice changer, as "strip <i> fx <what> [values...]" from argv[4].
+static bool set_fx(VoiceFx& p, int argc, char** argv)
+{
+    const std::string w = argv[4];
+    auto need = [&](int n) {
+        if (argc >= 5 + n) return true;
+        std::fprintf(stderr, "fx %s needs %d value%s\n", w.c_str(), n, n == 1 ? "" : "s");
+        return false;
+    };
+    FxValues v = fx_capture(p);
+    if      (w == "on")  { p.on.store(1); return true; }
+    else if (w == "off") { p.on.store(0); return true; }
+    else if (w == "show") {
+        const int idx = fx_preset_index(v);
+        std::printf("on %d  preset %s\n  pitch %.2f st  drive %.2f  gain %.2f dB\n"
+                    "  ring %.1f Hz mix %.2f\n  crush %d bits, downsample %d\n"
+                    "  echo %.0f ms fb %.2f mix %.2f\n  chorus %.2f ms %.2f Hz mix %.2f\n",
+                    p.on.load(), idx >= 0 ? fx_presets()[idx].name : "(custom)",
+                    v.pitch, v.drive, v.gain_db, v.ring_hz, v.ring_mix,
+                    v.bits, v.downsample, v.echo_ms, v.echo_fb, v.echo_mix,
+                    v.chorus_ms, v.chorus_hz, v.chorus_mix);
+        return true;
+    }
+    else if (w == "preset") {
+        if (!need(1)) return false;
+        if (!fx_preset_by_name(argv[5], v)) {
+            std::fprintf(stderr, "bb-ctl: no voice preset '%s' (try: bb-ctl fx list)\n", argv[5]);
+            return false;
+        }
+        fx_apply(p, v);
+        // "Off" is how you clear it, so it should not also switch the block on.
+        p.on.store(std::string(argv[5]) == "Off" ? 0 : 1);
+        return true;
+    }
+    else if (w == "pitch")  { if (!need(1)) return false; v.pitch = atof(argv[5]); }
+    else if (w == "drive")  { if (!need(1)) return false; v.drive = atof(argv[5]); }
+    else if (w == "gain")   { if (!need(1)) return false; v.gain_db = atof(argv[5]); }
+    else if (w == "ring")   { if (!need(2)) return false; v.ring_hz = atof(argv[5]); v.ring_mix = atof(argv[6]); }
+    else if (w == "crush")  { if (!need(2)) return false; v.bits = atoi(argv[5]); v.downsample = atoi(argv[6]); }
+    else if (w == "echo")   { if (!need(3)) return false; v.echo_ms = atof(argv[5]); v.echo_fb = atof(argv[6]); v.echo_mix = atof(argv[7]); }
+    else if (w == "chorus") { if (!need(3)) return false; v.chorus_ms = atof(argv[5]); v.chorus_hz = atof(argv[6]); v.chorus_mix = atof(argv[7]); }
+    else { usage(); return false; }
+    fx_apply(p, v);
+    return true;
 }
 
 // "<band> <gain> <freq> <Q> [type] [on]" starting at argv[4]; shared by the
@@ -221,6 +277,35 @@ int main(int argc, char** argv)
             }
         } else { usage(); return 1; }
         std::printf("%s autostart %s\n", what.c_str(), on ? "enabled" : "disabled");
+        return 0;
+    }
+
+    // Catalogues read nothing but built-ins and the profile directory, so they
+    // answer whether or not an engine is running - which is exactly when you
+    // want to look one up.
+    if (std::string(argv[1]) == "fx" && argc >= 3 && std::string(argv[2]) == "list") {
+        std::printf("voice changer presets:\n");
+        for (const FxPreset& f : fx_presets()) std::printf("  %s\n", f.name);
+        std::printf("\nApply one with:  bb-ctl strip <i> fx preset \"<name>\"\n"
+                    "A telephone or radio voice is an EQ recipe rather than an effect:\n"
+                    "  bb-ctl strip 0 band 0 0 300 0.7 hp\n"
+                    "  bb-ctl strip 0 band 1 0 3400 0.7 lp\n"
+                    "  bb-ctl strip 0 eqon 1\n");
+        return 0;
+    }
+    if (std::string(argv[1]) == "eq" && argc >= 3 && std::string(argv[2]) == "list") {
+        std::printf("built-in:\n");
+        for (const EqFactoryPreset& fp : eq_factory_presets())
+            std::printf("  %s\n", fp.name);
+        DIR* d = opendir(eq_profile_dir().c_str());
+        if (!d) { std::printf("\nno saved profiles yet (%s)\n", eq_profile_dir().c_str()); return 0; }
+        std::printf("\nsaved in %s:\n", eq_profile_dir().c_str());
+        while (dirent* e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.size() > 4 && n.compare(n.size() - 4, 4, ".txt") == 0)
+                std::printf("  %s\n", n.substr(0, n.size() - 4).c_str());
+        }
+        closedir(d);
         return 0;
     }
 
@@ -364,6 +449,9 @@ int main(int argc, char** argv)
         else if (w == "band" && argc >= 8) {
             if (!set_band(p.eq, argc, argv)) return 1;
         }
+        else if (w == "fx" && argc >= 5) {
+            if (!set_fx(p.fx, argc, argv)) return 1;
+        }
         else if (w == "bus" && argc >= 6) {
             const int b = bus_index(argv[4]);
             if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
@@ -404,22 +492,6 @@ int main(int argc, char** argv)
             if (eq_read_file(out, path.c_str())) { out.name = n; return true; }
             return eq_factory_profile(n, out);
         };
-
-        if (w == "list") {
-            std::printf("built-in:\n");
-            for (const EqFactoryPreset& fp : eq_factory_presets())
-                std::printf("  %s\n", fp.name);
-            DIR* d = opendir(eq_profile_dir().c_str());
-            if (!d) { std::printf("\nno saved profiles yet (%s)\n", eq_profile_dir().c_str()); return 0; }
-            std::printf("\nsaved in %s:\n", eq_profile_dir().c_str());
-            while (dirent* e = readdir(d)) {
-                std::string n = e->d_name;
-                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".txt") == 0)
-                    std::printf("  %s\n", n.substr(0, n.size() - 4).c_str());
-            }
-            closedir(d);
-            return 0;
-        }
 
         // Everything past "list" names a target first.
         if (argc < 4) { usage(); return 1; }

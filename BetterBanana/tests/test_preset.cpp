@@ -66,6 +66,20 @@ static void scramble(Shared* s)
             p.eq.type[k].store((k + i) % kEqTypeCount);
             p.eq.band_on[k].store((k + i) % 3 != 0);
         }
+        p.fx.on.store(i != 2);
+        p.fx.pitch.store(-3.0f + 2.0f * i);
+        p.fx.drive.store(0.5f * i);
+        p.fx.ring_hz.store(40.0f + 13.0f * i);
+        p.fx.ring_mix.store(0.1f * i);
+        p.fx.bits.store(i == 0 ? 0 : 4 + i);
+        p.fx.downsample.store(1 + i);
+        p.fx.echo_ms.store(60.0f * i);
+        p.fx.echo_fb.store(0.05f * i);
+        p.fx.echo_mix.store(0.15f * i);
+        p.fx.chorus_ms.store(1.5f * i);
+        p.fx.chorus_hz.store(0.3f + 0.2f * i);
+        p.fx.chorus_mix.store(0.12f * i);
+        p.fx.gain_db.store(-1.5f * i);
     }
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];
@@ -164,6 +178,10 @@ int main()
     chk(blank->strip[3].eq.on.load() == 0, "a strip EQ left off stays off");
     chk(blank->strip[1].mono_source.load() == 1, "mono-source fold round trips");
     near(blank->strip[4].limit_db.load(), 2.0, 1e-3, "limiter ceiling round trips");
+    near(blank->strip[3].fx.pitch.load(), 3.0, 1e-3, "voice-changer pitch round trips");
+    near(blank->strip[4].fx.echo_ms.load(), 240.0, 1e-2, "echo time round trips");
+    chk(blank->strip[2].fx.on.load() == 0, "a voice changer left off stays off");
+    chk(blank->strip[3].fx.downsample.load() == 4, "the crusher's decimation round trips");
 
     // --- files are written whole or not at all ------------------------------
     const std::string path = std::string(dir) + "/state.bbp";
@@ -185,6 +203,8 @@ int main()
         // Give it a strip EQ that the v2 file cannot possibly mention.
         v2->strip[0].eq.on.store(1);
         v2->strip[0].eq.gain[4].store(9.0f);
+        v2->strip[0].fx.on.store(1);
+        v2->strip[0].fx.pitch.store(-7.0f);
         const std::string old =
             "betterbanana-preset 2\n"
             "strip.0.gain -6.000\n"
@@ -198,6 +218,8 @@ int main()
         near(v2->strip[0].eq.gain[4].load(), 0.0, 1e-6,
              "the strip EQ it cannot describe is reset, not left stale");
         chk(v2->strip[0].eq.on.load() == 0, "and that strip EQ ends up off");
+        chk(v2->strip[0].fx.on.load() == 0 && v2->strip[0].fx.pitch.load() == 0.0f,
+            "and the voice changer it cannot describe is cleared too");
     }
 
     // --- migration off the old autosave, before any choice has been made -----
@@ -251,6 +273,8 @@ int main()
              "the gate travels with the device");
         near(other->strip[1].eq.freq[7].load(), shm->strip[0].eq.freq[7].load(), 1e-2,
              "the parametric EQ travels with the device");
+        near(other->strip[1].fx.pitch.load(), shm->strip[0].fx.pitch.load(), 1e-3,
+             "and so does the voice changer");
         chk(other->strip[1].bus_on[4].load() == 1 && other->strip[1].bus_on[0].load() == 0,
             "but bus assignment does not");
 

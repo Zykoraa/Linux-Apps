@@ -42,6 +42,7 @@ public:
 signals:
     void routingChanged(int hwIndex, const QString& nodeName);
     void eqEditRequested(int stripIndex);
+    void fxEditRequested(int stripIndex);
     void statusMessage(const QString& text);
 
 private:
@@ -57,6 +58,7 @@ private:
 
     QComboBox*   m_device = nullptr;
     QPushButton* m_eqBtn  = nullptr;
+    QPushButton* m_fxBtn  = nullptr;
     Knob*        m_gate   = nullptr;
     Knob*        m_comp   = nullptr;
     Knob*        m_aud    = nullptr;
@@ -213,6 +215,7 @@ public:
     void openAppsDialog();
     void openBusEq(int bus);
     void openStripEq(int strip);
+    void openStripFx(int strip);
     void openDuckDialog();
 
 private slots:

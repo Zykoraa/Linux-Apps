@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 6;
+constexpr uint32_t kVersion    = 7;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -88,6 +88,49 @@ inline void eq_set_defaults(EqParams& p)
     }
 }
 
+// A voice changer: a pitch shifter followed by a small rack of character
+// effects, per input strip. Every field has an "off" value (0, or 1 for the
+// decimation factor) so a default block is bit-transparent and the engine
+// skips it entirely.
+//
+// Chain order is pitch -> drive -> ring -> crush -> chorus -> echo -> gain:
+// the structural change first, then character, then space, so the echo
+// repeats the finished voice rather than the raw one.
+struct VoiceFx {
+    ai  on;                       // whole-block bypass
+    af  pitch;                    // semitones, -12 .. +12; 0 bypasses
+    af  drive;                    // 0 .. 10 waveshaper amount
+    af  ring_hz;                  // ring modulator, 0 = off
+    af  ring_mix;                 // 0 .. 1
+    ai  bits;                     // bit-crush depth, 0 = off, else 2 .. 15
+    ai  downsample;               // sample-and-hold factor, 1 = off
+    af  echo_ms;                  // 0 = off, else up to 1000
+    af  echo_fb;                  // 0 .. 0.95
+    af  echo_mix;                 // 0 .. 1
+    af  chorus_ms;                // modulation depth, 0 = off
+    af  chorus_hz;                // 0.05 .. 8
+    af  chorus_mix;               // 0 .. 1
+    af  gain_db;                  // makeup, -24 .. +24
+};
+
+inline void fx_set_defaults(VoiceFx& p)
+{
+    p.on.store(0);
+    p.pitch.store(0.0f);
+    p.drive.store(0.0f);
+    p.ring_hz.store(0.0f);
+    p.ring_mix.store(0.0f);
+    p.bits.store(0);
+    p.downsample.store(1);
+    p.echo_ms.store(0.0f);
+    p.echo_fb.store(0.0f);
+    p.echo_mix.store(0.0f);
+    p.chorus_ms.store(0.0f);
+    p.chorus_hz.store(0.0f);
+    p.chorus_mix.store(0.0f);
+    p.gain_db.store(0.0f);
+}
+
 struct StripParams {
     ai  present;                  // strip has a live input attached
     ai  bus_on[kBuses];           // A1 A2 A3 B1 B2 assign buttons
@@ -101,6 +144,7 @@ struct StripParams {
     ai  duck_key;                 // this strip's level drives the ducker
     af  duck_depth_db;            // how far this strip drops while ducking (<= 0)
     EqParams eq;                  // the parametric block, after the tone knobs
+    VoiceFx  fx;                  // the voice changer, after the EQ
 };
 
 struct BusParams {
@@ -313,6 +357,7 @@ inline void set_defaults(Shared* s)
         p.duck_key.store(0);
         p.duck_depth_db.store(0.0f);
         eq_set_defaults(p.eq);
+        fx_set_defaults(p.fx);
     }
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];
