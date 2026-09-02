@@ -62,6 +62,9 @@ cd Linux-Apps/mic-gain && ./install.sh
 
 Needs `python3` and PipeWire — no third-party libraries. Then run `mic-gain`.
 
+Installing BetterBanana from a clone installs this too, and its
+**Engine → Analyse microphone** menu opens it on any strip or bus.
+
 ---
 
 Each app builds independently — see its own README. Everything here is MIT

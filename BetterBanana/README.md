@@ -254,10 +254,18 @@ the reading includes this mixer's gate, compressor, EQ and fader.
 
 mic-gain is a separate tool on purpose — it is a terminal program, so it still
 works over SSH and when this GUI will not start, which is exactly when a
-microphone needs diagnosing. Install it once with `mic-gain/install.sh`; the
-menu says so if it cannot find it. Strips fed by a virtual cable, or with no
-device assigned, are listed but greyed out: there is no microphone there to
-measure.
+microphone needs diagnosing. It shares no code with the engine; the two are
+joined only by this menu.
+
+Installing BetterBanana from a clone of the repository installs it too, since it
+is sitting right there and needs nothing BetterBanana does not already require
+(`python3`, for the watchdog and the stream guard). Installing from a source
+tarball does not, because the tarball contains BetterBanana alone — the
+installer says so, and the menu says so if it cannot find it. Either way,
+`mic-gain/install.sh` installs it on its own.
+
+Strips fed by a virtual cable, or with no device assigned, are listed but greyed
+out: there is no microphone there to measure.
 
 ## Sidechain ducking
 

@@ -18,6 +18,20 @@ install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
 install -m755 "$ROOT/tools/bb-health" "$BIN/bb-health"
 install -m755 "$ROOT/tools/bb-stream-setup" "$BIN/bb-stream-setup"
 install -m755 "$ROOT/tools/bb-autoeq" "$BIN/bb-autoeq"
+# mic-gain is a sibling tool, not part of BetterBanana -- it shares no code and
+# is useful on its own. But the mixer's "Engine -> Analyse microphone" menu
+# opens it, so a BetterBanana install that skipped it would leave that menu
+# dead-ending on "not installed". Installing from a repo clone puts it next to
+# us, and it costs nothing extra: one script, and python3 is already required
+# here by bb-health and bb-stream-guard. A dist tarball ships BetterBanana
+# alone, so this stays conditional.
+MICGAIN="$ROOT/../mic-gain/mic-gain"
+if [ -f "$MICGAIN" ]; then
+    install -m755 "$MICGAIN" "$BIN/mic-gain"
+    micgain_note="Mic analyzer:   mic-gain  (Engine -> Analyse microphone)"
+else
+    micgain_note="Mic analyzer:   not installed - run mic-gain/install.sh from https://github.com/Zykoraa/Linux-Apps"
+fi
 install -m644 "$ROOT/packaging/betterbanana.svg"            "$ICONS/betterbanana.svg"
 install -m644 "$ROOT/packaging/betterbanana.desktop"        "$APPS/betterbanana.desktop"
 # A bare Exec= name only resolves if the *graphical* session has $BIN on PATH,
@@ -51,9 +65,10 @@ systemctl --user restart betterbanana-health.service
 
 echo
 echo "Installed to $BIN"
-echo "Engine service: systemctl --user status betterbanana-engine"
+echo "Engine:         systemctl --user status betterbanana-engine"
 echo "Stream guard:   systemctl --user status betterbanana-stream-guard"
 echo "Watchdog:       systemctl --user status betterbanana-health"
+echo "$micgain_note"
 echo "Make sure $BIN is on your PATH."
 echo
 echo "Sharing your screen on Discord? One command sets up the stream bus so"
