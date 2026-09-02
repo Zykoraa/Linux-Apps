@@ -90,6 +90,7 @@ private:
     int m_spec  = bb::kSpecNone;
     int m_sel   = 0;
     int m_drag  = -1;
+    QPointF m_grabOff;      // pointer relative to the handle when it was picked up
     int m_hover = -1;
 
     // The dB range the frame spans, chosen to fit whatever is drawn. It used to

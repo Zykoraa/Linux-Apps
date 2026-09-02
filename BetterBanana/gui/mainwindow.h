@@ -178,7 +178,7 @@ protected:
 
 private:
     void apply();
-    void revert();
+    bool revert();          // true when it actually had to put something back
 
     bb::Shared* m_shm;
     // Snapshotted by value in the constructor. Deliberately not a memcpy of
@@ -317,12 +317,14 @@ private:
     QSet<int>   m_ruledStreams;
     bool        m_ruleBusy = false;
     int         m_ruleWait = 0;
+    uint32_t    m_ruleRound = 0;
     int         m_ruleTicks = 0;
 
     QString  m_presetName;        // "" until a preset is loaded or saved
     bool     m_dirty = false;
     bool     m_engineLive = true;
     QLabel*  m_alert = nullptr;   // the banner across the top when it is not
+    QString  m_statusColour;      // so a theme change repaints it and a tick does not
 
     QVector<QByteArray> m_undo, m_redo;
     QByteArray  m_committed;      // the last settled state

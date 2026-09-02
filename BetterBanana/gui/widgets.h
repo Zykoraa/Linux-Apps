@@ -71,6 +71,7 @@ private:
     bool m_clipped = false;
     bool m_stale   = false;
     bool m_hover   = false;
+    QString m_baseTip;          // what the owner called this column
     std::function<void()> m_onClick;
     static float dbToFrac(float db);
 
@@ -85,18 +86,19 @@ private:
 
 // A label that shortens rather than clipping. Card headers carry user-chosen
 // names of any length, and QLabel just cuts them off mid-word.
+//
+// The full string stays in QLabel, and the shortening happens only at paint
+// time. An earlier version kept its own copy and overrode setText - but
+// QLabel::setText is not virtual and every caller holds a QLabel*, so the
+// override never ran, the copy went stale, and a rename was painted back to
+// the old name on the next repaint.
 class ElidedLabel : public QLabel {
 public:
     explicit ElidedLabel(const QString& text = QString(), QWidget* parent = nullptr);
-    void setText(const QString& t);
-    QString fullText() const { return m_full; }
     QSize minimumSizeHint() const override;
 
 protected:
     void paintEvent(QPaintEvent*) override;
-
-private:
-    QString m_full;
 };
 
 // A bus's parametric EQ, small. A bus card carries fewer controls than a strip,

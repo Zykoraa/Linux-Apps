@@ -64,6 +64,10 @@ int main(int argc, char** argv)
         }
 
         // --- Law 2: dim text clears its floor on every surface it lands on -
+        //
+        // Including `well`: dim is used on tag chips, list items and plot
+        // grounds, and buildStyleSheet solves it once against the worst of all
+        // four - so the one it hands out has to clear all four.
         for (const auto& surf : std::vector<std::pair<const char*, QColor>>{
                  { "bg", t.bg }, { "panel", t.panel },
                  { "panelAlt", t.panelAlt }, { "well", t.well } }) {

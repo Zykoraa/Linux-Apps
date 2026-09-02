@@ -193,8 +193,8 @@ void Knob::mousePressEvent(QMouseEvent* e)
 {
     if (e->button() != Qt::LeftButton) return;
     m_dragging = true;
+    m_fine = e->modifiers() & Qt::ControlModifier;
     setFocus(Qt::MouseFocusReason);
-    setCursor(Qt::BlankCursor);
     m_dragStartY = e->position().toPoint().y();
     m_dragStartVal = m_value;
     showValueTip();
@@ -203,10 +203,16 @@ void Knob::mousePressEvent(QMouseEvent* e)
 void Knob::mouseMoveEvent(QMouseEvent* e)
 {
     if (!m_dragging) return;
+    // Fine control with Ctrl held, as in most mixers - re-anchored the moment
+    // the modifier changes, or the accumulated offset is re-scaled under you.
+    const bool fine = e->modifiers() & Qt::ControlModifier;
+    if (fine != m_fine) {
+        m_fine = fine;
+        m_dragStartY = e->position().toPoint().y();
+        m_dragStartVal = m_value;
+    }
     const int dy = m_dragStartY - e->position().toPoint().y();
-    // Fine control with Ctrl held, as in most mixers.
-    const double perPixel = (m_hi - m_lo) / 150.0
-                          * ((e->modifiers() & Qt::ControlModifier) ? 0.25 : 1.0);
+    const double perPixel = (m_hi - m_lo) / 150.0 * (fine ? 0.25 : 1.0);
     setValue(m_dragStartVal + int(qRound(dy * perPixel)));
     showValueTip();
 }
@@ -214,7 +220,6 @@ void Knob::mouseMoveEvent(QMouseEvent* e)
 void Knob::mouseReleaseEvent(QMouseEvent*)
 {
     m_dragging = false;
-    setCursor(Qt::PointingHandCursor);
     QToolTip::hideText();
 }
 
@@ -529,9 +534,19 @@ void Fader::mouseMoveEvent(QMouseEvent* e)
     // Anchored, like Knob. The old form was `m_value + (target - m_value) / 4`
     // in integers, so inside three raw units the quotient was 0 and fine drag
     // stopped moving altogether - the opposite of fine control.
+    //
+    // Re-anchor when Ctrl goes down or up part-way through a drag: the offset
+    // is measured from the anchor, so changing the scale without moving the
+    // anchor re-scales everything accumulated so far and jumps a live fader.
+    const bool fine = e->modifiers() & Qt::ControlModifier;
+    if (fine != m_fine) {
+        m_fine = fine;
+        m_dragStartY = int(e->position().y());
+        m_dragStartVal = m_value;
+    }
     const double dy = m_dragStartY - e->position().y();
     const double perPixel = double(m_hi - m_lo) / qMax(1.0, grooveRect().height())
-                          * ((e->modifiers() & Qt::ControlModifier) ? 0.25 : 1.0);
+                          * (fine ? 0.25 : 1.0);
     setValue(m_dragStartVal + int(qRound(dy * perPixel)));
     showValueTip();
 }

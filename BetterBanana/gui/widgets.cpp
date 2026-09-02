@@ -6,6 +6,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QStyleOption>
 #include <QStyleOptionComboBox>
 #include <QStylePainter>
 #include <QToolTip>
@@ -169,9 +170,13 @@ void LevelMeter::mousePressEvent(QMouseEvent*)
 void LevelMeter::enterEvent(QEnterEvent*)
 {
     m_hover = true;
+    // Prepend the level to whatever the owner said this meter is, rather than
+    // replacing it - the strip and the bus each name their own column.
+    if (m_baseTip.isNull()) m_baseTip = toolTip();
     const float h = heldPeak();
-    setToolTip(h <= kMinDb ? QStringLiteral("No signal\nClick to clear the clip indicator")
-                           : QString::asprintf("Peak %+.1f dB\nClick to clear the clip indicator", h));
+    const QString lead = h <= kMinDb ? QStringLiteral("No signal")
+                                     : QString::asprintf("Peak %+.1f dB", h);
+    setToolTip(m_baseTip.isEmpty() ? lead : lead + "\n" + m_baseTip);
     update();
 }
 
@@ -395,19 +400,9 @@ void EqThumb::leaveEvent(QEvent*)      { m_hover = false; update(); }
 // ---------------------------------------------------------------------------
 // ElidedLabel
 // ---------------------------------------------------------------------------
-ElidedLabel::ElidedLabel(const QString& text, QWidget* parent)
-    : QLabel(parent), m_full(text)
+ElidedLabel::ElidedLabel(const QString& text, QWidget* parent) : QLabel(text, parent)
 {
-    QLabel::setText(text);
     setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-}
-
-void ElidedLabel::setText(const QString& t)
-{
-    m_full = t;
-    QLabel::setText(t);
-    setToolTip(QString());
-    update();
 }
 
 QSize ElidedLabel::minimumSizeHint() const
@@ -419,13 +414,28 @@ QSize ElidedLabel::minimumSizeHint() const
 
 void ElidedLabel::paintEvent(QPaintEvent* e)
 {
-    // Paint the plate through the stylesheet, then the shortened text over it.
-    QString keep = QLabel::text();
-    const QString shown = fontMetrics().elidedText(m_full, Qt::ElideRight,
-                                                   qMax(0, contentsRect().width() - 2));
-    if (shown != keep) QLabel::setText(shown);
-    if (shown != m_full && toolTip().isEmpty()) setToolTip(m_full);
-    QLabel::paintEvent(e);
+    const QString full = text();
+    const QRect cr = contentsRect();
+    const QFontMetrics fm(fontMetrics());
+    if (fm.horizontalAdvance(full) <= cr.width()) {
+        if (!toolTip().isEmpty()) setToolTip(QString());
+        QLabel::paintEvent(e);
+        return;
+    }
+    // setToolTip schedules no repaint, so this cannot loop.
+    if (toolTip() != full) setToolTip(full);
+
+    // Too long: draw the stylesheet's own plate, then the shortened text on top.
+    // The text is never written back, so setText through a QLabel* still works
+    // and a rename is not undone by the next repaint.
+    QPainter p(this);
+    QStyleOption opt;
+    opt.initFrom(this);
+    style()->drawPrimitive(QStyle::PE_Widget, &opt, &p, this);
+    p.setPen(palette().color(foregroundRole()));
+    p.setFont(font());
+    p.drawText(cr, int(alignment()) | Qt::TextSingleLine,
+               fm.elidedText(full, Qt::ElideRight, cr.width()));
 }
 
 // ---------------------------------------------------------------------------

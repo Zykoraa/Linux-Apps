@@ -6,12 +6,28 @@
 #include <QDialog>
 #include <QEvent>
 #include <QFrame>
+#include <QPainter>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
 #include <QTimer>
 #include <QVBoxLayout>
+
+namespace {
+
+class HeaderRule : public QWidget {
+public:
+    HeaderRule() { setFixedHeight(1); setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed); }
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), theme().border);
+    }
+};
+
+} // namespace
 
 namespace bbdlg {
 
@@ -39,13 +55,11 @@ QWidget* header(const QString& title, const QString& subtitle)
         v->addWidget(s);
     }
 
-    auto* rule = new QFrame;
-    rule->setFrameShape(QFrame::HLine);
-    rule->setFixedHeight(1);
-    rule->setStyleSheet(QString("background:%1;border:0;")
-                            .arg(theme().border.name(QColor::HexRgb)));
+    // A painted rule, not a styled one: a per-widget stylesheet would bake in
+    // whichever theme happened to be live when the dialog was built, and
+    // applyTheme's qApp->setStyleSheet() does not clear a widget's own sheet.
     v->addSpacing(bbui::px(4));
-    v->addWidget(rule);
+    v->addWidget(new HeaderRule);
     return w;
 }
 

@@ -55,6 +55,13 @@ using namespace bb;
 
 static const char* kBusLabel[kBuses] = { "A1", "A2", "A3", "B1", "B2" };
 
+// The default name of each strip, in one place. There used to be five copies of
+// this, in two different spellings; shortening the card titles updated one of
+// them, and pullFromShm reverted the header from another twice a second.
+static const char* kStripTitle[kStrips] = {
+    "HW INPUT 1", "HW INPUT 2", "HW INPUT 3", "VAIO", "AUX"
+};
+
 static inline float sliderDb(int v) { return v / 10.0f; }
 static inline int   dbSlider(float d) { return int(std::lround(d * 10.0f)); }
 
@@ -173,7 +180,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
 
     if (m_hardware) {
         m_device = new DeviceCombo;
-        m_device->setMinimumWidth(90);
+        m_device->setMinimumWidth(bbui::px(90));
         m_device->setFixedHeight(bbui::rowH());
         m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         m_device->addItem("- none -", QString());
@@ -462,10 +469,10 @@ void StripWidget::setDeviceValue(const QString& id)
         idx = m_device->count() - 1;
     }
     if (idx > 0) m_missing = m_device->itemText(idx).startsWith("missing  -  ");
-    // Carry it in the control's own colour too, not just its text.
-    m_device->setProperty("bad", m_missing);
-    m_device->style()->unpolish(m_device);
-    m_device->style()->polish(m_device);
+    // Carry it in the control's own colour too, not just its text. Guarded:
+    // readRouting calls this twice a second, and an unguarded unpolish/polish
+    // re-runs the stylesheet over the widget every time.
+    restyle(m_device, "bad", m_missing);
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -496,11 +503,7 @@ void StripWidget::pullFromShm()
     if (m_fxBtn) m_fxBtn->setChecked(p.fx.on.load() != 0);
     for (int b = 0; b < m_busBtns.size(); ++b) m_busBtns[b]->setChecked(p.bus_on[b].load() != 0);
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
-    static const char* kDefault[kStrips] = {
-        "HARDWARE INPUT 1", "HARDWARE INPUT 2", "HARDWARE INPUT 3",
-        "BETTERBANANA VAIO", "BETTERBANANA AUX"
-    };
-    m_header->setText(labelFor(m_shm, true, m_index, kDefault[m_index]));
+    m_header->setText(labelFor(m_shm, true, m_index, kStripTitle[m_index]));
 }
 
 void StripWidget::refreshMeters()
@@ -552,7 +555,7 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
 
     if (m_hardware) {
         m_device = new DeviceCombo;
-        m_device->setMinimumWidth(90);
+        m_device->setMinimumWidth(bbui::px(90));
         m_device->setFixedHeight(bbui::rowH());
         m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         m_device->addItem("- none -", QString());
@@ -666,9 +669,7 @@ void BusWidget::setDeviceValue(const QString& id)
         idx = m_device->count() - 1;
     }
     if (idx > 0) m_missing = m_device->itemText(idx).startsWith("missing  -  ");
-    m_device->setProperty("bad", m_missing);
-    m_device->style()->unpolish(m_device);
-    m_device->style()->polish(m_device);
+    restyle(m_device, "bad", m_missing);
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -748,10 +749,10 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
 
     // Record side
     auto* recCol = new QVBoxLayout;
-    recCol->setSpacing(3);
+    recCol->setSpacing(bbui::gapS() - 1);
     {
         auto* r = new QHBoxLayout;
-        r->setSpacing(3);
+        r->setSpacing(bbui::gapS() - 1);
         r->addWidget(makeLabel("REC FILE", "caption", Qt::AlignLeft));
         m_recPath = new QLineEdit(QDir::homePath() + "/betterbanana-take.wav");
         m_recPath->setMinimumWidth(bbui::px(200));
@@ -788,7 +789,7 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
     // Play side
     {
         auto* r = new QHBoxLayout;
-        r->setSpacing(3);
+        r->setSpacing(bbui::gapS() - 1);
         r->addWidget(makeLabel("PLAY FILE", "caption", Qt::AlignLeft));
         m_playPath = new QLineEdit;
         m_playPath->setMinimumWidth(bbui::px(200));
@@ -822,10 +823,10 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
     // Playback gain + routing
     {
         auto* col = new QVBoxLayout;
-        col->setSpacing(2);
+        col->setSpacing(bbui::gapXS());
         col->addWidget(makeLabel("PLAYBACK TO", "caption"));
         auto* r = new QHBoxLayout;
-        r->setSpacing(1);
+        r->setSpacing(bbui::gapXS() - 1);
         for (int b = 0; b < kBuses; ++b) {
             auto* btn = makeToggle(kBusLabel[b], b < kPhysBuses ? "busA" : "busB",
                                    bbui::px(19));
@@ -912,12 +913,9 @@ void RecorderWidget::refresh()
     const int err = m_shm->rec.err.load();
 
     // The offending field is marked, rather than an error printed 450px away.
-    m_recPath->setProperty("bad", err == 1);
-    m_playPath->setProperty("bad", err == 2);
-    for (QLineEdit* e : { m_recPath, m_playPath }) {
-        e->style()->unpolish(e);
-        e->style()->polish(e);
-    }
+    // Guarded: this runs thirty times a second.
+    restyle(m_recPath,  "bad", err == 1);
+    restyle(m_playPath, "bad", err == 2);
 
     if (err == 1)      m_status->setText("cannot open the record file");
     else if (err == 2) m_status->setText("cannot open the playback file");
@@ -948,9 +946,13 @@ void RecorderWidget::refresh()
     }
 
     // Nothing to record to, nothing to play: say so with the control's state.
-    m_rec->setEnabled(!m_recPath->text().trimmed().isEmpty());
-    m_play->setEnabled(!m_playPath->text().trimmed().isEmpty());
-    m_loop->setEnabled(m_play->isEnabled());
+    // Guarded: refresh() runs thirty times a second, and setEnabled on an
+    // unchanged value still walks the widget's children.
+    const bool canRec  = !m_recPath->text().trimmed().isEmpty();
+    const bool canPlay = !m_playPath->text().trimmed().isEmpty();
+    if (m_rec->isEnabled()  != canRec)  m_rec->setEnabled(canRec);
+    if (m_play->isEnabled() != canPlay) m_play->setEnabled(canPlay);
+    if (m_loop->isEnabled() != canPlay) m_loop->setEnabled(canPlay);
 
     for (int b = 0; b < m_busBtns.size(); ++b) {
         QSignalBlocker blk(m_busBtns[b]);
@@ -977,7 +979,7 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
 
     auto* outBox = new QGroupBox("OUTGOING  (a bus sent to a remote host)");
     auto* og = new QGridLayout(outBox);
-    og->setSpacing(3);
+    og->setSpacing(bbui::gapS() - 1);
     og->addWidget(makeLabel("ON", "caption"), 0, 0);
     og->addWidget(makeLabel("STREAM NAME", "caption"), 0, 1);
     og->addWidget(makeLabel("DESTINATION IP", "caption"), 0, 2);
@@ -986,8 +988,8 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     for (int i = 0; i < kVbanStreams; ++i) {
         VbanOutCfg& c = m_shm->vban.out[i];
         m_out[i].on   = new QCheckBox;              m_out[i].on->setChecked(c.enabled != 0);
-        m_out[i].name = new QLineEdit(c.name);      m_out[i].name->setMaximumWidth(130);
-        m_out[i].host = new QLineEdit(c.host);      m_out[i].host->setMaximumWidth(130);
+        m_out[i].name = new QLineEdit(c.name);      m_out[i].name->setMaximumWidth(bbui::px(130));
+        m_out[i].host = new QLineEdit(c.host);      m_out[i].host->setMaximumWidth(bbui::px(130));
         m_out[i].host->setPlaceholderText("e.g. 192.168.1.20");
         m_out[i].port = new QSpinBox;               m_out[i].port->setRange(1, 65535);
         m_out[i].port->setValue(c.port);
@@ -1004,7 +1006,7 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
 
     auto* inBox = new QGroupBox("INCOMING  (each becomes a selectable source)");
     auto* ig = new QGridLayout(inBox);
-    ig->setSpacing(3);
+    ig->setSpacing(bbui::gapS() - 1);
     ig->addWidget(makeLabel("ON", "caption"), 0, 0);
     ig->addWidget(makeLabel("STREAM NAME", "caption"), 0, 1);
     ig->addWidget(makeLabel("PORT", "caption"), 0, 2);
@@ -1012,7 +1014,7 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     for (int i = 0; i < kVbanStreams; ++i) {
         VbanInCfg& c = m_shm->vban.in[i];
         m_in[i].on   = new QCheckBox;           m_in[i].on->setChecked(c.enabled != 0);
-        m_in[i].name = new QLineEdit(c.name);   m_in[i].name->setMaximumWidth(130);
+        m_in[i].name = new QLineEdit(c.name);   m_in[i].name->setMaximumWidth(bbui::px(130));
         m_in[i].port = new QSpinBox;            m_in[i].port->setRange(1, 65535);
         m_in[i].port->setValue(c.port);
         ig->addWidget(m_in[i].on,   i + 1, 0);
@@ -1031,25 +1033,37 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     connect(okBtn,     &QPushButton::clicked, this, [this]{ apply(); accept(); });
     connect(cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
     root->addLayout(bbdlg::buttonRow(okBtn, cancelBtn));
-    bbdlg::tameDefaults(this, okBtn);
+    // Deliberately no default button: Return in a port or an IP field must not
+    // push network configuration at the engine and dismiss the dialog.
+    bbdlg::tameDefaults(this);
     bbdlg::rememberGeometry(this, "vban");
 }
 
-void VbanDialog::revert()
+bool VbanDialog::revert()
 {
+    // Nothing to put back unless Apply was actually pressed. Escape on an
+    // untouched dialog should not make the engine rebuild every stream.
+    bool changed = false;
+    for (int i = 0; i < kVbanStreams && !changed; ++i)
+        changed = std::memcmp(&m_shm->vban.out[i], &m_out0[i], sizeof(VbanOutCfg)) != 0
+               || std::memcmp(&m_shm->vban.in[i],  &m_in0[i],  sizeof(VbanInCfg))  != 0;
+    if (!changed) return false;
+
     m_shm->vban.seq.fetch_add(1, std::memory_order_acq_rel);
     for (int i = 0; i < kVbanStreams; ++i) {
         m_shm->vban.out[i] = m_out0[i];
         m_shm->vban.in[i]  = m_in0[i];
     }
     m_shm->vban.seq.fetch_add(1, std::memory_order_release);
+    return true;
 }
 
 void VbanDialog::reject()
 {
-    revert();
-    m_shm->cmd.store(kCmdVbanReload);
-    m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+    if (revert()) {
+        m_shm->cmd.store(kCmdVbanReload);
+        m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+    }
     QDialog::reject();
 }
 
@@ -1119,6 +1133,13 @@ static void pactlAsync(const QStringList& args, QObject* ctx,
         fire(QString::fromUtf8(p->readAllStandardOutput()));
     });
     QObject::connect(p, &QProcess::errorOccurred, ctx, [fire](QProcess::ProcessError) {
+        fire(QString());
+    });
+    // The synchronous form this replaced gave up after three seconds. Without
+    // the same bound a wedged pipewire-pulse leaves the round in flight, and
+    // its answer arrives long after the streams it describes have moved.
+    QTimer::singleShot(3000, p, [p, fire] {
+        if (p->state() != QProcess::NotRunning) p->kill();
         fire(QString());
     });
     p->start("pactl", args);
@@ -1216,23 +1237,19 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     root->addLayout(top);
 
     auto* grid = new QGridLayout;
-    grid->setSpacing(4);
+    grid->setSpacing(bbui::gapS());
     grid->addWidget(makeLabel("STRIP", "caption", Qt::AlignLeft), 0, 0);
     grid->addWidget(makeLabel("KEY (triggers ducking)", "caption"), 0, 1);
     grid->addWidget(makeLabel("DEPTH (how far it drops)", "caption"), 0, 2);
-    static const char* kDefault[kStrips] = {
-        "HARDWARE INPUT 1", "HARDWARE INPUT 2", "HARDWARE INPUT 3",
-        "BETTERBANANA VAIO", "BETTERBANANA AUX"
-    };
     for (int i = 0; i < kStrips; ++i) {
         StripParams& p = m_shm->strip[i];
-        grid->addWidget(makeLabel(labelFor(m_shm, true, i, kDefault[i]), "gain", Qt::AlignLeft), i + 1, 0);
-        auto* key = makeToggle("KEY", "rec", 20);
+        grid->addWidget(makeLabel(labelFor(m_shm, true, i, kStripTitle[i]), "gain", Qt::AlignLeft), i + 1, 0);
+        auto* key = makeToggle("KEY", "rec");
         key->setChecked(p.duck_key.load() != 0);
         connect(key, &QPushButton::toggled, this, [&p](bool b) { p.duck_key.store(b ? 1 : 0); });
         grid->addWidget(key, i + 1, 1);
         auto* depth = new Knob(-600, 0, 0, false, " dB");   // as bb-ctl strip <i> duck
-        depth->setMinimumWidth(52);
+        depth->setMinimumWidth(bbui::px(52));
         depth->setValue(int(p.duck_depth_db.load() * 10));
         connect(depth, &Knob::valueChanged, this, [&p](int v) { p.duck_depth_db.store(v / 10.0f); });
         grid->addWidget(depth, i + 1, 2, Qt::AlignHCenter);
@@ -1422,11 +1439,11 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
             nr.holder = new QWidget;
             auto* h = new QHBoxLayout(nr.holder);
             h->setContentsMargins(0, 0, 0, 0);
-            h->setSpacing(8);
+            h->setSpacing(bbui::px(8));
             nr.name = makeLabel(s.label, "gain", Qt::AlignLeft);
-            nr.name->setMinimumWidth(200);
+            nr.name->setMinimumWidth(bbui::px(200));
             nr.target = new QComboBox;
-            nr.target->setMinimumWidth(230);
+            nr.target->setMinimumWidth(bbui::px(230));
             const int idx = nr.index;
             const bool pb = playback;
             const QString app = s.app;
@@ -1444,7 +1461,7 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
             // a bad rule would keep re-routing this stream with nothing in the
             // UI to point at, let alone remove.
             nr.forget = new QPushButton("Forget");
-            nr.forget->setFixedWidth(64);
+            nr.forget->setFixedWidth(bbui::px(64));
             nr.forget->hide();
             connect(nr.forget, &QPushButton::clicked, this, [this, app, pb] {
                 setRule(app, pb, QString());
@@ -1517,12 +1534,12 @@ void AppsDialog::rebuildRemembered()
         auto* holder = new QWidget;
         auto* h = new QHBoxLayout(holder);
         h->setContentsMargins(0, 0, 0, 0);
-        h->setSpacing(8);
+        h->setSpacing(bbui::px(8));
         auto* nm = makeLabel(r.first + (r.second ? "" : "  (mic)"), "caption", Qt::AlignLeft);
-        nm->setMinimumWidth(200);
+        nm->setMinimumWidth(bbui::px(200));
         auto* tgt = makeLabel(ruleFor(r.first, r.second), "gain", Qt::AlignLeft);
         auto* forget = new QPushButton("Forget");
-        forget->setFixedWidth(64);
+        forget->setFixedWidth(bbui::px(64));
         const QString app = r.first;
         const bool pb = r.second;
         connect(forget, &QPushButton::clicked, this, [this, app, pb] {
@@ -1638,13 +1655,8 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     auto* inBox = new QGroupBox("INPUTS");
     auto* inRow = new QHBoxLayout(inBox);
     inRow->setSpacing(bbui::gapXS() + 1);
-    // Short enough to fit a card without eliding; the long form was clipped to
-    // "HARDWARE IN..." at every window size the app is actually used at.
-    static const char* stripTitle[kStrips] = {
-        "HW INPUT 1", "HW INPUT 2", "HW INPUT 3", "VAIO", "AUX"
-    };
     for (int i = 0; i < kStrips; ++i) {
-        auto* s = new StripWidget(m_shm, i, i < kHwStrips, stripTitle[i]);
+        auto* s = new StripWidget(m_shm, i, i < kHwStrips, kStripTitle[i]);
         connect(s, &StripWidget::routingChanged, this,
                 [this](int idx, const QString& n) {
                     m_hwIn[idx] = n;
@@ -1654,7 +1666,7 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
         connect(s, &StripWidget::eqEditRequested, this, &MainWindow::openStripEq);
         connect(s, &StripWidget::fxEditRequested, this, &MainWindow::openStripFx);
         connect(s, &StripWidget::statusMessage, this,
-                [this](const QString& t) { say(t); });
+                [this](const QString& t) { say(t, 7000); });
         m_strips.push_back(s);
         inRow->addWidget(s);
         // Two classes of input, separated by a real gutter. A 1px bevel in 2px
@@ -1748,6 +1760,9 @@ void MainWindow::refreshTitle()
     if (windowTitle() != t) setWindowTitle(t);
 }
 
+// One place, so the timeouts stop being six different numbers chosen at six
+// call sites. Anything that reports a change the user did not make gets longer
+// on screen than a plain acknowledgement.
 void MainWindow::say(const QString& text, int ms)
 {
     statusBar()->showMessage(text, ms);
@@ -1782,13 +1797,15 @@ void MainWindow::restoreWindowGeometry()
 {
     const QByteArray g = QSettings("betterbanana", "gui").value("geometry/main").toByteArray();
     if (!g.isEmpty() && restoreGeometry(g)) {
-        // A saved geometry from a bigger display must not open off-screen.
+        // restoreGeometry has already placed the window, including its frame.
+        // Only intervene when the saved geometry does not fit or does not land
+        // on this display - and then move the FRAME, via QWidget::move, rather
+        // than feeding a frame origin to setGeometry, which positions the
+        // client rect and so walked the window up and left on every launch.
         const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 720);
-        QRect r = frameGeometry();
-        r.setWidth(qMin(r.width(), avail.width()));
-        r.setHeight(qMin(r.height(), avail.height()));
-        if (!avail.intersects(r)) r.moveTo(avail.topLeft());
-        setGeometry(QRect(r.topLeft(), size().boundedTo(avail.size())));
+        const QSize fit = size().boundedTo(avail.size() - (frameGeometry().size() - size()));
+        if (fit != size()) resize(fit);
+        if (!avail.intersects(frameGeometry())) move(avail.topLeft());
         return;
     }
     const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 720);
@@ -1861,24 +1878,16 @@ void MainWindow::openBusEq(int bus)
 void MainWindow::openStripEq(int strip)
 {
     if (strip < 0 || strip >= kStrips) return;
-    static const char* kDefault[kStrips] = {
-        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
-        "BetterBanana VAIO", "BetterBanana AUX"
-    };
     // -1: a microphone has no measured headphone correction to look up.
     EqEditorDialog(m_shm, &m_shm->strip[strip].eq, spec_strip_src(strip),
-                   labelFor(m_shm, true, strip, kDefault[strip]), -1, this).exec();
+                   labelFor(m_shm, true, strip, kStripTitle[strip]), -1, this).exec();
     m_strips[strip]->pullFromShm();
 }
 
 void MainWindow::openStripFx(int strip)
 {
     if (strip < 0 || strip >= kStrips) return;
-    static const char* kDefault[kStrips] = {
-        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
-        "BetterBanana VAIO", "BetterBanana AUX"
-    };
-    VoiceFxDialog(m_shm, strip, labelFor(m_shm, true, strip, kDefault[strip]), this).exec();
+    VoiceFxDialog(m_shm, strip, labelFor(m_shm, true, strip, kStripTitle[strip]), this).exec();
     m_strips[strip]->pullFromShm();
 }
 
@@ -2072,29 +2081,25 @@ void MainWindow::buildMenus()
     });
     eng->addSeparator();
     auto* inEq = eng->addMenu("&Input EQ");
-    static const char* kStripDefault[kStrips] = {
-        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
-        "BetterBanana VAIO", "BetterBanana AUX"
-    };
     connect(inEq, &QMenu::aboutToShow, this, [this, inEq] {
         inEq->clear();
         for (int i = 0; i < kStrips; ++i)
-            inEq->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+            inEq->addAction(labelFor(m_shm, true, i, kStripTitle[i]) + "...",
                             this, [this, i] { openStripEq(i); });
     });
     for (int i = 0; i < kStrips; ++i)
-        inEq->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+        inEq->addAction(labelFor(m_shm, true, i, kStripTitle[i]) + "...",
                         this, [this, i] { openStripEq(i); });
 
     auto* fxMenu = eng->addMenu("&Voice changer");
     connect(fxMenu, &QMenu::aboutToShow, this, [this, fxMenu] {
         fxMenu->clear();
         for (int i = 0; i < kStrips; ++i)
-            fxMenu->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+            fxMenu->addAction(labelFor(m_shm, true, i, kStripTitle[i]) + "...",
                               this, [this, i] { openStripFx(i); });
     });
     for (int i = 0; i < kStrips; ++i)
-        fxMenu->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+        fxMenu->addAction(labelFor(m_shm, true, i, kStripTitle[i]) + "...",
                           this, [this, i] { openStripFx(i); });
 
     auto* eqMenu = eng->addMenu("&Bus EQ");
@@ -2454,9 +2459,14 @@ void MainWindow::applyAppRules()
 
     struct Fetch { QString sinks, sinkIn, sourceIn, srcShort, sinkShort; int pending = 5; };
     auto acc = std::make_shared<Fetch>();
-    auto done = [this, acc](const QString&) {
+    const uint32_t round = ++m_ruleRound;
+    auto done = [this, acc, round](const QString&) {
         if (--acc->pending > 0) return;
+        // A round the watchdog already gave up on describes a state that has
+        // moved on. Acting on it would re-route from a stale snapshot.
+        if (round != m_ruleRound) return;
         m_ruleBusy = false;
+        if (acc->sinks.isEmpty() && acc->sinkIn.isEmpty()) return;   // pactl failed
         applyAppRulesWith(acc->sinks, acc->sinkIn, acc->sinkShort,
                           acc->sourceIn, acc->srcShort);
     };
@@ -2506,7 +2516,7 @@ void MainWindow::tick()
     if (++m_ruleTicks >= 30) { m_ruleTicks = 0; applyAppRules(); }
     // If a pactl round somehow neither finishes nor errors, the busy flag would
     // latch and application routing would stop for the life of the window.
-    if (m_ruleBusy && ++m_ruleWait > 300) { m_ruleWait = 0; m_ruleBusy = false; }
+    if (m_ruleBusy && ++m_ruleWait > 300) { m_ruleWait = 0; m_ruleBusy = false; ++m_ruleRound; }
     if (!m_ruleBusy) m_ruleWait = 0;
 
     if (m_engineLive) {
@@ -2552,12 +2562,16 @@ void MainWindow::tick()
         : QString("engine not responding");
     // No unconditional setStyleSheet: this used to re-parse a sheet 30x a
     // second for a string that had not changed.
-    if (m_status->text() != txt) {
-        m_status->setText(txt);
-        m_status->setStyleSheet(QString("color:%1;")
-            .arg(bbcolor::ensureContrast(live ? theme().busA : theme().mute,
-                                         theme().panel, bbcolor::kTextFloor)
-                     .name(QColor::HexRgb)));
+    // Recomputed only when the text or the theme changes: this used to
+    // re-parse a stylesheet thirty times a second for a string that had not
+    // moved, and then never re-parse it at all when the theme did.
+    const QString col = bbcolor::ensureContrast(live ? theme().busA : theme().mute,
+                                                theme().panel, bbcolor::kTextFloor)
+                            .name(QColor::HexRgb);
+    if (m_status->text() != txt) m_status->setText(txt);
+    if (m_statusColour != col) {
+        m_statusColour = col;
+        m_status->setStyleSheet(QString("color:%1;").arg(col));
     }
 
     if (++m_stateTicks >= 15) { m_stateTicks = 0; refreshCardStates(); }

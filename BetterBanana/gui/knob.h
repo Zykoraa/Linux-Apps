@@ -55,6 +55,7 @@ private:
     std::function<QString(int)> m_fmt;
     bool    m_dragging = false;
     bool    m_hover = false;
+    bool    m_fine = false;
     int     m_dragStartY = 0, m_dragStartVal = 0;
 };
 

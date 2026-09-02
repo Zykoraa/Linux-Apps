@@ -682,6 +682,11 @@ void EqCurve::mousePressEvent(QMouseEvent* e)
     if (e->button() != Qt::LeftButton) return;
     emit editStarted(k);
     setCursor(Qt::ClosedHandCursor);
+    // Where the pointer sits relative to the handle's TRUE position. A handle
+    // that has been fanned aside to clear a coincident one is drawn up to 17px
+    // from where its gain actually is, so mapping the raw pointer y straight to
+    // a gain snapped the band by exactly that offset the moment you grabbed it.
+    m_grabOff = e->position() - handlePos(k);
     m_drag = k;
     setSelected(k);
     emit bandSelected(k);
@@ -698,9 +703,10 @@ void EqCurve::mouseMoveEvent(QMouseEvent* e)
         if (h != m_hover) { m_hover = h; update(); }
         return;
     }
-    m_eq->freq[m_drag].store(float(std::clamp(freqForX(e->position().x()), 10.0, 24000.0)));
+    const QPointF at = e->position() - m_grabOff;
+    m_eq->freq[m_drag].store(float(std::clamp(freqForX(at.x()), 10.0, 24000.0)));
     if (eq_type_uses_gain(m_eq->type[m_drag].load())) {
-        const double g = dbForY(e->position().y()) - m_eq->preamp_db.load();
+        const double g = dbForY(at.y()) - m_eq->preamp_db.load();
         m_eq->gain[m_drag].store(float(std::clamp(g, -24.0, 24.0)));
     }
     emit bandEdited(m_drag);
