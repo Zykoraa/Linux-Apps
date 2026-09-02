@@ -834,11 +834,15 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
         col->addWidget(k, 0, Qt::AlignHCenter);
         top->addLayout(col);
     };
+    // These ranges track bb-ctl's clamps exactly (the "duck" block in
+    // tools/bb-ctl.cpp). A knob narrower than the shell accepts leaves a
+    // scripted value unreachable here, and pulls it in the moment anyone
+    // nudges the knob - a silent edit nobody asked for.
     addKnob("THRESHOLD", -800, 0, int(m_shm->duck_threshold_db.load() * 10), 0.1, 1, " dB",
             [this](int v) { m_shm->duck_threshold_db.store(v / 10.0f); });
     addKnob("ATTACK", 1, 500, int(m_shm->duck_attack_ms.load()), 1.0, 0, " ms",
             [this](int v) { m_shm->duck_attack_ms.store(float(v)); });
-    addKnob("RELEASE", 10, 3000, int(m_shm->duck_release_ms.load()), 1.0, 0, " ms",
+    addKnob("RELEASE", 10, 5000, int(m_shm->duck_release_ms.load()), 1.0, 0, " ms",
             [this](int v) { m_shm->duck_release_ms.store(float(v)); });
     top->addStretch();
     m_env = makeLabel("idle", "value", Qt::AlignRight | Qt::AlignVCenter);
@@ -862,7 +866,7 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
         key->setChecked(p.duck_key.load() != 0);
         connect(key, &QPushButton::toggled, this, [&p](bool b) { p.duck_key.store(b ? 1 : 0); });
         grid->addWidget(key, i + 1, 1);
-        auto* depth = new Knob(-400, 0, 0, false, " dB");
+        auto* depth = new Knob(-600, 0, 0, false, " dB");   // as bb-ctl strip <i> duck
         depth->setMinimumWidth(52);
         depth->setValue(int(p.duck_depth_db.load() * 10));
         connect(depth, &Knob::valueChanged, this, [&p](int v) { p.duck_depth_db.store(v / 10.0f); });
