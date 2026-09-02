@@ -389,13 +389,35 @@ Two consequences worth knowing:
   yourself through it will. Use your interface's direct monitoring for your own
   ears and take the strip off the bus feeding your headphones, so the effect
   only sits on the path going out.
-- **There is a faint warble on speech** that a phase vocoder would not have, at
-  the rate the head wraps: about 8 Hz for a five-semitone shift. That is the
-  price of the cheap algorithm, and it is why the crossfade is short rather than
-  the more obvious half-window overlap — two heads summed the whole time sit a
-  fixed distance apart and cancel each other wherever that distance is a half
-  period, which sounds hollow. `tests/test_voicefx.cpp` measures the result with
-  the analyser's own FFT and checks the shifted tone is the dominant partial.
+- **The seam is locked to your pitch.** The head splices back by one sweep
+  whenever it runs out of window, and if that sweep is an arbitrary length the
+  waveform does not line up either side of the splice. The mismatch then repeats
+  at the sweep rate — 15 to 20 Hz for a large shift, which is exactly where the
+  ear hears roughness. It sounds robotic.
+
+  So the sweep is set to a whole number of the speaker's own pitch periods,
+  tracked by autocorrelation and refined to a fraction of a sample. Rounding
+  that period to whole samples is not good enough: four samples of error per
+  sweep puts the tenth harmonic sixty degrees out at the seam, and on its own
+  that held the modulation at 2.4%.
+
+  The crossfade law changes with it. Aligning the taps makes them read
+  near-identical signal, and summing correlated signals with the constant-*power*
+  law puts +3 dB in the middle of every seam — measurably worse than the buzz
+  the alignment just removed. Correlated wants constant amplitude; unvoiced
+  audio, where no period is found, still wants constant power. It picks per
+  seam.
+
+  Measured on a 115 Hz voice: **5.5% amplitude modulation before, 0.2% after**,
+  which is the test signal's own noise floor. The tracker costs nothing
+  measurable — a pitch-shifting strip reads the same DSP load as an idle one —
+  and it runs only while the pitch stage does.
+
+  The crossfade is also short rather than the more obvious half-window overlap:
+  two heads summed the whole time sit a fixed distance apart and cancel each
+  other wherever that distance is a half period, which sounds hollow.
+  `tests/test_voicefx.cpp` measures all of it — the shifted tone is the dominant
+  partial, and the modulation added stays under 1%.
 
 RubberBand would do the pitch side better than this, but it is GPL and this is
 MIT; the formant stage above is what actually mattered, and it needed no
@@ -869,7 +891,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
-    ./build/test_voicefx      # 29 voice changer assertions, measured by FFT
+    ./build/test_voicefx      # 36 voice changer assertions, measured by FFT
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
