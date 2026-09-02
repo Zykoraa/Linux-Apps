@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "eqdialog.h"
 #include "fxdialog.h"
+#include "dialogbits.h"
 #include "theme.h"
 #include "color.h"
 #include "metrics.h"
@@ -142,7 +143,12 @@ Knob* StripWidget::addKnob(QGridLayout* g, int col, const QString& name,
                            int lo, int hi, int def, bool bipolar)
 {
     auto* k = new Knob(lo, hi, def, bipolar, QString());
-    g->addWidget(makeLabel(name, "caption"), 0, col);
+    // Elided rather than clipped: three five-letter captions share a knob grid
+    // barely a hundred pixels wide, and "AUDIB" is already an abbreviation.
+    auto* cap = makeHeader(name, "knobcap");
+    cap->setToolTip(name == "AUDIB" ? "Audibility: Voicemeeter's intelligibility lift"
+                                    : name);
+    g->addWidget(cap, 0, col);
     g->addWidget(k, 1, col, Qt::AlignHCenter);
     return k;
 }
@@ -159,7 +165,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
     setProperty("role", hardware ? "card" : "cardVirtual");
     setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setContentsMargins(bbui::gapS() + 1, bbui::gapS() + 2, bbui::gapS() + 1, bbui::gapS() + 2);
     root->setSpacing(bbui::gapS());
     m_header = makeHeader(labelFor(shm, true, index, title), "header");
     installRename(m_header, shm, true, index, title, this);
@@ -194,7 +200,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
     // Gate / Comp / Audibility exist only on hardware strips, as in Banana.
     if (m_hardware) {
         auto* g = new QGridLayout;
-        g->setSpacing(1);
+        g->setSpacing(bbui::gapXS());
         m_gate = addKnob(g, 0, "GATE",  0, 100, 0, false);
         m_comp = addKnob(g, 1, "COMP",  0, 100, 0, false);
         m_aud  = addKnob(g, 2, "AUDIB", 0, 100, 0, false);
@@ -218,7 +224,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
 
     {   // EQ
         auto* g = new QGridLayout;
-        g->setSpacing(1);
+        g->setSpacing(bbui::gapXS());
         m_eqLo  = addKnob(g, 0, "LOW",  -120, 120, 0, true);
         m_eqMid = addKnob(g, 1, "MID",  -120, 120, 0, true);
         m_eqHi  = addKnob(g, 2, "HIGH", -120, 120, 0, true);
@@ -252,7 +258,13 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         root->addLayout(row);
     }
 
-    {   // Mono / Solo / Mute
+    {   // Mono / Solo, then Mute across the full width.
+        //
+        // Three four-letter chips side by side is what set this card's minimum
+        // width, and it needed 133px per column: ten of those plus chrome asked
+        // for a 1370px window, so at any smaller size the labels clipped to
+        // "MONC SOLC MUTI". Two rows cost 22px of height - which the console has
+        // in quantity - and hand the most-used control the biggest target.
         auto* row = new QHBoxLayout;
         row->setSpacing(bbui::gapXS());
         m_mono = makeToggle("MONO", "mono");
@@ -261,8 +273,9 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         connect(m_mono, &QPushButton::toggled, this, [&p](bool b){ p.mono.store(b ? 1 : 0); });
         connect(m_solo, &QPushButton::toggled, this, [&p](bool b){ p.solo.store(b ? 1 : 0); });
         connect(m_mute, &QPushButton::toggled, this, [&p](bool b){ p.mute.store(b ? 1 : 0); });
-        row->addWidget(m_mono); row->addWidget(m_solo); row->addWidget(m_mute);
+        row->addWidget(m_mono); row->addWidget(m_solo);
         root->addLayout(row);
+        root->addWidget(m_mute);
     }
 
     {   // Fader + meter
@@ -325,7 +338,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         }
         root->addLayout(row);
     }
-    setMinimumWidth(bbui::px(140));
+    setMinimumWidth(bbui::px(112));
 }
 
 // Re-apply a dynamic property so the stylesheet picks it up. Qt does not
@@ -337,6 +350,13 @@ static void restyle(QWidget* w, const char* name, bool on)
     w->style()->unpolish(w);
     w->style()->polish(w);
     w->update();
+}
+
+void StripWidget::setTravel(int px)
+{
+    if (m_fader->height() == px) return;
+    m_fader->setFixedHeight(px);
+    m_meter->setFixedHeight(px);
 }
 
 void StripWidget::setDimmed(bool d)
@@ -435,10 +455,17 @@ void StripWidget::setDeviceValue(const QString& id)
     int idx = m_device->findData(id);
     m_missing = false;
     if (idx < 0 && !id.isEmpty()) {          // assigned device is gone/unplugged
-        m_device->addItem(id + "  (missing)", id);
+        // The marker leads. It used to be appended to a raw PipeWire node name
+        // that needs 437px of advance inside a 94px combo, so the one word that
+        // mattered was the only part guaranteed never to be on screen.
+        m_device->addItem("missing  -  " + id, id);
         idx = m_device->count() - 1;
     }
-    if (idx > 0) m_missing = m_device->itemText(idx).endsWith("(missing)");
+    if (idx > 0) m_missing = m_device->itemText(idx).startsWith("missing  -  ");
+    // Carry it in the control's own colour too, not just its text.
+    m_device->setProperty("bad", m_missing);
+    m_device->style()->unpolish(m_device);
+    m_device->style()->polish(m_device);
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -502,7 +529,7 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
     setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QVBoxLayout(this);
     m_root = root;
-    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setContentsMargins(bbui::gapS() + 1, bbui::gapS() + 2, bbui::gapS() + 1, bbui::gapS() + 2);
     root->setSpacing(bbui::gapS());
 
     {   // Rename a bus to "headphones" and its A-number used to vanish from the
@@ -554,8 +581,9 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
         connect(m_eq,   &QPushButton::toggled, this, [&p](bool b){ p.eq.on.store(b ? 1 : 0); });
         connect(m_mono, &QPushButton::toggled, this, [&p](bool b){ p.mono.store(b ? 1 : 0); });
         connect(m_mute, &QPushButton::toggled, this, [&p](bool b){ p.mute.store(b ? 1 : 0); });
-        row->addWidget(m_eq); row->addWidget(m_mono); row->addWidget(m_mute);
+        row->addWidget(m_eq); row->addWidget(m_mono);
         root->addLayout(row);
+        root->addWidget(m_mute);      // full width, as on an input strip
     }
     {
         auto* row = new QHBoxLayout;
@@ -590,10 +618,17 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
     // A strip carries pan and a bus-assign row under its gain readout. Matching
     // that depth here lines every meter in the console up along one baseline.
     root->addStretch(1);
-    setMinimumWidth(bbui::px(124));
+    setMinimumWidth(bbui::px(100));
 }
 
 void BusWidget::setLive(bool live) { m_meter->setStale(!live); }
+
+void BusWidget::setTravel(int px)
+{
+    if (m_fader->height() == px) return;
+    m_fader->setFixedHeight(px);
+    m_meter->setFixedHeight(px);
+}
 
 int  BusWidget::meterTop() const { return m_meter->mapTo(this, QPoint(0, 0)).y(); }
 int  BusWidget::leadPad() const  { return m_lead ? m_lead->geometry().height() : 0; }
@@ -627,10 +662,13 @@ void BusWidget::setDeviceValue(const QString& id)
     int idx = m_device->findData(id);
     m_missing = false;
     if (idx < 0 && !id.isEmpty()) {
-        m_device->addItem(id + "  (missing)", id);
+        m_device->addItem("missing  -  " + id, id);   // marker leads; see StripWidget
         idx = m_device->count() - 1;
     }
-    if (idx > 0) m_missing = m_device->itemText(idx).endsWith("(missing)");
+    if (idx > 0) m_missing = m_device->itemText(idx).startsWith("missing  -  ");
+    m_device->setProperty("bad", m_missing);
+    m_device->style()->unpolish(m_device);
+    m_device->style()->polish(m_device);
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -697,6 +735,7 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
 {
     setProperty("role", "card");
     setAttribute(Qt::WA_StyledBackground, true);
+    m_pulse.start();
     auto* root = new QHBoxLayout(this);
     root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
     root->setSpacing(bbui::gapM());
@@ -851,6 +890,18 @@ void RecorderWidget::refresh()
     const uint32_t tot = m_shm->rec.total_frames.load();
 
     { QSignalBlocker b(m_rec);  m_rec->setChecked(st == kRecRecording); }
+    // Pulse the record chip while it is actually recording. Two seconds of a
+    // steady red chip and two seconds of an armed one look identical.
+    {
+        const bool recording = (st == kRecRecording);
+        const bool lit = !recording || (m_pulse.elapsed() % 1000) < 620;
+        const char* want = lit ? "rec" : "recdim";
+        if (m_rec->property("role").toString() != QLatin1String(want)) {
+            m_rec->setProperty("role", want);
+            m_rec->style()->unpolish(m_rec);
+            m_rec->style()->polish(m_rec);
+        }
+    }
     { QSignalBlocker b(m_play); m_play->setChecked(st == kRecPlaying); }
     { QSignalBlocker b(m_loop); m_loop->setChecked(m_shm->rec.loop.load() != 0); }
 
@@ -913,7 +964,16 @@ void RecorderWidget::refresh()
 VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(shm)
 {
     setWindowTitle("VBAN network streams");
+    // What to put back if the user cancels. Copied field by field rather than
+    // by memcpy of VbanConfig, which holds an atomic the engine is reading.
+    for (int i = 0; i < kVbanStreams; ++i) {
+        m_out0[i] = m_shm->vban.out[i];
+        m_in0[i]  = m_shm->vban.in[i];
+    }
     auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("VBAN network streams",
+        "Send a bus to another machine on the network, or receive one as a new input."));
 
     auto* outBox = new QGroupBox("OUTGOING  (a bus sent to a remote host)");
     auto* og = new QGridLayout(outBox);
@@ -963,14 +1023,34 @@ VbanDialog::VbanDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     }
     root->addWidget(inBox);
 
-    auto* btns = new QHBoxLayout;
-    btns->addStretch();
-    auto* applyBtn = new QPushButton("Apply");
-    auto* closeBtn = new QPushButton("Close");
-    connect(applyBtn, &QPushButton::clicked, this, [this]{ apply(); });
-    connect(closeBtn, &QPushButton::clicked, this, [this]{ apply(); accept(); });
-    btns->addWidget(applyBtn); btns->addWidget(closeBtn);
-    root->addLayout(btns);
+    // Three exits meaning three different things is one too many: "Apply"
+    // applied, "Close" also applied without saying so, and Escape discarded.
+    // Now the words match what happens.
+    auto* okBtn     = new QPushButton("Apply and close");
+    auto* cancelBtn = new QPushButton("Cancel");
+    connect(okBtn,     &QPushButton::clicked, this, [this]{ apply(); accept(); });
+    connect(cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
+    root->addLayout(bbdlg::buttonRow(okBtn, cancelBtn));
+    bbdlg::tameDefaults(this, okBtn);
+    bbdlg::rememberGeometry(this, "vban");
+}
+
+void VbanDialog::revert()
+{
+    m_shm->vban.seq.fetch_add(1, std::memory_order_acq_rel);
+    for (int i = 0; i < kVbanStreams; ++i) {
+        m_shm->vban.out[i] = m_out0[i];
+        m_shm->vban.in[i]  = m_in0[i];
+    }
+    m_shm->vban.seq.fetch_add(1, std::memory_order_release);
+}
+
+void VbanDialog::reject()
+{
+    revert();
+    m_shm->cmd.store(kCmdVbanReload);
+    m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+    QDialog::reject();
 }
 
 void VbanDialog::apply()
@@ -1015,13 +1095,41 @@ static QString pactlRun(const QStringList& args)
     return QString::fromUtf8(p.readAllStandardOutput());
 }
 
+// The same thing without stopping the world. The application-routing pass runs
+// once a second from the timer that also drives the meters, and it made five of
+// these round trips per pass at 16-18 ms each - so the meters dropped a frame
+// or two every second, for as long as the mixer was open, and a wedged
+// pipewire-pulse would freeze the window for fifteen seconds.
+//
+// The callback is shared rather than moved: `finished` and `errorOccurred` can
+// both be connected, and only one of them will run.
+static void pactlAsync(const QStringList& args, QObject* ctx,
+                       std::function<void(const QString&)> done)
+{
+    auto cb = std::make_shared<std::function<void(const QString&)>>(std::move(done));
+    auto* p = new QProcess(ctx);
+    auto fire = [p, cb](const QString& out) {
+        if (!*cb) return;
+        auto call = *cb;
+        *cb = nullptr;                       // exactly once
+        call(out);
+        p->deleteLater();
+    };
+    QObject::connect(p, &QProcess::finished, ctx, [p, fire](int, QProcess::ExitStatus) {
+        fire(QString::fromUtf8(p->readAllStandardOutput()));
+    });
+    QObject::connect(p, &QProcess::errorOccurred, ctx, [fire](QProcess::ProcessError) {
+        fire(QString());
+    });
+    p->start("pactl", args);
+}
+
 // `own`: include the engine's own endpoints (wanted when choosing where an
 // application should play, unwanted when choosing a physical device).
-static QVector<DevEntry> listDevices(bool sinks, bool own)
+static QVector<DevEntry> parseDevices(const QString& json, bool own)
 {
     QVector<DevEntry> v;
-    const QJsonDocument doc =
-        QJsonDocument::fromJson(pactlRun({ "-f", "json", "list", sinks ? "sinks" : "sources" }).toUtf8());
+    const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
     if (!doc.isArray()) return v;
     for (const QJsonValue& val : doc.array()) {
         const QJsonObject o = val.toObject();
@@ -1044,6 +1152,11 @@ static QVector<DevEntry> listDevices(bool sinks, bool own)
     return v;
 }
 
+static QVector<DevEntry> listDevices(bool sinks, bool own)
+{
+    return parseDevices(pactlRun({ "-f", "json", "list", sinks ? "sinks" : "sources" }), own);
+}
+
 // Puts the entries whose id is in `first` at the top, in that order.
 static QVector<DevEntry> promote(QVector<DevEntry> in, const QStringList& first)
 {
@@ -1060,12 +1173,14 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
 {
     setWindowTitle("Sidechain ducking");
     auto* root = new QVBoxLayout(this);
-    root->addWidget(makeLabel(
-        "Strips marked KEY pull down every strip that has a depth set - so music "
-        "gets out of the way while you talk.", "caption", Qt::AlignLeft));
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("Sidechain ducking",
+        "Strips marked KEY pull down every strip that has a depth set, so music "
+        "gets out of the way while you talk."));
 
     auto* top = new QHBoxLayout;
-    m_on = makeToggle("DUCKING ON", "eq", 24);
+    top->setSpacing(bbui::gapM());
+    m_on = makeToggle("DUCKING ON", "eq", bbui::px(24));
     m_on->setChecked(m_shm->duck_enabled.load() != 0);
     connect(m_on, &QPushButton::toggled, this,
             [this](bool b) { m_shm->duck_enabled.store(b ? 1 : 0); });
@@ -1076,7 +1191,7 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
         auto* col = new QVBoxLayout;
         col->addWidget(makeLabel(cap, "caption"));
         auto* k = new Knob(lo, hi, val, false, suffix);
-        k->setMinimumWidth(52);
+        k->setMinimumWidth(bbui::px(52));
         k->setScale(scale);
         k->setDecimals(decimals);
         k->setValue(val);
@@ -1096,7 +1211,7 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
             [this](int v) { m_shm->duck_release_ms.store(float(v)); });
     top->addStretch();
     m_env = makeLabel("idle", "value", Qt::AlignRight | Qt::AlignVCenter);
-    m_env->setMinimumWidth(120);
+    m_env->setMinimumWidth(bbui::px(120));
     top->addWidget(m_env);
     root->addLayout(top);
 
@@ -1132,6 +1247,7 @@ DuckDialog::DuckDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(sh
     root->addLayout(btns);
 
     resize(560, 400);
+    bbdlg::rememberGeometry(this, "duck");
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &DuckDialog::refresh);
     m_timer->start(60);
@@ -1168,17 +1284,15 @@ struct StreamInfo {
     QString target;     // node.name it is currently attached to
 };
 
-static QVector<StreamInfo> listStreams(bool playback)
+static QVector<StreamInfo> parseStreams(const QString& js, const QString& shortList,
+                                       bool playback)
 {
     QVector<StreamInfo> v;
-    const QString js = pactlRun({ "-f", "json", "list",
-                                  playback ? "sink-inputs" : "source-outputs" });
     const QJsonDocument doc = QJsonDocument::fromJson(js.toUtf8());
     if (!doc.isArray()) return v;
 
     QMap<int, QString> byId;
-    for (const QString& ln : pactlRun({ "list", "short", playback ? "sinks" : "sources" })
-                                 .split('\n', Qt::SkipEmptyParts)) {
+    for (const QString& ln : shortList.split('\n', Qt::SkipEmptyParts)) {
         const QStringList f = ln.split('\t');
         if (f.size() >= 2) byId[f.at(0).toInt()] = f.at(1);
     }
@@ -1204,6 +1318,14 @@ static QVector<StreamInfo> listStreams(bool playback)
         v.append(si);
     }
     return v;
+}
+
+static QVector<StreamInfo> listStreams(bool playback)
+{
+    return parseStreams(pactlRun({ "-f", "json", "list",
+                                   playback ? "sink-inputs" : "source-outputs" }),
+                        pactlRun({ "list", "short", playback ? "sinks" : "sources" }),
+                        playback);
 }
 
 // Auto-routing rules, remembered per application name.
@@ -1234,6 +1356,10 @@ AppsDialog::AppsDialog(QWidget* parent) : QDialog(parent)
 {
     setWindowTitle("Applications");
     auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("Applications",
+        "Where each program's audio goes. A choice made here is remembered and "
+        "re-applied the next time that program starts."));
 
     auto* playBox = new QGroupBox("PLAYING  (send an app into a BetterBanana strip)");
     m_playLay = new QVBoxLayout(playBox);
@@ -1266,6 +1392,7 @@ AppsDialog::AppsDialog(QWidget* parent) : QDialog(parent)
 
     resize(620, 460);
     refresh();
+    bbdlg::rememberGeometry(this, "apps");
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &AppsDialog::refresh);
     m_timer->start(1000);
@@ -1510,7 +1637,7 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
 
     auto* inBox = new QGroupBox("INPUTS");
     auto* inRow = new QHBoxLayout(inBox);
-    inRow->setSpacing(bbui::gapS());
+    inRow->setSpacing(bbui::gapXS() + 1);
     // Short enough to fit a card without eliding; the long form was clipped to
     // "HARDWARE IN..." at every window size the app is actually used at.
     static const char* stripTitle[kStrips] = {
@@ -1532,13 +1659,13 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
         inRow->addWidget(s);
         // Two classes of input, separated by a real gutter. A 1px bevel in 2px
         // of space read as a rendering seam, not a boundary.
-        if (i == kHwStrips - 1) inRow->addSpacing(bbui::gapL());
+        if (i == kHwStrips - 1) inRow->addSpacing(bbui::gapM() + 2);
     }
     row->addWidget(inBox, 5);
 
     auto* outBox = new QGroupBox("BUSES");
     auto* outRow = new QHBoxLayout(outBox);
-    outRow->setSpacing(bbui::gapS());
+    outRow->setSpacing(bbui::gapXS() + 1);
     for (int b = 0; b < kBuses; ++b) {
         auto* w = new BusWidget(m_shm, b, b < kPhysBuses, kBusLabel[b]);
         connect(w, &BusWidget::routingChanged, this,
@@ -1550,7 +1677,7 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
         connect(w, &BusWidget::eqEditRequested, this, &MainWindow::openBusEq);
         m_buses.push_back(w);
         outRow->addWidget(w);
-        if (b == kPhysBuses - 1) outRow->addSpacing(bbui::gapL());
+        if (b == kPhysBuses - 1) outRow->addSpacing(bbui::gapM() + 2);
     }
     row->addWidget(outBox, 5);
     outer->addLayout(row, 0);
@@ -1565,6 +1692,8 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     outer->addWidget(m_recorder);
 
     auto* scroll = new QScrollArea;
+    m_scroll = scroll;
+    m_central = central;
     scroll->setWidget(central);
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
@@ -1577,16 +1706,28 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
 
     QSettings st("betterbanana", "gui");
     applyTheme(st.value("theme", 0).toInt());
-    // Below this the bus section clips and the recorder collapses to a title
-    // with a scrollbar, which is what a 1366x768 laptop used to get.
-    setMinimumSize(bbui::px(1040), bbui::px(640));
+    // Derived, not guessed: ten cards at their own minimum widths plus the
+    // gutters and margins around them, and the console's own content height at
+    // the floor travel. Hard-coding it got the app a horizontal scrollbar at
+    // its own stated minimum.
+    if (m_central) {
+        const QSize need = m_central->minimumSizeHint().expandedTo(m_central->sizeHint());
+        // Width is a hard floor - ten columns cannot overlap. Height is capped
+        // well below what the content wants, because a 1366x768 laptop has
+        // about 730 usable pixels and scrolling the console is a far better
+        // answer there than refusing to open at a usable size.
+        setMinimumSize(qMin(need.width() + bbui::px(4), 1600),
+                       qMin(need.height() + bbui::px(24), bbui::px(660)));
+    }
     // A screen-clamped restore, so the mixer cannot open wider than the display
     // it is opening on. The hard-coded 1500x720 was nothing like the size this
     // window actually gets dragged to.
     restoreWindowGeometry();
 
-    for (auto* s : m_strips) s->pullFromShm();
-    for (auto* b : m_buses)  b->pullFromShm();
+    // Start at the floor so the first tick can measure the window's own chrome.
+    m_travel = bbui::travel();
+    for (auto* s : m_strips) { s->setTravel(m_travel); s->pullFromShm(); }
+    for (auto* b : m_buses)  { b->setTravel(m_travel); b->pullFromShm(); }
     refreshDevices();
 
     // Whatever the mixer looks like when the window opens is undo's starting
@@ -2303,18 +2444,49 @@ void MainWindow::refreshDevices()
 
 // Re-route newly appeared streams according to the saved rules. Applied once
 // per stream, so a manual move afterwards is respected.
+// Four reads, all in flight at once, none of them on the timer's critical path.
+// The writes that follow are rare - only when a stream first appears with a
+// rule that does not match where it landed - so they stay synchronous.
 void MainWindow::applyAppRules()
+{
+    if (m_ruleBusy) return;              // a round is still in flight
+    m_ruleBusy = true;
+
+    struct Fetch { QString sinks, sinkIn, sourceIn, srcShort, sinkShort; int pending = 5; };
+    auto acc = std::make_shared<Fetch>();
+    auto done = [this, acc](const QString&) {
+        if (--acc->pending > 0) return;
+        m_ruleBusy = false;
+        applyAppRulesWith(acc->sinks, acc->sinkIn, acc->sinkShort,
+                          acc->sourceIn, acc->srcShort);
+    };
+    pactlAsync({ "-f", "json", "list", "sinks" }, this,
+               [acc, done](const QString& o) { acc->sinks = o; done(o); });
+    pactlAsync({ "-f", "json", "list", "sink-inputs" }, this,
+               [acc, done](const QString& o) { acc->sinkIn = o; done(o); });
+    pactlAsync({ "list", "short", "sinks" }, this,
+               [acc, done](const QString& o) { acc->sinkShort = o; done(o); });
+    pactlAsync({ "-f", "json", "list", "source-outputs" }, this,
+               [acc, done](const QString& o) { acc->sourceIn = o; done(o); });
+    pactlAsync({ "list", "short", "sources" }, this,
+               [acc, done](const QString& o) { acc->srcShort = o; done(o); });
+}
+
+void MainWindow::applyAppRulesWith(const QString& sinksJson,
+                                   const QString& sinkInputs, const QString& sinkShort,
+                                   const QString& sourceOutputs, const QString& sourceShort)
 {
     // A rule saved before the stream bus was excluded from the target list can
     // still point at it, and re-applying that rule silences the app every time
     // the mixer opens. Drop such a rule instead of honouring it.
     QSet<QString> captureOnly;
-    for (const DevEntry& d : listDevices(true, true))
+    for (const DevEntry& d : parseDevices(sinksJson, true))
         if (d.captureOnly) captureOnly.insert(d.id);
 
     QSet<int> seen;
     for (bool pb : { true, false }) {
-        for (const StreamInfo& s : listStreams(pb)) {
+        for (const StreamInfo& s : (pb ? parseStreams(sinkInputs, sinkShort, true)
+                                       : parseStreams(sourceOutputs, sourceShort, false))) {
             const int key = pb ? s.index : -(s.index + 1);
             seen.insert(key);
             if (m_ruledStreams.contains(key)) continue;
@@ -2332,6 +2504,10 @@ void MainWindow::applyAppRules()
 void MainWindow::tick()
 {
     if (++m_ruleTicks >= 30) { m_ruleTicks = 0; applyAppRules(); }
+    // If a pactl round somehow neither finishes nor errors, the busy flag would
+    // latch and application routing would stop for the life of the window.
+    if (m_ruleBusy && ++m_ruleWait > 300) { m_ruleWait = 0; m_ruleBusy = false; }
+    if (!m_ruleBusy) m_ruleWait = 0;
 
     if (m_engineLive) {
         for (auto* s : m_strips) s->refreshMeters();
@@ -2386,11 +2562,32 @@ void MainWindow::tick()
 
     if (++m_stateTicks >= 15) { m_stateTicks = 0; refreshCardStates(); }
 
-    // Bring every meter onto one baseline once the layout has settled. Cheap,
-    // idempotent, and it re-runs after a theme or interface-size change because
-    // the measured offsets move with them.
+    // One travel for the whole console, recomputed from the window. A fixed
+    // travel left a blank band under a tall window; an unbounded one gave the
+    // old 835px meter. This grows to fill and stops, and because every column
+    // gets the same number, the meter bridge still reads across.
     if (!m_strips.isEmpty()) {
-        const int want = m_strips.first()->meterTop();
-        for (auto* b : m_buses) b->setLeadPad(want - (b->meterTop() - b->leadPad()));
+        // Measured once, at the floor travel: how tall the *content* wants to
+        // be when the faders are as short as they go. Everything the viewport
+        // has above that is spare, and it goes into the travel.
+        //
+        // The content's hint, not the window's: the console lives in a
+        // QScrollArea, whose own sizeHint is a fixed 576x431 and says nothing
+        // about what is inside it.
+        if (m_consoleChrome == 0 && m_travel == bbui::travel() && m_central)
+            m_consoleChrome = m_central->sizeHint().height();
+        const int room = m_scroll ? m_scroll->viewport()->height() : height();
+        const int want = m_consoleChrome == 0
+            ? bbui::travel()
+            : qBound(bbui::travel(),
+                     bbui::travel() + room - m_consoleChrome,
+                     bbui::travelMax());
+        if (want != m_travel) {
+            m_travel = want;
+            for (auto* s : m_strips) s->setTravel(want);
+            for (auto* b : m_buses)  b->setTravel(want);
+        }
+        const int top = m_strips.first()->meterTop();
+        for (auto* b : m_buses) b->setLeadPad(top - (b->meterTop() - b->leadPad()));
     }
 }

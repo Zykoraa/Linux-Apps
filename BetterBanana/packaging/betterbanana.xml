@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The .bbp preset type.
+
+  A preset is the whole mixer state as plain text, one "key value" per line
+  (common/preset.h), and the first line is always "betterbanana-preset <n>" -
+  so the type can be recognised by content as well as by extension, and a
+  preset renamed or downloaded without its suffix is still identified.
+
+  sub-class-of text/plain is the literal truth about the format and it buys
+  something: a file manager will offer a text editor for one, which is how you
+  read a preset without the mixer running.
+
+  generic-icon rather than icon: giving presets the application's own icon
+  would turn a directory of them into a directory of copies of the app.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-betterbanana-preset">
+    <comment>BetterBanana mixer preset</comment>
+    <generic-icon name="audio-x-generic"/>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.bbp"/>
+    <magic priority="60">
+      <match type="string" value="betterbanana-preset " offset="0"/>
+    </magic>
+  </mime-type>
+</mime-info>

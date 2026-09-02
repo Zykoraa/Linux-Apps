@@ -4,15 +4,18 @@
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$HOME/.local/bin"
-APPS="$HOME/.local/share/applications"
-ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
+SHARE="$HOME/.local/share"
+APPS="$SHARE/applications"
+ICONS="$SHARE/icons/hicolor"
 UNITS="$HOME/.config/systemd/user"
 PWCONF="$HOME/.config/pipewire/pipewire.conf.d"
+ICON_SIZES="16 24 32 48 64 128 256"
 
 [ -x "$ROOT/build/bb-engine" ] || { echo "run 'make' first"; exit 1; }
 [ -x "$ROOT/build/bb-gui" ]    || { echo "run 'make gui' first"; exit 1; }
 
-mkdir -p "$BIN" "$APPS" "$ICONS" "$UNITS" "$PWCONF"
+mkdir -p "$BIN" "$APPS" "$ICONS/scalable/apps" "$UNITS" "$PWCONF" \
+         "$SHARE/mime/packages" "$SHARE/metainfo"
 install -m755 "$ROOT/build/bb-engine" "$ROOT/build/bb-gui" "$ROOT/build/bb-ctl" "$BIN/"
 install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
 install -m755 "$ROOT/tools/bb-health" "$BIN/bb-health"
@@ -32,13 +35,28 @@ if [ -f "$MICGAIN" ]; then
 else
     micgain_note="Mic analyzer:   not installed - run mic-gain/install.sh from https://github.com/Zykoraa/Linux-Apps"
 fi
-install -m644 "$ROOT/packaging/betterbanana.svg"            "$ICONS/betterbanana.svg"
+install -m644 "$ROOT/packaging/betterbanana.svg" "$ICONS/scalable/apps/betterbanana.svg"
+# Sized PNGs as well as the SVG: the hicolor theme is searched by size, and a
+# panel that does not link librsvg never looks in scalable/ at all -- which is
+# how an app that ships a perfectly good icon still comes up as a placeholder.
+for s in $ICON_SIZES; do
+    install -Dm644 "$ROOT/packaging/icons/${s}x${s}/apps/betterbanana.png" \
+                   "$ICONS/${s}x${s}/apps/betterbanana.png"
+done
 install -m644 "$ROOT/packaging/betterbanana.desktop"        "$APPS/betterbanana.desktop"
+install -m644 "$ROOT/packaging/io.github.zykoraa.betterbanana.metainfo.xml" \
+              "$SHARE/metainfo/io.github.zykoraa.betterbanana.metainfo.xml"
+# The .bbp type, so a preset has a name and an icon in a file manager. The
+# .desktop file does not claim to open one yet -- see the comment on its
+# MimeType= line.
+install -m644 "$ROOT/packaging/betterbanana.xml"            "$SHARE/mime/packages/betterbanana.xml"
 # A bare Exec= name only resolves if the *graphical* session has $BIN on PATH,
 # and it often does not: under uwsm, "uwsm aux prepare-env" rebuilds PATH from a
 # POSIX login shell, so a ~/.local/bin added by a fish/bash rc (or by
 # environment.d) is dropped. The launcher then fails with no error at all.
-sed -i "s|^Exec=bb-gui$|Exec=$BIN/bb-gui|" "$APPS/betterbanana.desktop"
+# Unanchored, so the four Desktop Actions get the same treatment as the entry
+# itself; install overwrites the file first, so re-running never double-prefixes.
+sed -i "s|^Exec=bb-gui|Exec=$BIN/bb-gui|" "$APPS/betterbanana.desktop"
 install -m644 "$ROOT/packaging/betterbanana-engine.service" "$UNITS/betterbanana-engine.service"
 install -m644 "$ROOT/packaging/betterbanana-stream-guard.service" "$UNITS/betterbanana-stream-guard.service"
 install -m644 "$ROOT/packaging/betterbanana-health.service" "$UNITS/betterbanana-health.service"
@@ -46,7 +64,8 @@ install -m644 "$ROOT/packaging/99-bb-stream.conf" "$PWCONF/99-bb-stream.conf"
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" || true
 command -v gtk-update-icon-cache >/dev/null && \
-  gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+  gtk-update-icon-cache -f -t "$ICONS" 2>/dev/null || true
+command -v update-mime-database >/dev/null && update-mime-database "$SHARE/mime" || true
 
 systemctl --user daemon-reload
 systemctl --user enable betterbanana-engine.service

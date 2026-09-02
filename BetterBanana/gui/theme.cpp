@@ -191,6 +191,10 @@ QString buildStyleSheet(const Theme& t)
     // --- text -------------------------------------------------------------
     s += QString("QLabel{background:transparent;color:%1;}").arg(c(t.text));
     s += QString("QLabel[role=\"caption\"]{color:%1;font-size:%2px;}").arg(dim).arg(fsCaption());
+    // Three five-letter words share a knob grid barely a hundred pixels wide,
+    // directly above the values they name - so they can afford a step down
+    // where a free-standing caption cannot.
+    s += QString("QLabel[role=\"knobcap\"]{color:%1;font-size:%2px;}").arg(dim).arg(fsTiny());
     s += QString("QLabel[role=\"value\"]{color:%1;font-size:%2px;font-weight:bold;}")
             .arg(c(bbcolor::ensureContrast(t.accent, t.panel, bbcolor::kTextFloor)))
             .arg(fsCaption());
@@ -226,6 +230,9 @@ QString buildStyleSheet(const Theme& t)
     s += QString("QComboBox:hover{border-color:%1;}").arg(c(t.accent));
     s += QString("QComboBox:focus{border-color:%1;outline:1px solid %1;}").arg(c(t.accent));
     s += QString("QComboBox:disabled{color:%1;border-color:%1;}").arg(off);
+    // The assigned device is named in the state but is not on the system.
+    s += QString("QComboBox[bad=\"true\"]{border-color:%1;color:%2;}")
+            .arg(c(t.mute), c(bbcolor::ensureContrast(t.mute, t.panelAlt, bbcolor::kTextFloor)));
     // The popup used to jump from 9px to 11px the moment it opened, a 22% step
     // on every device list. Same size as the closed control, set on the view
     // selector that already existed - the ::drop-down subcontrol stays
@@ -254,11 +261,17 @@ QString buildStyleSheet(const Theme& t)
     s += QString("QPushButton[role]:hover{border-color:%1;color:%2;}")
             .arg(c(t.accent), c(t.text));
     s += QString("QPushButton[role]:disabled{color:%1;border-color:%1;}").arg(off);
+    // Five of these across one card, beside a fader and a meter.
+    s += QString("QPushButton[bus]{padding:2px 1px;font-size:%1px;}").arg(fsTiny());
 
     struct RoleColour { const char* role; QColor col; };
     const RoleColour roles[] = {
         { "busA", t.busA }, { "busB", t.busB }, { "mute", t.mute }, { "solo", t.solo },
         { "mono", t.mono }, { "eq",   t.eqOn }, { "rec",  t.rec  }, { "accent", t.accent },
+        // The off half of the record indicator's pulse. Recording is the one
+        // state in this app that is destructive to get wrong, and a static red
+        // chip looks the same as a chip that is merely armed.
+        { "recdim", bbcolor::mix(t.rec, t.panel, 0.55) },
     };
     for (const auto& r0 : roles) {
         // A lit chip is a fill and its ink together; the pair has to clear the
@@ -303,6 +316,14 @@ QString buildStyleSheet(const Theme& t)
             .arg(c(bbcolor::ensureContrast(t.mute, t.panelAlt, bbcolor::kTextFloor)));
     s += QString("QPushButton[cta=\"danger\"]:hover{background:%1;color:%2;border-color:%1;}")
             .arg(c(t.mute), c(onFill(t.mute)));
+    // A cta selector out-specifies a bare :disabled, so without these a
+    // disabled primary button went on painting itself as a lit call to action -
+    // which two dialogs had to work around locally because they could not
+    // reach this file.
+    s += QString("QPushButton[cta=\"primary\"]:disabled{background:%1;color:%2;border-color:%1;}")
+            .arg(c(bbcolor::mix(t.accent, t.panel, 0.6)), off);
+    s += QString("QPushButton[cta=\"danger\"]:disabled{color:%1;border-color:%1;background:%2;}")
+            .arg(off, c(t.panelAlt));
 
     // --- check boxes ------------------------------------------------------
     //

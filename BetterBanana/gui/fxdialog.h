@@ -6,11 +6,13 @@
 #pragma once
 
 #include "../common/protocol.h"
+#include "dialogbits.h"
 
 #include <QDialog>
 #include <QVector>
 
 class QComboBox;
+class QGroupBox;
 class QLabel;
 class QPushButton;
 class Knob;
@@ -22,12 +24,18 @@ public:
                   QWidget* parent = nullptr);
 
 private:
+    // `def` is the knob's factory position in raw knob units, taken from
+    // fx_set_defaults(). It used to be hard-coded to 0 for all nineteen knobs,
+    // which is what made ROOM and DAMPING sit at 50% drawn accent-bold as if
+    // somebody had moved them, and made double-clicking ROOM reset it to 0%.
     Knob* addKnob(class QGridLayout* g, int row, int col, const QString& cap,
-                  int lo, int hi, double scale, int decimals,
+                  int lo, int hi, int def, double scale, int decimals,
                   const QString& suffix, bool bipolar = false);
     void pull();                    // shm -> knobs, without re-entering them
     void push();                    // knobs -> shm
+    void refreshState();            // both of the two below
     void refreshPresetCombo();
+    void refreshEngaged();          // which sections are actually doing work
 
     bb::Shared* m_shm;
     int         m_strip;
@@ -35,7 +43,13 @@ private:
 
     QComboBox*   m_preset = nullptr;
     QPushButton* m_on     = nullptr;
-    QLabel*      m_note   = nullptr;
+    bbdlg::StatusStrip m_status;
+
+    QGroupBox* m_voiceBox = nullptr;
+    QGroupBox* m_charBox  = nullptr;
+    QGroupBox* m_spaceBox = nullptr;
+    QGroupBox* m_tuneBox  = nullptr;
+    QGroupBox* m_outBox   = nullptr;
 
     QPushButton* m_fmtOn = nullptr;
     QPushButton* m_calib = nullptr;

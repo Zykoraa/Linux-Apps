@@ -9,6 +9,11 @@
 // Deliberately a measurement, not a model: it runs offline in a second or two,
 // needs no network and no training, and everything it decides is visible and
 // editable afterwards.
+//
+// The three steps are staged rather than merely numbered. Everything after the
+// recording depends on a pitch nobody has measured yet, so until there is one,
+// step 2 is locked and step 3 offers only playback of what was captured -
+// which is the one thing worth hearing when a measurement fails.
 #pragma once
 
 #include "../common/protocol.h"
@@ -17,7 +22,9 @@
 #include <QString>
 #include <QVector>
 
+class CalibLevelBar;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QProcess;
 class QPushButton;
@@ -43,7 +50,10 @@ private slots:
 private:
     void analyse();
     void retarget();                 // target Hz -> pitch semitones
-    void setBusy(const QString& what, bool busy);
+    // Status line and step gating in one place: which steps are live is a
+    // function of what has been captured and measured, and nothing else.
+    void restage(const QString& status, bool busy);
+    void pollLevel();
     QString playbackSink() const;
     bool play(const QVector<float>& samples);
     QVector<float> processed() const;
@@ -62,10 +72,20 @@ private:
     QTimer*   m_tick = nullptr;
     int       m_left = 0;
 
+    // The input meter polls the engine's own strip level, so it needs to know
+    // when the engine has stopped writing one.
+    QTimer*   m_levelTimer = nullptr;
+    uint32_t  m_lastHeartbeat = 0;
+    int       m_stallTicks = 0;
+
+    QGroupBox*      m_recBox = nullptr;
+    QGroupBox*      m_aimBox = nullptr;
+    QGroupBox*      m_playBox = nullptr;
     QPushButton*    m_record = nullptr;
     QPushButton*    m_playOrig = nullptr;
     QPushButton*    m_playRes = nullptr;
     QPushButton*    m_apply = nullptr;
+    CalibLevelBar*  m_meter = nullptr;
     QLabel*         m_phrase = nullptr;
     QLabel*         m_result = nullptr;
     QLabel*         m_status = nullptr;

@@ -1,6 +1,6 @@
 [Unit]
-Description=betterbanana audio engine
-Documentation=https://github.com/local/betterbanana
+Description=BetterBanana audio engine
+Documentation=https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana
 # PipeWire must be up first: the engine publishes its nodes into that graph.
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service

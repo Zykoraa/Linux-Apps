@@ -4,6 +4,8 @@
 
 #include "../common/protocol.h"
 #include "widgets.h"
+
+#include <QElapsedTimer>
 #include "knob.h"
 
 #include <QMainWindow>
@@ -43,6 +45,7 @@ public:
     void setDimmed(bool d);
     void setLive(bool live);
     void setAttached(bool a);
+    void setTravel(int px);
     bool isHardware() const { return m_hardware; }
     int  meterTop() const;
     void refreshBusTips(const QStringList& names);
@@ -109,6 +112,7 @@ public:
     int  meterTop() const;
     int  leadPad() const;
     void setLeadPad(int px);
+    void setTravel(int px);
 
 signals:
     void routingChanged(int busIndex, const QString& nodeName);
@@ -156,6 +160,7 @@ private:
     QLabel*      m_time     = nullptr;
     class QProgressBar* m_progress = nullptr;
     LevelMeter*  m_meter    = nullptr;
+    QElapsedTimer m_pulse;
     Knob*        m_gain     = nullptr;
     QVector<QPushButton*> m_busBtns;
 };
@@ -166,10 +171,20 @@ class VbanDialog : public QDialog {
 public:
     explicit VbanDialog(bb::Shared* shm, QWidget* parent = nullptr);
 
+protected:
+    // Escape used to discard silently while "Close" wrote network configuration
+    // into shared memory. Now Escape and Cancel both put back what was there.
+    void reject() override;
+
 private:
     void apply();
+    void revert();
 
     bb::Shared* m_shm;
+    // Snapshotted by value in the constructor. Deliberately not a memcpy of
+    // VbanConfig: that holds an atomic seq the engine is reading.
+    bb::VbanOutCfg m_out0[bb::kVbanStreams];
+    bb::VbanInCfg  m_in0 [bb::kVbanStreams];
     struct OutRow { QCheckBox* on; QLineEdit* name; QLineEdit* host; QSpinBox* port; QComboBox* bus; };
     struct InRow  { QCheckBox* on; QLineEdit* name; QSpinBox* port; };
     OutRow m_out[bb::kVbanStreams];
@@ -268,6 +283,9 @@ private:
     void populateAnalyzerMenu(class QMenu* menu);
     void readRouting();
     void applyAppRules();
+    void applyAppRulesWith(const QString& sinksJson, const QString& sinkInputs,
+                           const QString& sinkShort, const QString& sourceOutputs,
+                           const QString& sourceShort);
     void buildMenus();
     // The title carries the loaded preset and whether it has drifted, since on
     // a tiling compositor the title bar may be the only place either shows.
@@ -288,11 +306,17 @@ private:
     int      m_stallTicks = 0;
     int      m_syncTicks = 0;
     int      m_stateTicks = 0;
+    int      m_travel = 0;
+    class QScrollArea* m_scroll = nullptr;
+    QWidget* m_central = nullptr;
+    int      m_consoleChrome = 0;   // a strip card minus its fader, measured once
     QVector<QAction*> m_themeActions;
     QAction* m_autoEngine = nullptr;
     QAction* m_autoGui = nullptr;
     AppsDialog* m_apps = nullptr;
     QSet<int>   m_ruledStreams;
+    bool        m_ruleBusy = false;
+    int         m_ruleWait = 0;
     int         m_ruleTicks = 0;
 
     QString  m_presetName;        // "" until a preset is loaded or saved

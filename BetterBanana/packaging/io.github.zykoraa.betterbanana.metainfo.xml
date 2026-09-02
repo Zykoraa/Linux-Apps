@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Zykoraa -->
+<component type="desktop-application">
+  <id>io.github.zykoraa.betterbanana</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>BetterBanana</name>
+  <summary>Virtual mixing console for PipeWire</summary>
+
+  <developer id="io.github.zykoraa">
+    <name>Zykoraa</name>
+  </developer>
+
+  <description>
+    <p>
+      BetterBanana is a virtual mixing console for PipeWire, modelled on
+      Voicemeeter Banana. Five input strips - three hardware, two virtual -
+      feed a 5x5 routing matrix into five buses, three hardware and two
+      virtual, so any input can be sent to any combination of outputs at once:
+      your voice to a chat application and to your headphones, your game to the
+      speakers and to a stream, each with its own level.
+    </p>
+    <p>
+      The mixing runs in a separate engine process. Closing the window, or
+      restarting it after an update, does not interrupt the audio.
+    </p>
+    <p>Every strip carries:</p>
+    <ul>
+      <li>Gate, compressor, limiter, three-band EQ, Intellipan and fader</li>
+      <li>A twelve-band parametric EQ with shelves, pass filters and a
+          preamp, on every strip and every bus, drawn as a draggable curve
+          over a live spectrum analyser</li>
+      <li>A voice changer with independent pitch and formant shifting, drive,
+          ring modulation, bit crush, chorus, echo and pitch correction</li>
+    </ul>
+    <p>Around them:</p>
+    <ul>
+      <li>Sidechain ducking, so music steps back while you talk</li>
+      <li>Per-application routing that survives the application restarting</li>
+      <li>Headphone corrections for around 8850 models from the AutoEq
+          database, searchable by name</li>
+      <li>Three standalone virtual cables, a recorder, an 8x8 VBAN network
+          audio bridge, presets, undo and redo, and ten colour themes</li>
+      <li>A calibration wizard that records your voice, measures its pitch,
+          works out the shift and plays it back so you can judge it</li>
+    </ul>
+    <p>
+      BetterBanana is an independent implementation and is not affiliated with
+      VB-Audio.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">betterbanana.desktop</launchable>
+
+  <provides>
+    <binary>bb-gui</binary>
+    <binary>bb-engine</binary>
+    <binary>bb-ctl</binary>
+    <mediatype>application/x-betterbanana-preset</mediatype>
+  </provides>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Mixer</category>
+  </categories>
+
+  <keywords>
+    <keyword>mixer</keyword>
+    <keyword>routing</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>equalizer</keyword>
+    <keyword>voicemeeter</keyword>
+    <keyword>streaming</keyword>
+  </keywords>
+
+  <!-- width and height are the real pixel sizes of the files in docs/, not a
+       target: a store scales to them and a wrong pair letterboxes the image.
+       Re-measure them whenever a shot is retaken - the EQ dialog grew 17px
+       taller between the first capture and the second and these went stale
+       with it. -->
+  <screenshots>
+    <screenshot type="default">
+      <caption>The console: five input strips on the left, five buses on the right</caption>
+      <image type="source" width="1500" height="900">https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/docs/main-dark.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The twelve-band parametric EQ over a live spectrum</caption>
+      <image type="source" width="678" height="550">https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/docs/eq-dark.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The same console in Catppuccin Latte, the light one of the ten themes</caption>
+      <image type="source" width="1500" height="900">https://raw.githubusercontent.com/Zykoraa/Linux-Apps/main/BetterBanana/docs/main-light.png</image>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana</url>
+  <url type="bugtracker">https://github.com/Zykoraa/Linux-Apps/issues</url>
+  <url type="vcs-browser">https://github.com/Zykoraa/Linux-Apps</url>
+
+  <!-- Nothing in a mixer is age-rated; the empty block is how AppStream says
+       "assessed, nothing to declare" rather than "never filled in". -->
+  <content_rating type="oars-1.1"/>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <recommends>
+    <!-- Ten strip and bus columns side by side; below this the window starts
+         scrolling horizontally rather than laying out. -->
+    <display_length compare="ge">1024</display_length>
+  </recommends>
+
+  <releases>
+    <release version="0.2.0" date="2026-09-02">
+      <description>
+        <p>
+          A production pass over the interface: one spacing, radius and type
+          scale throughout, a colour contract that keeps every foreground
+          readable in all ten themes, and meters that share a single dB-per-
+          pixel so the same level is the same height in every column.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

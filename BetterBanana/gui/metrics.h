@@ -47,7 +47,8 @@ inline int rowH()  { return px(22); }   // every clickable row, one value
 // tall, so the same dBFS is the same number of pixels in every column. Four
 // different meter heights used to put -20 dBFS 114px apart between a strip and
 // a virtual bus, which makes a meter bridge you cannot read across.
-inline int travel() { return px(300); }
+inline int travel()    { return px(280); }   // the floor
+inline int travelMax() { return px(760); }   // and the ceiling
 
 // Half the fader cap, and the inset its groove needs so the cap does not hang
 // off either end. The level meter reads the same constant: the two used to map
@@ -83,6 +84,9 @@ inline int fsControl() { return fs(11); }   // buttons, combos, header plates
 // The densest row in the app: three four-letter chips across a ~140px card.
 // At the control step MUTE needs 44px and gets 43, so it clipped to "MUTI".
 inline int fsChip()    { return fs(9);  }
+// The bus-assign row packs five chips across a card that also has to hold a
+// fader and a meter, so it gets its own step below the others.
+inline int fsTiny()    { return fs(8);  }
 inline int fsReadout() { return fs(13); }   // dB values, timecode, peak numbers
 inline int fsDisplay() { return fs(15); }   // section and dialog titles
 

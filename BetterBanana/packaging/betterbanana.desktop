@@ -3,9 +3,41 @@ Type=Application
 Name=BetterBanana
 GenericName=Audio Mixer
 Comment=Virtual audio mixer for PipeWire
-Exec=bb-gui
+Exec=bb-gui %f
 Icon=betterbanana
 Terminal=false
 Categories=AudioVideo;Audio;Mixer;
 Keywords=audio;mixer;routing;pipewire;betterbanana;
-StartupWMClass=bb-gui
+# Wayland matches a window to this file by app_id, and Qt takes app_id from
+# QGuiApplication::setDesktopFileName() -- gui/main.cpp sets that to
+# "betterbanana", not to the executable's basename. It read "bb-gui" here for as
+# long as nothing set the desktop file name at all, which is why the mixer came
+# up as an unnamed placeholder in alt-tab.
+StartupWMClass=betterbanana
+# Every one of these is a flag gui/main.cpp already parses; none of them was
+# reachable from a launcher.
+Actions=apps;ducking;vban;eq-b1;
+# Deliberately not enabled yet. gui/main.cpp reads its arguments with
+# QStringList::contains() and ignores a positional path, so a .bbp handed to the
+# mixer would open the window and silently do nothing with the preset -- an
+# association that claims more than the binary can do. Uncomment this line in
+# the same commit as the loader in main.cpp. The type itself
+# (packaging/betterbanana.xml) is installed either way, so a preset already has
+# a name and an icon in a file manager.
+#MimeType=application/x-betterbanana-preset;
+
+[Desktop Action apps]
+Name=Route applications
+Exec=bb-gui --apps
+
+[Desktop Action ducking]
+Name=Sidechain ducking
+Exec=bb-gui --duck
+
+[Desktop Action vban]
+Name=VBAN network audio
+Exec=bb-gui --vban
+
+[Desktop Action eq-b1]
+Name=Equalise bus B1
+Exec=bb-gui --eq 3

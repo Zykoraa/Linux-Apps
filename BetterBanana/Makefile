@@ -58,7 +58,7 @@ check-deps:
 dist:
 	@rm -rf $(DISTNAME) $(DISTNAME).tar.gz
 	@mkdir -p $(DISTNAME)
-	@cp -r Makefile README.md common engine gui tools tests packaging $(DISTNAME)/
+	@cp -r Makefile README.md LICENSE common engine gui tools tests packaging docs $(DISTNAME)/
 	@tar czf $(DISTNAME).tar.gz $(DISTNAME)
 	@rm -rf $(DISTNAME)
 	@echo "$(DISTNAME).tar.gz  ($$(du -h $(DISTNAME).tar.gz | cut -f1))"
@@ -149,23 +149,72 @@ $(BUILD):
 install: engine gui ctl
 	./packaging/install.sh
 
-# System-wide install, for packaging. The systemd unit goes to the user-unit
+# System-wide install, for packaging. The systemd units go to the user-unit
 # directory so each user still runs their own engine.
-PREFIX ?= /usr/local
+#
+# This target used to install three binaries, one icon and one unit: a mixer
+# with no watchdog, no stream guard, no PipeWire drop-in and no AutoEq helper -
+# not the program packaging/install.sh puts on a machine, and this is the path
+# the PKGBUILD takes. The two install the same set now. The differences that
+# remain are the ones that have to be: system paths instead of $$HOME, and no
+# systemctl, because a package is built in a chroot and must not enable a
+# service on the builder's machine.
+PREFIX  ?= /usr/local
+BINDIR   = $(DESTDIR)$(PREFIX)/bin
+DATADIR  = $(DESTDIR)$(PREFIX)/share
+ICONDIR  = $(DATADIR)/icons/hicolor
+UNITDIR  = $(DESTDIR)$(PREFIX)/lib/systemd/user
+ICONSIZES = 16 24 32 48 64 128 256
+
 install-system: engine gui ctl
-	install -Dm755 build/bb-engine $(DESTDIR)$(PREFIX)/bin/bb-engine
-	install -Dm755 build/bb-gui    $(DESTDIR)$(PREFIX)/bin/bb-gui
-	install -Dm755 build/bb-ctl    $(DESTDIR)$(PREFIX)/bin/bb-ctl
+	install -Dm755 $(BUILD)/bb-engine $(BINDIR)/bb-engine
+	install -Dm755 $(BUILD)/bb-gui    $(BINDIR)/bb-gui
+	install -Dm755 $(BUILD)/bb-ctl    $(BINDIR)/bb-ctl
+	install -Dm755 -t $(BINDIR) tools/bb-stream-guard tools/bb-health \
+	                            tools/bb-stream-setup tools/bb-autoeq
 	install -Dm644 packaging/betterbanana.svg \
-	  $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/betterbanana.svg
+	  $(ICONDIR)/scalable/apps/betterbanana.svg
+	@# A panel that does not link librsvg only reads the sized directories, and
+	@# with scalable/ alone it falls back to the generic placeholder.
+	for s in $(ICONSIZES); do \
+	  install -Dm644 packaging/icons/$${s}x$${s}/apps/betterbanana.png \
+	    $(ICONDIR)/$${s}x$${s}/apps/betterbanana.png; \
+	done
 	install -Dm644 packaging/betterbanana.desktop \
-	  $(DESTDIR)$(PREFIX)/share/applications/betterbanana.desktop
-	install -Dm644 packaging/betterbanana-engine.service \
-	  $(DESTDIR)$(PREFIX)/lib/systemd/user/betterbanana-engine.service
-	sed -i 's|%h/.local/bin/bb-engine|$(PREFIX)/bin/bb-engine|' \
-	  $(DESTDIR)$(PREFIX)/lib/systemd/user/betterbanana-engine.service
-	sed -i 's|^Exec=bb-gui$$|Exec=$(PREFIX)/bin/bb-gui|' \
-	  $(DESTDIR)$(PREFIX)/share/applications/betterbanana.desktop
+	  $(DATADIR)/applications/betterbanana.desktop
+	install -Dm644 packaging/io.github.zykoraa.betterbanana.metainfo.xml \
+	  $(DATADIR)/metainfo/io.github.zykoraa.betterbanana.metainfo.xml
+	install -Dm644 packaging/betterbanana.xml \
+	  $(DATADIR)/mime/packages/betterbanana.xml
+	install -Dm644 packaging/99-bb-stream.conf \
+	  $(DATADIR)/pipewire/pipewire.conf.d/99-bb-stream.conf
+	install -Dm644 LICENSE $(DATADIR)/licenses/betterbanana/LICENSE
+	@# Every unit runs the binary out of ~/.local/bin, which is where the
+	@# per-user installer puts it; all three need repointing, not just the
+	@# engine's.
+	for u in engine stream-guard health; do \
+	  install -Dm644 packaging/betterbanana-$$u.service \
+	    $(UNITDIR)/betterbanana-$$u.service; \
+	  sed -i 's|%h/.local/bin/|$(PREFIX)/bin/|' \
+	    $(UNITDIR)/betterbanana-$$u.service; \
+	done
+	@# No trailing $$ on the pattern: the entry's Exec now carries %f and the
+	@# four Desktop Actions carry their own flags, and an unanchored launcher
+	@# only resolves if the *graphical* session has the directory on PATH.
+	@# Re-running is safe because install overwrites the file first.
+	sed -i 's|^Exec=bb-gui|Exec=$(PREFIX)/bin/bb-gui|' \
+	  $(DATADIR)/applications/betterbanana.desktop
+	@# Caches, only when installing for real. Under DESTDIR this is a package
+	@# build: the files are not at these paths yet and the distribution's own
+	@# hooks refresh the caches at install time.
+	@if [ -z "$(DESTDIR)" ]; then \
+	  command -v update-desktop-database >/dev/null \
+	    && update-desktop-database $(DATADIR)/applications || true; \
+	  command -v gtk-update-icon-cache >/dev/null \
+	    && gtk-update-icon-cache -f -t $(ICONDIR) 2>/dev/null || true; \
+	  command -v update-mime-database >/dev/null \
+	    && update-mime-database $(DATADIR)/mime || true; \
+	fi
 
 # Run every unit test and say plainly which one broke. The integration script
 # is deliberately not part of this: it needs a running engine and it moves the

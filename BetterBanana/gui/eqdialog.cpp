@@ -1,4 +1,7 @@
 #include "eqdialog.h"
+#include "color.h"
+#include "dialogbits.h"
+#include "metrics.h"
 #include "theme.h"
 
 #include "../common/eqprofile.h"
@@ -12,8 +15,10 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QGridLayout>
 #include <QGroupBox>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
@@ -26,10 +31,14 @@
 #include <QNetworkRequest>
 #include <QPainter>
 #include <QPainterPath>
+#include <QProgressBar>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollArea>
 #include <QSettings>
+#include <QShowEvent>
 #include <QSignalBlocker>
+#include <QSplitter>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -43,11 +52,11 @@ using namespace bb;
 static const char* kAutoEqBase =
     "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/";
 
-static QPushButton* makeToggle(const QString& text, const char* role, int h = 22)
+static QPushButton* makeToggle(const QString& text, const char* role)
 {
     auto* b = new QPushButton(text);
     b->setCheckable(true);
-    b->setFixedHeight(h);
+    b->setFixedHeight(bbui::rowH());
     b->setMinimumWidth(1);
     b->setProperty("role", role);
     return b;
@@ -88,20 +97,30 @@ private:
 // ---------------------------------------------------------------------------
 // EqCurve
 // ---------------------------------------------------------------------------
-static constexpr double kFLo = 20.0, kFHi = 20000.0, kMaxDb = 18.0;
+static constexpr double kFLo = 20.0, kFHi = 20000.0;
 
-// The spectrum shares the plot area but not its scale: 90 dB of level across
-// the same height as 36 dB of EQ. That ratio is chosen so every EQ gridline
-// lands on a round level - +18 dB is 0 dBFS, 0 dB is -45, -18 dB is -90 - and
-// the two scales can share one set of horizontal lines.
+// The spectrum shares the plot area but not its scale: 90 dB of level over the
+// full height. The two used to share one set of horizontal lines, which stops
+// being possible once the dB axis moves to fit the curve - and a level scale
+// that relabels itself every time a band is nudged is worse than one that never
+// moves. So the level scale keeps its own round decades down the right margin.
 static constexpr double kSpecTop = 0.0, kSpecBot = -90.0;
+
+// The steps the dB axis is allowed to take. Nothing below 12, because a flat
+// curve drawn on a +/-3 frame reads as noise rather than as flat; 48 is a -24
+// preamp stacked under a +24 band, which is as far as the controls go.
+static constexpr int    kDbStepN = 5;
+static constexpr double kDbSteps[kDbStepN] = { 12.0, 18.0, 24.0, 36.0, 48.0 };
 
 EqCurve::EqCurve(Shared* shm, EqParams* eq, int specSource, QWidget* parent)
     : QWidget(parent), m_shm(shm), m_eq(eq), m_spec(specSource)
 {
-    setMinimumHeight(200);
+    setMinimumHeight(bbui::px(220));
     setMouseTracking(true);
     setCursor(Qt::CrossCursor);
+    for (int b = 0; b < kSpecBins; ++b) m_hold[b] = float(kSpecBot);
+    for (int k = 0; k < kEqBands; ++k) m_fan[k] = 0.0;
+    m_holdClock.start();
 }
 
 void EqCurve::setSelected(int band)
@@ -118,11 +137,28 @@ bool EqCurve::spectrumLive() const
         && m_shm->spec.seq.load(std::memory_order_relaxed) > 0;
 }
 
+QRectF EqCurve::cardRect() const
+{
+    // Half a pixel in, so the 1px border lands on whole pixels.
+    return QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+}
+
 QRectF EqCurve::plotRect() const
 {
-    // The right margin holds the level scale. It is reserved whether or not the
-    // analyser is running, so the plot does not jump the moment it starts.
-    return QRectF(rect()).adjusted(30, 5, m_spec == kSpecNone ? -6 : -32, -16);
+    // The top margin is the readout strip, which used to be drawn straight over
+    // the curve it describes. The right margin holds the level scale and is
+    // reserved whether or not the analyser is running, so the plot does not
+    // jump the moment it starts.
+    return cardRect().adjusted(bbui::px(34), bbui::px(28),
+                               m_spec == kSpecNone ? -bbui::px(10) : -bbui::px(38),
+                               -bbui::px(18));
+}
+
+QRectF EqCurve::readoutRect() const
+{
+    const QRectF c = cardRect();
+    return QRectF(c.left() + bbui::px(6), c.top() + bbui::px(5),
+                  c.width() - bbui::px(12), bbui::px(18));
 }
 
 double EqCurve::xForFreq(double f) const
@@ -142,13 +178,13 @@ double EqCurve::freqForX(double x) const
 double EqCurve::yForDb(double db) const
 {
     const QRectF r = plotRect();
-    return r.center().y() - (std::clamp(db, -kMaxDb, kMaxDb) / kMaxDb) * (r.height() / 2);
+    return r.center().y() - (std::clamp(db, -m_range, m_range) / m_range) * (r.height() / 2);
 }
 
 double EqCurve::dbForY(double y) const
 {
     const QRectF r = plotRect();
-    return std::clamp(-(y - r.center().y()) / (r.height() / 2) * kMaxDb, -kMaxDb, kMaxDb);
+    return std::clamp(-(y - r.center().y()) / (r.height() / 2) * m_range, -m_range, m_range);
 }
 
 double EqCurve::yForSpec(double dbfs) const
@@ -166,12 +202,48 @@ QPointF EqCurve::handlePos(int band) const
     return QPointF(xForFreq(m_eq->freq[band].load()), yForDb(db));
 }
 
+// Handles landing on the same point. The Telephone preset puts two bands on
+// 300 Hz and two on 3400 Hz, and the second of each pair was drawn exactly under
+// the first, so nothing could ever select it. Offsetting alternately up and down
+// is cosmetic - a drag still writes the frequency and gain the pointer is over -
+// but it makes both halves of a stacked pair reachable.
+void EqCurve::fanHandles() const
+{
+    const double touch = bbui::px(13);   // closer than this and they overlap
+    const double lift  = bbui::px(17);   // one handle diameter, so both show
+    for (int k = 0; k < kEqBands; ++k) {
+        const QPointF p = handlePos(k);
+        double off = 0.0;
+        for (int slot = 0; slot < kEqBands; ++slot) {
+            bool clear = true;
+            for (int j = 0; j < k && clear; ++j) {
+                const QPointF q = handlePos(j);
+                clear = std::fabs(p.x() - q.x()) >= touch
+                     || std::fabs(p.y() + off - q.y() - m_fan[j]) >= touch;
+            }
+            if (clear) break;
+            off = (slot % 2 ? 1 : -1) * (slot / 2 + 1) * lift;
+        }
+        m_fan[k] = off;
+    }
+}
+
+QPointF EqCurve::drawPos(int band) const
+{
+    return handlePos(band) + QPointF(0.0, m_fan[band]);
+}
+
 int EqCurve::bandAt(const QPoint& pt) const
 {
+    // What is picked has to be what is drawn, so the offsets are recomputed
+    // here too: a value typed into the table can stack two handles between one
+    // paint and the next click.
+    fanHandles();
+    const double reach = bbui::px(11);
     int best = -1;
-    double bestD = 11.0 * 11.0;
+    double bestD = reach * reach;
     for (int k = 0; k < kEqBands; ++k) {
-        const QPointF h = handlePos(k);
+        const QPointF h = drawPos(k);
         const double dx = h.x() - pt.x(), dy = h.y() - pt.y();
         const double d = dx * dx + dy * dy;
         if (d < bestD) { bestD = d; best = k; }
@@ -179,42 +251,204 @@ int EqCurve::bandAt(const QPoint& pt) const
     return best;
 }
 
+// A smooth path through a run of points, using quadratics through their
+// midpoints. The engine publishes 64 bins across 20 Hz - 20 kHz, about a third
+// of an octave each, and joining them with straight segments drew the analyser
+// as a visible polygon rather than as a spectrum.
+static QPainterPath smoothPath(const QVector<QPointF>& pts)
+{
+    QPainterPath path;
+    if (pts.isEmpty()) return path;
+    path.moveTo(pts.first());
+    for (int i = 1; i + 1 < pts.size(); ++i) {
+        const QPointF mid((pts[i].x() + pts[i + 1].x()) / 2.0,
+                          (pts[i].y() + pts[i + 1].y()) / 2.0);
+        path.quadTo(pts[i], mid);
+    }
+    path.lineTo(pts.last());
+    return path;
+}
+
 // The engine's own analysis of whatever this EQ sits in, drawn behind the
 // curve so a boom or a whistle can be seen rather than guessed at.
 void EqCurve::drawSpectrum(QPainter& p, const QRectF& r) const
 {
-    if (!spectrumLive()) return;
+    if (m_spec == kSpecNone) return;
     const Theme& t = theme();
+
+    // Direction rather than a fixed alpha. meterLow composited at alpha 56 over
+    // the plot ground measured 1.22:1 on Catppuccin Latte: on a light theme an
+    // overlay has to go darker than what it lies on, not lighter.
+    const QColor spec = bbcolor::ensureContrast(t.meterLow, t.well, bbcolor::kBoundFloor);
+
+    if (!spectrumLive()) {
+        // There used to be nothing at all here between opening the dialog and
+        // the engine's first publish, which reads as a broken analyser rather
+        // than one that has not started yet.
+        p.setPen(QPen(dimOn(t, t.well), 1.0));
+        p.drawText(QRectF(r.left(), r.bottom() - bbui::px(30), r.width(), bbui::px(16)),
+                   Qt::AlignCenter, "waiting for audio");
+        return;
+    }
+
     const double lo = m_shm->spec.f_lo.load(std::memory_order_relaxed);
     const double hi = m_shm->spec.f_hi.load(std::memory_order_relaxed);
     if (!(hi > lo)) return;
     const double ratio = std::pow(hi / lo, 1.0 / kSpecBins);
 
-    QPainterPath top;
+    // The hold falls in dB per second, not per frame: the repaint timer runs at
+    // 20 Hz today and the number has to keep meaning the same thing if it ever
+    // changes. 12 dB/s is slow enough to read a transient off and fast enough
+    // that the trace follows a fader.
+    const double dt = std::clamp(m_holdClock.restart() / 1000.0, 0.0, 0.5);
+
+    QVector<QPointF> live, held;
+    live.reserve(kSpecBins + 2);
+    held.reserve(kSpecBins + 2);
     for (int b = 0; b < kSpecBins; ++b) {
+        const float v = m_shm->spec.bin_db[b].load(std::memory_order_relaxed);
+        m_hold[b] = v >= m_hold[b] ? v : std::max(v, float(m_hold[b] - 12.0 * dt));
         // A band's geometric centre is its midpoint on a log axis.
         const double f = lo * std::pow(ratio, b + 0.5);
         const double x = std::clamp(xForFreq(f), r.left(), r.right());
-        const QPointF pt(x, yForSpec(m_shm->spec.bin_db[b].load(std::memory_order_relaxed)));
-        if (b == 0) top.moveTo(r.left(), pt.y());
-        top.lineTo(pt);
+        live.push_back(QPointF(x, yForSpec(v)));
+        held.push_back(QPointF(x, yForSpec(m_hold[b])));
     }
-    top.lineTo(r.right(), top.currentPosition().y());
+    live.prepend(QPointF(r.left(), live.first().y()));
+    live.append(QPointF(r.right(), live.last().y()));
+    held.prepend(QPointF(r.left(), held.first().y()));
+    held.append(QPointF(r.right(), held.last().y()));
 
+    const QPainterPath top = smoothPath(live);
     QPainterPath area = top;
     area.lineTo(r.right(), r.bottom());
     area.lineTo(r.left(), r.bottom());
     area.closeSubpath();
 
-    QColor fill = t.meterLow; fill.setAlpha(56);
+    QColor fill = spec;
+    fill.setAlpha(t.dark ? 64 : 48);
     p.setPen(Qt::NoPen);
     p.setBrush(fill);
     p.drawPath(area);
 
-    QColor edge = t.meterLow; edge.setAlpha(160);
+    QColor edge = spec;
+    edge.setAlpha(t.dark ? 190 : 235);
     p.setPen(QPen(edge, 1.0));
     p.setBrush(Qt::NoBrush);
     p.drawPath(top);
+
+    // The held trace borrows the meters' own peak-hold colour, so a held peak
+    // means the same thing here as it does on the meter bridge.
+    QColor hold = bbcolor::ensureContrast(t.meterHold, t.well, bbcolor::kBoundFloor);
+    hold.setAlpha(t.dark ? 125 : 165);
+    p.setPen(QPen(hold, 1.0));
+    p.drawPath(smoothPath(held));
+}
+
+// Two tiers, so the axis can actually be read. Every line used to be drawn in
+// one dotted weight - t.border on the plot ground, which is #333a45 on #12151a
+// in the default theme - and the eight verticals drawn did not correspond to
+// the five labels printed beneath them.
+void EqCurve::drawGrid(QPainter& p, const QRectF& r) const
+{
+    const Theme& t = theme();
+    const QColor base = bbcolor::ensureContrast(t.border, t.well, bbcolor::kBoundFloor);
+    QColor major = base; major.setAlpha(150);
+    QColor minor = base; minor.setAlpha(64);
+
+    auto vline = [&](double f) {
+        const double x = std::round(xForFreq(f)) + 0.5;
+        p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
+    };
+    p.setPen(QPen(minor, 1.0));
+    for (double dec = 10.0; dec <= 10000.0; dec *= 10.0)
+        for (int m = 2; m <= 9; ++m) {
+            const double f = dec * m;
+            if (f <= kFLo || f >= kFHi) continue;      // the ends are the frame
+            vline(f);
+        }
+    p.setPen(QPen(major, 1.0));
+    for (double f : { 100.0, 1000.0, 10000.0 }) vline(f);
+
+    // Horizontals follow the adaptive range: a 6 dB ladder on the two tightest
+    // frames and a 12 dB one above them, so the count stays between one and
+    // three pairs however far the frame has opened up.
+    const double step = m_range >= 24.0 ? 12.0 : 6.0;
+    for (double db = step; db < m_range - 0.5; db += step)
+        for (double s : { db, -db }) {
+            const double y = std::round(yForDb(s)) + 0.5;
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y));
+        }
+
+    // Unity is the axis, not another gridline.
+    p.setPen(QPen(dimOn(t, t.well), 1.4));
+    p.drawLine(QPointF(r.left(), yForDb(0)), QPointF(r.right(), yForDb(0)));
+}
+
+// Whatever is under the pointer, on a plate of its own above the plot. It used
+// to share one rectangle with the preamp readout, unplated, in the same faint
+// font as the axis labels, directly on top of where the spectrum is drawn.
+void EqCurve::drawReadout(QPainter& p) const
+{
+    const Theme& t = theme();
+    const QRectF strip = readoutRect();
+    p.setPen(Qt::NoPen);
+    p.setBrush(t.well);
+    p.drawRoundedRect(strip, bbui::radWell(), bbui::radWell());
+
+    QFont f = p.font();
+    f.setPixelSize(bbui::fsControl());
+    bbui::makeTabular(f);
+    p.setFont(f);
+    const QFontMetricsF fm(f);
+    const QColor ink = bbcolor::ensureContrast(t.text, t.well, bbcolor::kTextFloor);
+    const QColor dim = dimOn(t, t.well);
+
+    // Every field is as wide as its own widest possible value, so nothing in
+    // the strip shifts sideways while a handle is being dragged.
+    double x = strip.left() + bbui::px(6);
+    auto cell = [&](const QString& text, const QString& widest, int align, const QColor& c) {
+        const double w = fm.horizontalAdvance(widest);
+        p.setPen(QPen(c, 1.0));
+        p.drawText(QRectF(x, strip.top(), w, strip.height()), align | Qt::AlignVCenter, text);
+        x += w + bbui::px(8);
+    };
+
+    const int show = m_drag >= 0 ? m_drag : (m_hover >= 0 ? m_hover : m_sel);
+    if (show >= 0 && show < kEqBands) {
+        const int type = m_eq->type[show].load();
+        const bool live = m_eq->band_on[show].load() != 0;
+
+        // The same chip the handle carries, so the strip names a band you can
+        // point at rather than a number you have to go looking for.
+        const QColor chip = bbcolor::fitFill(live ? (show == m_sel ? t.solo : t.accent)
+                                                  : t.header, bbcolor::kTextFloor);
+        const double d = bbui::px(15);
+        const QRectF box(x, strip.center().y() - d / 2, d, d);
+        p.setBrush(chip);
+        p.setPen(Qt::NoPen);
+        p.drawRoundedRect(box, bbui::radWell(), bbui::radWell());
+        p.setPen(QPen(onFill(chip), 1.0));
+        p.drawText(box, Qt::AlignCenter, QString::number(show + 1));
+        x += d + bbui::px(8);
+
+        cell(eq_type_name(type), "High shelf", Qt::AlignLeft, ink);
+        cell(fmtHz(m_eq->freq[show].load()) + " Hz", "20000 Hz", Qt::AlignRight, ink);
+        cell(eq_type_uses_gain(type)
+                 ? QString("%1 dB").arg(m_eq->gain[show].load(), 0, 'f', 1) : QString(),
+             "-24.0 dB", Qt::AlignRight, ink);
+        cell(QString("Q %1").arg(m_eq->q[show].load(), 0, 'f', 2), "Q 20.00",
+             Qt::AlignRight, ink);
+        if (!live) cell("bypassed", "bypassed", Qt::AlignLeft, dim);
+    }
+
+    // The preamp keeps the right-hand end to itself: the two readouts used to
+    // be drawn into the identical rectangle, one left and one right.
+    if (std::fabs(m_eq->preamp_db.load()) > 0.05) {
+        p.setPen(QPen(dim, 1.0));
+        p.drawText(strip.adjusted(0, 0, -bbui::px(6), 0), Qt::AlignRight | Qt::AlignVCenter,
+                   QString("preamp %1 dB").arg(m_eq->preamp_db.load(), 0, 'f', 1));
+    }
 }
 
 void EqCurve::paintEvent(QPaintEvent*)
@@ -222,63 +456,25 @@ void EqCurve::paintEvent(QPaintEvent*)
     const Theme& t = theme();
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
-    const QRectF r = plotRect();
-    p.fillRect(rect(), t.panelAlt);
+
+    QFont small = p.font();
+    small.setPixelSize(bbui::fsCaption());
+    bbui::makeTabular(small);
+    p.setFont(small);
+
+    // The plot is a well sunk into a card, not a slab floating on the dialog:
+    // the readout plate and the axis labels need a plane to sit on that is not
+    // the plot ground itself.
+    const QRectF card = cardRect();
+    p.setPen(QPen(t.border, 1.0));
+    p.setBrush(t.panel);
+    p.drawRoundedRect(card, bbui::radCard(), bbui::radCard());
 
     const float sr = m_shm->samplerate.load();
     const bool on = m_eq->on.load() != 0;
 
-    QFont small = p.font();
-    small.setPointSizeF(std::max(6.5, small.pointSizeF() - 2.0));
-    p.setFont(small);
-
-    // Spectrum first: it is the floor everything else is read against.
-    p.save();
-    p.setClipRect(r);
-    drawSpectrum(p, r);
-    p.restore();
-
-    // Grid.
-    p.setPen(QPen(t.border, 1.0, Qt::DotLine));
-    for (double db : { -12.0, -6.0, 6.0, 12.0 })
-        p.drawLine(QPointF(r.left(), yForDb(db)), QPointF(r.right(), yForDb(db)));
-    static const double kFreqTicks[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000 };
-    for (double f : kFreqTicks) {
-        const double x = xForFreq(f);
-        p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
-    }
-    p.setPen(QPen(t.textDim, 1.0));
-    p.drawLine(QPointF(r.left(), yForDb(0)), QPointF(r.right(), yForDb(0)));
-
-    // Scales. EQ gain on the left, and - when the analyser is running - the
-    // level the spectrum is drawn on, on the right.
-    for (double db : { -12.0, -6.0, 0.0, 6.0, 12.0 }) {
-        const QString s = db > 0 ? QString("+%1").arg(int(db)) : QString::number(int(db));
-        p.drawText(QRectF(0, yForDb(db) - 7, 26, 14), Qt::AlignRight | Qt::AlignVCenter, s);
-    }
-    if (spectrumLive()) {
-        QColor lab = t.meterLow; lab.setAlpha(190);
-        p.setPen(QPen(lab, 1.0));
-        for (double db : { 18.0, 12.0, 6.0, 0.0, -6.0, -12.0, -18.0 }) {
-            const double dbfs = kSpecBot + (db + kMaxDb) / (2 * kMaxDb) * (kSpecTop - kSpecBot);
-            p.drawText(QRectF(r.right() + 3, yForDb(db) - 7, 28, 14),
-                       Qt::AlignLeft | Qt::AlignVCenter, QString::number(int(dbfs)));
-        }
-        p.setPen(QPen(t.textDim, 1.0));
-    }
-    // The end labels sit on the plot's edges, so centring them on the tick would
-    // run half of each off the widget - and on the right, straight through the
-    // level scale, where "20k" and "-90" would print on top of each other.
-    const double xmax = m_spec == kSpecNone ? double(width()) : r.right();
-    for (double f : { 20.0, 100.0, 1000.0, 10000.0, 20000.0 }) {
-        QRectF box(xForFreq(f) - 24, r.bottom() + 1, 48, 14);
-        int flags = Qt::AlignHCenter | Qt::AlignTop;
-        if (box.left() < 0)      { box.moveLeft(0);      flags = Qt::AlignLeft  | Qt::AlignTop; }
-        if (box.right() > xmax)  { box.moveRight(xmax);  flags = Qt::AlignRight | Qt::AlignTop; }
-        p.drawText(box, flags, fmtHz(f));
-    }
-
-    // Per-band responses, faint, then the sum on top.
+    // Design first: the range the frame spans is chosen to fit what is about to
+    // be drawn on it.
     Biquad band[kEqBands];
     bool live[kEqBands];
     for (int k = 0; k < kEqBands; ++k) {
@@ -287,8 +483,102 @@ void EqCurve::paintEvent(QPaintEvent*)
                     m_eq->freq[k].load(), m_eq->q[k].load(), m_eq->gain[k].load());
     }
     const double preamp = m_eq->preamp_db.load();
-    const int steps = std::max(2, int(r.width()));
 
+    // Not while a handle is being dragged: the drag reads its gain back off the
+    // pointer's y, so a range moving underneath it would fight the gesture.
+    if (m_drag < 0) {
+        // Only the bands that carry a gain of their own are fitted. A high-pass
+        // skirt has no bottom, and a frame stretched to hold one squeezes every
+        // peak and shelf in the block into a sliver: fitting the Telephone
+        // preset's roll-offs asks for +/-48 to show 4 dB of boost. A roll-off
+        // is allowed to leave the picture, as it does in every other EQ.
+        double peak = std::fabs(preamp);
+        bool skirt = false;
+        for (int i = 0; i <= 96; ++i) {
+            const double f = kFLo * std::pow(kFHi / kFLo, i / 96.0);
+            double db = preamp;
+            for (int k = 0; k < kEqBands; ++k)
+                if (live[k] && eq_type_uses_gain(m_eq->type[k].load()))
+                    db += band[k].magnitude_db(sr, float(f));
+            peak = std::max(peak, std::fabs(db));
+        }
+        // Each band's own trace is drawn too, and a shelf's extreme lies off the
+        // end of the sweep rather than on it.
+        for (int k = 0; k < kEqBands; ++k) {
+            if (!live[k]) continue;
+            if (eq_type_uses_gain(m_eq->type[k].load()))
+                peak = std::max(peak, std::fabs(preamp + m_eq->gain[k].load()));
+            else skirt = true;
+        }
+        // A roll-off still needs enough frame to be read as a roll-off.
+        if (skirt) peak = std::max(peak, 16.0);
+
+        // Grow at once, shrink only with margin. A frame that flips between two
+        // steps as a band is nudged is worse than one a step too big.
+        auto fit = [&](double margin) {
+            for (int i = 0; i < kDbStepN; ++i)
+                if (kDbSteps[i] >= peak + margin) return kDbSteps[i];
+            return kDbSteps[kDbStepN - 1];
+        };
+        const double want = fit(2.0);
+        if (want > m_range)      m_range = want;
+        else if (want < m_range) m_range = std::min(m_range, fit(4.0));
+    }
+    fanHandles();
+
+    const QRectF r = plotRect();
+    p.setPen(Qt::NoPen);
+    p.setBrush(t.well);
+    p.drawRoundedRect(r, bbui::radWell(), bbui::radWell());
+
+    // Spectrum first: it is the floor everything else is read against.
+    p.save();
+    p.setClipRect(r);
+    drawSpectrum(p, r);
+    drawGrid(p, r);
+    p.restore();
+
+    // Scales, in the margins: EQ gain on the left, and the level the spectrum is
+    // drawn on down the right.
+    const QColor axis = dimOn(t, t.panel);
+    p.setPen(QPen(axis, 1.0));
+    const double step = m_range >= 24.0 ? 12.0 : 6.0;
+    QVector<double> marks{ 0.0, m_range, -m_range };
+    for (double db = step; db < m_range - 0.5; db += step) marks << db << -db;
+    for (double db : marks) {
+        QRectF box(0, yForDb(db) - bbui::px(7), r.left() - bbui::px(5), bbui::px(14));
+        if (box.top() < 0)          box.moveTop(0);
+        if (box.bottom() > height()) box.moveBottom(height());
+        p.drawText(box, Qt::AlignRight | Qt::AlignVCenter,
+                   db > 0 ? QString("+%1").arg(db, 0, 'f', 0) : QString::number(db, 'f', 0));
+    }
+    if (m_spec != kSpecNone) {
+        QColor lab = spectrumLive()
+                       ? bbcolor::ensureContrast(t.meterLow, t.panel, bbcolor::kTextFloor)
+                       : axis;
+        p.setPen(QPen(lab, 1.0));
+        for (double dbfs : { 0.0, -20.0, -40.0, -60.0, -80.0 })
+            p.drawText(QRectF(r.right() + bbui::px(4), yForSpec(dbfs) - bbui::px(7),
+                              bbui::px(32), bbui::px(14)),
+                       Qt::AlignLeft | Qt::AlignVCenter, QString::number(int(dbfs)));
+        p.setPen(QPen(axis, 1.0));
+    }
+    // Labelled on the majors, plus the two ends of the axis. The end labels sit
+    // on the frame, so centring them on the tick would run half of each off the
+    // widget - and on the right, straight through the level scale, where "20k"
+    // and "-90" printed on top of each other.
+    const double xmax = m_spec == kSpecNone ? card.right() : r.right();
+    for (double f : { 20.0, 100.0, 1000.0, 10000.0, 20000.0 }) {
+        QRectF box(xForFreq(f) - bbui::px(24), r.bottom() + bbui::px(2),
+                   bbui::px(48), bbui::px(14));
+        int flags = Qt::AlignHCenter | Qt::AlignTop;
+        if (box.left() < 0)     { box.moveLeft(0);     flags = Qt::AlignLeft  | Qt::AlignTop; }
+        if (box.right() > xmax) { box.moveRight(xmax); flags = Qt::AlignRight | Qt::AlignTop; }
+        p.drawText(box, flags, fmtHz(f));
+    }
+
+    // Per-band responses, faint, then the sum on top.
+    const int steps = std::max(2, int(r.width()));
     auto sweep = [&](int only) {
         QPainterPath path;
         for (int i = 0; i <= steps; ++i) {
@@ -306,6 +596,12 @@ void EqCurve::paintEvent(QPaintEvent*)
         return path;
     };
 
+    p.save();
+    p.setClipRect(r.adjusted(-1, -1, 1, 1));
+    // drawPath strokes AND fills, and the brush is still the plot ground from
+    // the fillRect above: an unset brush here paints an opaque wedge under
+    // every sweep and rubs out the spectrum behind it.
+    p.setBrush(Qt::NoBrush);
     QColor faint = t.accent;
     faint.setAlpha(on ? 70 : 40);
     for (int k = 0; k < kEqBands; ++k) {
@@ -315,53 +611,60 @@ void EqCurve::paintEvent(QPaintEvent*)
         p.setPen(QPen(k == m_sel ? t.solo : faint, k == m_sel ? 1.4 : 1.0));
         p.drawPath(sweep(k));
     }
-
-    p.setPen(QPen(on ? t.accent : t.textDim, 2.0));
+    p.setPen(QPen(on ? t.accent : dimOn(t, t.well), 2.0));
     p.drawPath(sweep(-1));
+    p.restore();
 
-    // Handles.
-    for (int k = 0; k < kEqBands; ++k) {
-        const QPointF h = handlePos(k);
-        if (!r.adjusted(-6, -6, 6, 6).contains(h)) continue;
+    // Handles. Drawn in reverse pick order - hovered second last, selected last
+    // - so a crowded right-hand edge cannot bury the one being edited under the
+    // band that happens to come after it.
+    auto drawHandle = [&](int k) {
+        const QPointF h = drawPos(k);
+        // A handle sitting on the frame is still half inside it, so the cull
+        // allows a radius either way - and has to grow with the handle.
+        const double slop = bbui::px(12);
+        if (!r.adjusted(-slop, -slop, slop, slop).contains(h)) return;
         const bool sel = k == m_sel;
         const bool hot = k == m_hover || k == m_drag;
-        const double rad = sel ? 8.0 : 6.5;
-        QColor fill = live[k] ? (sel ? t.solo : t.accent) : t.panel;
-        if (hot) fill = fill.lighter(125);
+        const double rad = sel ? bbui::px(9) : bbui::px(8);
+
+        QColor fill = bbcolor::fitFill(live[k] ? (sel ? t.solo : t.accent) : t.header,
+                                       bbcolor::kTextFloor);
+        // lighter() clamps once a channel is at 255, which left a hot handle in
+        // a bright palette looking identical to a cold one.
+        if (hot) fill = bbcolor::hoverOf(fill);
+        QPen ring(bbcolor::ensureContrast(live[k] ? t.text : t.textDim, t.well,
+                                          bbcolor::kBoundFloor),
+                  sel ? 1.6 : 1.0);
+        // A bypassed band keeps its place on the curve but stops claiming to be
+        // part of it.
+        if (!live[k]) ring.setStyle(Qt::DashLine);
         p.setBrush(fill);
-        p.setPen(QPen(live[k] ? t.text : t.textDim, sel ? 1.6 : 1.0));
+        p.setPen(ring);
         p.drawEllipse(h, rad, rad);
-        p.setPen(QPen(t.bg, 1.0));
+
+        // The digit used to be painted in t.bg whatever the handle was filled
+        // with: 1.07:1 on an off band in Rose Pine, 1.9:1 on the selected
+        // handle in Latte. The ink comes from the fill now.
+        QFont hf = small;
+        hf.setPixelSize(bbui::fsChip());
+        hf.setBold(true);
+        p.setFont(hf);
+        p.setPen(QPen(onFill(fill), 1.0));
         p.drawText(QRectF(h.x() - rad, h.y() - rad, rad * 2, rad * 2),
                    Qt::AlignCenter, QString::number(k + 1));
-    }
+        p.setFont(small);
+    };
+    for (int k = 0; k < kEqBands; ++k)
+        if (k != m_sel && k != m_hover) drawHandle(k);
+    if (m_hover >= 0 && m_hover != m_sel) drawHandle(m_hover);
+    if (m_sel >= 0 && m_sel < kEqBands)   drawHandle(m_sel);
 
-    // Read-out for whatever is under the pointer, or the selected band.
-    const int show = m_drag >= 0 ? m_drag : (m_hover >= 0 ? m_hover : m_sel);
-    if (show >= 0 && show < kEqBands) {
-        const int type = m_eq->type[show].load();
-        QString s = QString("%1  %2  %3")
-                        .arg(show + 1)
-                        .arg(eq_type_name(type))
-                        .arg(fmtHz(m_eq->freq[show].load()) + " Hz");
-        if (eq_type_uses_gain(type))
-            s += QString("  %1 dB").arg(m_eq->gain[show].load(), 0, 'f', 1);
-        s += QString("  Q %1").arg(m_eq->q[show].load(), 0, 'f', 2);
-        if (!live[show]) s += "  (bypassed)";
-        p.setPen(QPen(t.text, 1.0));
-        p.drawText(QRectF(r.left() + 4, r.top() + 2, r.width() - 8, 14),
-                   Qt::AlignLeft | Qt::AlignTop, s);
-    }
-    if (std::fabs(preamp) > 0.05) {
-        p.setPen(QPen(t.textDim, 1.0));
-        p.drawText(QRectF(r.left() + 4, r.top() + 2, r.width() - 8, 14),
-                   Qt::AlignRight | Qt::AlignTop,
-                   QString("preamp %1 dB").arg(preamp, 0, 'f', 1));
-    }
+    drawReadout(p);
 
     p.setPen(QPen(t.border, 1.0));
     p.setBrush(Qt::NoBrush);
-    p.drawRect(r);
+    p.drawRoundedRect(r, bbui::radWell(), bbui::radWell());
 }
 
 void EqCurve::mousePressEvent(QMouseEvent* e)
@@ -378,6 +681,7 @@ void EqCurve::mousePressEvent(QMouseEvent* e)
     }
     if (e->button() != Qt::LeftButton) return;
     emit editStarted(k);
+    setCursor(Qt::ClosedHandCursor);
     m_drag = k;
     setSelected(k);
     emit bandSelected(k);
@@ -388,6 +692,9 @@ void EqCurve::mouseMoveEvent(QMouseEvent* e)
 {
     if (m_drag < 0) {
         const int h = bandAt(e->pos());
+        // The cursor never changed over a handle, so a thing you can pick up
+        // looked the same as the empty plot beside it.
+        setCursor(h >= 0 ? Qt::OpenHandCursor : Qt::CrossCursor);
         if (h != m_hover) { m_hover = h; update(); }
         return;
     }
@@ -400,10 +707,11 @@ void EqCurve::mouseMoveEvent(QMouseEvent* e)
     update();
 }
 
-void EqCurve::mouseReleaseEvent(QMouseEvent*)
+void EqCurve::mouseReleaseEvent(QMouseEvent* e)
 {
     if (m_drag < 0) return;
     m_drag = -1;
+    setCursor(bandAt(e->pos()) >= 0 ? Qt::OpenHandCursor : Qt::CrossCursor);
     update();
 }
 
@@ -435,6 +743,7 @@ void EqCurve::wheelEvent(QWheelEvent* e)
 
 void EqCurve::leaveEvent(QEvent*)
 {
+    setCursor(Qt::CrossCursor);
     if (m_hover != -1) { m_hover = -1; update(); }
 }
 
@@ -443,7 +752,8 @@ void EqCurve::leaveEvent(QEvent*)
 // ---------------------------------------------------------------------------
 EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
                                const QString& title, int bus, QWidget* parent)
-    : QDialog(parent), m_shm(shm), m_eq(eq), m_bus(bus), m_spec(specSource), m_title(title)
+    : QDialog(parent), m_shm(shm), m_eq(eq), m_bus(bus), m_spec(specSource),
+      m_title(title), m_note(this)
 {
     setWindowTitle(title + " - parametric EQ");
 
@@ -452,16 +762,26 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
     if (m_spec != kSpecNone) m_shm->spec.source.store(m_spec);
 
     auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+
+    // Which strip or bus this is editing, inside the window. It used to be in
+    // the title bar and nowhere else, and a tiling compositor never draws one.
+    root->addWidget(bbdlg::header(
+        m_title, QString("%1 equaliser - twelve bands. Drag a handle, or type a "
+                         "value into its row.").arg(m_bus >= 0 ? "Output" : "Input")));
 
     // --- profile bar -------------------------------------------------------
     auto* bar = new QHBoxLayout;
+    bar->setSpacing(bbui::gapS());
     bar->addWidget(makeLabel("PROFILE", "caption", Qt::AlignRight));
     m_profile = new QComboBox;
-    m_profile->setMinimumWidth(220);
+    m_profile->setMinimumWidth(bbui::px(220));
     bar->addWidget(m_profile, 1);
 
     auto* save = new QPushButton("Save as...");
     m_delete   = new QPushButton("Delete");
+    // Delete destroys a file on disk and used to look exactly like Export.
+    m_delete->setProperty("cta", "danger");
     auto* imp  = new QPushButton("Import...");
     auto* exp  = new QPushButton("Export...");
     for (QPushButton* b : { save, m_delete, imp, exp }) bar->addWidget(b);
@@ -488,25 +808,38 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
                         "double-click to zero its gain.\n"
                         "The shaded area behind is the live spectrum, on the\n"
                         "dBFS scale down the right-hand edge.");
-    root->addWidget(m_curve, 1);
 
     // --- band table --------------------------------------------------------
     auto* tableHost = new QWidget;
     auto* grid = new QGridLayout(tableHost);
-    grid->setContentsMargins(2, 2, 2, 2);
-    grid->setHorizontalSpacing(6);
-    grid->setVerticalSpacing(2);
+    grid->setContentsMargins(bbui::gapS(), bbui::gapS(), bbui::gapS(), bbui::gapS());
+    grid->setHorizontalSpacing(bbui::gapM());
+    grid->setVerticalSpacing(bbui::gapXS());
 
-    grid->addWidget(makeLabel("BAND", "caption"),  0, 0);
-    grid->addWidget(makeLabel("ON",   "caption"),  0, 1);
-    grid->addWidget(makeLabel("TYPE", "caption"),  0, 2);
-    grid->addWidget(makeLabel("FREQ", "caption"),  0, 3);
-    grid->addWidget(makeLabel("GAIN", "caption"),  0, 4);
-    grid->addWidget(makeLabel("Q",    "caption"),  0, 5);
+    grid->addWidget(makeLabel("BAND", "caption"), 0, 0);
+    grid->addWidget(makeLabel("ON",   "caption"), 0, 1);
+    grid->addWidget(makeLabel("TYPE", "caption", Qt::AlignLeft | Qt::AlignVCenter), 0, 2);
+    // The numeric headings sit over right-aligned fields, so each is inset by
+    // the width of the step arrows - otherwise the heading lines up with the
+    // frame of the box rather than with the digits inside it.
+    const char* numHead[] = { "FREQ", "GAIN", "Q" };
+    for (int col = 3; col < 6; ++col) {
+        QLabel* h = makeLabel(numHead[col - 3], "caption", Qt::AlignRight | Qt::AlignVCenter);
+        h->setContentsMargins(0, 0, bbui::px(20), 0);
+        grid->addWidget(h, 0, col);
+    }
 
     m_rows.resize(kEqBands);
     for (int k = 0; k < kEqBands; ++k) {
         BandRow& row = m_rows[k];
+
+        // A plate spanning the whole row, added before the controls so it sits
+        // behind them. Twelve rows of numbers with nothing banding them are
+        // twelve rows you read one at a time.
+        row.holder = new QWidget;
+        row.holder->setAttribute(Qt::WA_StyledBackground, true);
+        grid->addWidget(row.holder, k + 1, 0, 1, 6);
+
         row.num = makeLabel(QString::number(k + 1), "caption");
         row.on = new QCheckBox;
         row.on->setToolTip("Bypass this band without losing its settings");
@@ -532,7 +865,18 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
         row.q->setDecimals(2);
         row.q->setKeyboardTracking(false);
 
-        grid->addWidget(row.num,  k + 1, 0);
+        // Right-aligned and one width, so twelve rows of FREQ, GAIN and Q form
+        // three columns you can run an eye down. They were flush left in boxes
+        // wide enough to leave a 40px gap before the arrows, which staggered
+        // the digits and put the "Hz" in five different places. Alignment and
+        // width only: giving a spin box a background or a border would take the
+        // widget over and lose its step arrows for good.
+        for (QDoubleSpinBox* s : { row.freq, row.gain, row.q }) {
+            s->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            s->setMinimumWidth(bbui::px(96));
+        }
+
+        grid->addWidget(row.num,  k + 1, 0, Qt::AlignCenter);
         grid->addWidget(row.on,   k + 1, 1, Qt::AlignHCenter);
         grid->addWidget(row.type, k + 1, 2);
         grid->addWidget(row.freq, k + 1, 3);
@@ -544,8 +888,8 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
             snapshot(k);
             pushBand(k);
             refreshRowEnables(k);
-            highlight(k);
             m_curve->setSelected(k);
+            highlight(k);
             m_curve->update();
         };
         connect(row.on,   &QCheckBox::toggled, this, edited);
@@ -559,32 +903,47 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
     grid->setColumnStretch(4, 1);
     grid->setColumnStretch(5, 1);
 
-    auto* scroll = new QScrollArea;
-    scroll->setWidget(tableHost);
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setMinimumHeight(170);
-    root->addWidget(scroll, 1);
+    m_table = new QScrollArea;
+    m_table->setWidget(tableHost);
+    m_table->setWidgetResizable(true);
+    m_table->setFrameShape(QFrame::NoFrame);
+    m_table->setMinimumHeight(bbui::px(120));
 
-    // --- bottom bar --------------------------------------------------------
-    auto* btns = new QHBoxLayout;
-    m_eqOn = makeToggle("EQ ON", "eq", 24);
+    // The plot is the instrument and the table is its keyboard. Both used to be
+    // added with stretch 1, so every pixel of a resize was split down the
+    // middle and the twelve-row table ended up physically larger than the curve
+    // it edits - while still hiding three of its rows behind a scrollbar.
+    m_split = new QSplitter(Qt::Vertical);
+    m_split->addWidget(m_curve);
+    m_split->addWidget(m_table);
+    m_split->setChildrenCollapsible(false);
+    m_split->setCollapsible(0, false);
+    m_split->setStretchFactor(0, 3);
+    m_split->setStretchFactor(1, 1);
+    root->addWidget(m_split, 1);
+
+    // --- tools -------------------------------------------------------------
+    auto* tools = new QHBoxLayout;
+    tools->setSpacing(bbui::gapS());
+    m_eqOn = makeToggle("EQ ON", "eq");
     m_eqOn->setChecked(m_eq->on.load() != 0);
     connect(m_eqOn, &QPushButton::toggled, this, [this](bool b) {
         if (m_updating) return;
         m_eq->on.store(b ? 1 : 0);
         m_curve->update();
     });
-    btns->addWidget(m_eqOn);
+    tools->addWidget(m_eqOn);
 
-    btns->addSpacing(8);
-    btns->addWidget(makeLabel("PREAMP", "caption", Qt::AlignRight));
+    tools->addSpacing(bbui::gapM());
+    tools->addWidget(makeLabel("PREAMP", "caption", Qt::AlignRight));
     m_preamp = new QDoubleSpinBox;
     m_preamp->setRange(-24.0, 12.0);
     m_preamp->setDecimals(1);
     m_preamp->setSingleStep(0.5);
     m_preamp->setSuffix(" dB");
     m_preamp->setKeyboardTracking(false);
+    m_preamp->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_preamp->setMinimumWidth(bbui::px(96));
     m_preamp->setToolTip("Overall level trim applied before the bands, so a "
                          "boosted curve does not clip.");
     connect(m_preamp, &QDoubleSpinBox::valueChanged, this, [this](double v) {
@@ -594,31 +953,33 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
         highlight(-1);
         m_curve->update();
     });
-    btns->addWidget(m_preamp);
+    tools->addWidget(m_preamp);
     auto* autoPre = new QPushButton("Auto");
     autoPre->setToolTip("Set the preamp to just clear the curve's highest peak");
     connect(autoPre, &QPushButton::clicked, this, &EqEditorDialog::autoPreamp);
-    btns->addWidget(autoPre);
+    tools->addWidget(autoPre);
 
-    btns->addSpacing(8);
+    tools->addSpacing(bbui::gapM());
     m_undoBtn = new QPushButton("Undo");
     m_undoBtn->setShortcut(QKeySequence::Undo);
     m_undoBtn->setToolTip("Step back through the edits made in this dialog (Ctrl+Z)");
     m_undoBtn->setEnabled(false);
     connect(m_undoBtn, &QPushButton::clicked, this, &EqEditorDialog::undo);
-    btns->addWidget(m_undoBtn);
+    tools->addWidget(m_undoBtn);
 
     auto* flat = new QPushButton("Flatten");
     connect(flat, &QPushButton::clicked, this, &EqEditorDialog::flatten);
-    btns->addWidget(flat);
+    tools->addWidget(flat);
+    tools->addStretch(1);
+    root->addLayout(tools);
 
-    m_note = makeLabel("", "caption", Qt::AlignLeft);
-    btns->addWidget(m_note, 1);
+    // --- status and close --------------------------------------------------
+    m_note.widget()->setProperty("role", "value");
 
     auto* close = new QPushButton("Close");
-    close->setDefault(true);
     connect(close, &QPushButton::clicked, this, &QDialog::accept);
-    btns->addWidget(close);
+    QBoxLayout* btns = bbdlg::buttonRow(nullptr, close);
+    btns->insertWidget(0, m_note.widget(), 1);
     root->addLayout(btns);
 
     connect(m_curve, &EqCurve::editStarted,  this, [this](int k) { snapshot(k); });
@@ -642,7 +1003,48 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
 
     pullFromShm();
     highlight(0);
-    resize(760, 700);
+
+    // Big enough to be an instrument, never taller than the screen it opens on:
+    // a default that does not fit is simply never honoured, and the dialog then
+    // always opens at its layout minimum instead. The wanted size goes through
+    // the interface scale, since everything inside it does; the margin left on
+    // the screen does not, because a window manager's panels are not ours to
+    // scale.
+    const QScreen* sc = QGuiApplication::primaryScreen();
+    const QRect avail = sc ? sc->availableGeometry() : QRect(0, 0, 1280, 900);
+    resize(std::min(bbui::px(980), avail.width() - 80),
+           std::min(bbui::px(880), avail.height() - 80));
+    bbdlg::rememberGeometry(this, "eq");
+
+    // Three to one, restored from last time if the split was ever dragged.
+    m_split->setSizes({ height() * 3 / 4, height() / 4 });
+    const QByteArray st = QSettings("betterbanana", "gui").value("eqsplit").toByteArray();
+    if (!st.isEmpty()) m_split->restoreState(st);
+
+    // Every band spin box is setKeyboardTracking(false), so Return is exactly
+    // how a typed frequency is committed - and Close carried the default, so
+    // the same keystroke dismissed the editor. Escape already closes a dialog,
+    // which is the affordance this one wants.
+    bbdlg::tameDefaults(this);
+}
+
+void EqEditorDialog::showEvent(QShowEvent* e)
+{
+    QDialog::showEvent(e);
+    // Tabular figures, re-stated after the first polish: a stylesheet font rule
+    // is applied when the widget is polished and drops the OpenType feature
+    // tags a constructor sets. Safe in this dialog and nowhere long-lived - it
+    // is modal, so it cannot outlive a theme switch.
+    if (m_tabular) return;
+    m_tabular = true;
+    auto tabular = [](QWidget* w) {
+        QFont f = w->font();
+        bbui::makeTabular(f);
+        w->setFont(f);
+    };
+    for (const BandRow& row : m_rows)
+        for (QDoubleSpinBox* s : { row.freq, row.gain, row.q }) tabular(s);
+    tabular(m_preamp);
 }
 
 EqEditorDialog::~EqEditorDialog()
@@ -650,6 +1052,9 @@ EqEditorDialog::~EqEditorDialog()
     // Stop the engine analysing the moment nobody is looking.
     if (m_spec != kSpecNone && m_shm->spec.source.load() == m_spec)
         m_shm->spec.source.store(kSpecNone);
+    // Kept next to the dialog's geometry: someone who wants more table than
+    // curve should have to say so once.
+    QSettings("betterbanana", "gui").setValue("eqsplit", m_split->saveState());
 }
 
 void EqEditorDialog::snapshot(int tag)
@@ -678,7 +1083,7 @@ void EqEditorDialog::undo()
     const QSignalBlocker block(m_profile);
     m_profile->setCurrentIndex(0);
     m_delete->setEnabled(false);
-    m_note->setText(m_undo.isEmpty() ? "undone (nothing further to undo)" : "undone");
+    m_note.say(m_undo.isEmpty() ? "undone (nothing further to undo)" : "undone");
 }
 
 // The combo lists the built-ins, then whatever is saved in the EQ directory.
@@ -741,7 +1146,7 @@ void EqEditorDialog::applyProfile(const EqProfile& prof, const QString& label)
     m_eq->on.store(1);
     pullFromShm();
     if (!label.isEmpty())
-        m_note->setText(QString("applied \"%1\"").arg(label));
+        m_note.say(QString("applied \"%1\"").arg(label));
 }
 
 void EqEditorDialog::pullFromShm()
@@ -760,6 +1165,7 @@ void EqEditorDialog::pullFromShm()
     m_updating = false;
 
     for (int k = 0; k < kEqBands; ++k) refreshRowEnables(k);
+    restyleRows();
     m_curve->update();
 }
 
@@ -786,15 +1192,56 @@ void EqEditorDialog::refreshRowEnables(int k)
     row.gain->setEnabled(live && gainy);
 }
 
+// The row plates: a zebra so twelve rows of numbers can be scanned across, and
+// a selected row carrying the same colour its handle carries on the curve.
+void EqEditorDialog::restyleRows()
+{
+    const Theme& t = theme();
+    auto hex = [](const QColor& c) { return c.name(QColor::HexRgb); };
+    // A fixed step in L*, not a blend of two palette colours: bg and panel are
+    // 1.09:1 apart on Catppuccin Latte, so a mix of them bands nothing.
+    const QColor zebra = bbcolor::nudge(t.bg, t.dark ? 5.0 : -5.0);
+
+    for (int k = 0; k < kEqBands; ++k) {
+        const bool sel  = k == m_selRow;
+        const bool live = m_eq->band_on[k].load() != 0;
+        const QString plate = sel
+            ? QString("background:%1;border-left:%2px solid %3;border-radius:%4px;")
+                  .arg(hex(bbcolor::mix(t.solo, t.bg, 0.78)))
+                  .arg(bbui::px(3)).arg(hex(bbcolor::fitFill(t.solo, bbcolor::kTextFloor)))
+                  .arg(bbui::radCtl())
+            : QString("background:%1;border-radius:%2px;")
+                  .arg(hex(k % 2 ? zebra : t.bg)).arg(bbui::radCtl());
+
+        // The band number becomes the handle's own chip. The link between the
+        // curve and the table used to be one 9px digit going bold. The chip is
+        // wide enough for two digits: 10, 11 and 12 clipped inside a square.
+        const QColor chip = live ? bbcolor::fitFill(sel ? t.solo : t.accent,
+                                                    bbcolor::kTextFloor)
+                                 : t.well;
+        const QString chipCss =
+            QString("background:%1;color:%2;font-size:%3px;font-weight:bold;"
+                    "border-radius:%4px;min-width:%5px;max-width:%5px;"
+                    "min-height:%6px;max-height:%6px;")
+                .arg(hex(chip), hex(live ? onFill(chip) : dimOn(t, t.well)))
+                .arg(bbui::fsChip()).arg(bbui::px(8))
+                .arg(bbui::px(22)).arg(bbui::px(16));
+
+        BandRow& row = m_rows[k];
+        if (row.plateCss != plate)   { row.plateCss = plate;   row.holder->setStyleSheet(plate); }
+        if (row.chipCss  != chipCss) { row.chipCss  = chipCss; row.num->setStyleSheet(chipCss); }
+    }
+}
+
 // Marks the row matching the band selected on the curve, so the two halves of
 // the dialog stay visibly connected.
 void EqEditorDialog::highlight(int band)
 {
-    for (int k = 0; k < kEqBands; ++k) {
-        QFont f = m_rows[k].num->font();
-        f.setBold(k == band);
-        m_rows[k].num->setFont(f);
-    }
+    if (band >= 0 && band < kEqBands) m_selRow = band;
+    restyleRows();
+    // Dragging handle 11 used to mark a row below the fold.
+    if (band >= 0 && band < m_rows.size())
+        m_table->ensureWidgetVisible(m_rows[band].num, 0, bbui::px(36));
     // Any hand edit means the curve is no longer exactly the chosen profile.
     if (m_profile->currentIndex() != 0) {
         const QSignalBlocker block(m_profile);
@@ -809,7 +1256,7 @@ void EqEditorDialog::autoPreamp()
     const float pa = eq_suggest_preamp(eq_capture(*m_eq));
     m_eq->preamp_db.store(pa);
     pullFromShm();
-    m_note->setText(QString("preamp set to %1 dB").arg(pa, 0, 'f', 1));
+    m_note.say(QString("preamp set to %1 dB").arg(pa, 0, 'f', 1));
 }
 
 void EqEditorDialog::flatten()
@@ -820,7 +1267,7 @@ void EqEditorDialog::flatten()
     pullFromShm();
     const QSignalBlocker block(m_profile);
     m_profile->setCurrentIndex(0);
-    m_note->setText("flattened");
+    m_note.say("flattened");
 }
 
 void EqEditorDialog::saveProfile()
@@ -847,7 +1294,7 @@ void EqEditorDialog::saveProfile()
         return;
     }
     buildProfileCombo("user:" + name);
-    m_note->setText(QString("saved \"%1\"").arg(name));
+    m_note.say(QString("saved \"%1\"").arg(name));
 }
 
 void EqEditorDialog::deleteProfile()
@@ -864,7 +1311,7 @@ void EqEditorDialog::deleteProfile()
         return;
     }
     buildProfileCombo();
-    m_note->setText(QString("deleted \"%1\"").arg(name));
+    m_note.say(QString("deleted \"%1\"").arg(name));
 }
 
 void EqEditorDialog::importProfile()
@@ -885,7 +1332,7 @@ void EqEditorDialog::importProfile()
     const QString label = QFileInfo(path).completeBaseName();
     applyProfile(prof, label);
     if (int(prof.bands.size()) > kEqBands)
-        m_note->setText(QString("applied \"%1\" - %2 of its %3 filters "
+        m_note.say(QString("applied \"%1\" - %2 of its %3 filters "
                                 "(the strongest ones fit)")
                             .arg(label).arg(kEqBands).arg(prof.bands.size()));
 }
@@ -905,7 +1352,7 @@ void EqEditorDialog::exportProfile()
         QMessageBox::warning(this, "BetterBanana", "Could not write " + path);
         return;
     }
-    m_note->setText("exported " + QFileInfo(path).fileName());
+    m_note.say("exported " + QFileInfo(path).fileName());
 }
 
 void EqEditorDialog::openAutoEq()
@@ -917,7 +1364,7 @@ void EqEditorDialog::openAutoEq()
     pullFromShm();
     if (!dlg.applied().isEmpty()) {
         buildProfileCombo("user:" + dlg.applied());
-        m_note->setText(QString("applied \"%1\"").arg(dlg.applied()));
+        m_note.say(QString("applied \"%1\"").arg(dlg.applied()));
     }
 }
 
@@ -943,12 +1390,15 @@ AutoEqDialog::AutoEqDialog(Shared* shm, int bus, QWidget* parent)
     m_net = new QNetworkAccessManager(this);
 
     auto* root = new QVBoxLayout(this);
-    root->addWidget(makeLabel(
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header(
+        "Headphone EQ",
         "Measured corrections for thousands of headphones and IEMs, from the "
         "AutoEq project. Pick yours, and the matching parametric EQ is applied "
-        "to this bus.", "caption", Qt::AlignLeft));
+        "to this bus."));
 
     auto* top = new QHBoxLayout;
+    top->setSpacing(bbui::gapS());
     m_search = new QLineEdit;
     m_search->setPlaceholderText("Search - e.g.  hd 650   ·   moondrop chu   ·   airpods pro");
     m_search->setClearButtonEnabled(true);
@@ -961,6 +1411,16 @@ AutoEqDialog::AutoEqDialog(Shared* shm, int bus, QWidget* parent)
     m_list = new QListWidget;
     m_list->setAlternatingRowColors(true);
     root->addWidget(m_list, 1);
+
+    // Both downloads run in a nested event loop, so the dialog was never
+    // actually frozen - it just had no way of saying so. An indeterminate bar
+    // under the list is the whole busy state.
+    m_busy = new QProgressBar;
+    m_busy->setRange(0, 0);
+    m_busy->setTextVisible(false);
+    m_busy->setFixedHeight(bbui::px(4));
+    m_busy->hide();
+    root->addWidget(m_busy);
 
     // Only a physical bus drives a real device worth remembering a profile for.
     if (m_bus < kPhysBuses) {
@@ -975,22 +1435,25 @@ AutoEqDialog::AutoEqDialog(Shared* shm, int bus, QWidget* parent)
         m_remember->setEnabled(false);
         m_remember->setToolTip("Assign an output device to this bus first.");
     } else {
-        m_remember->setText(QString("Re-apply automatically whenever this bus is set to %1")
-                                .arg(m_device));
+        // A node name is "alsa_output.usb-BEHRINGER_UMC202HD_192k_...Direct__sink",
+        // and a check box does not elide its own label - so it was setting the
+        // dialog's minimum width, 285px wider than anything else in it.
+        m_remember->setText(
+            QString("Re-apply automatically whenever this bus is set to %1")
+                .arg(QFontMetrics(m_remember->font())
+                         .elidedText(m_device, Qt::ElideMiddle, bbui::px(260))));
+        m_remember->setToolTip(m_device);
         m_remember->setChecked(
             QSettings("betterbanana", "gui").contains("eqdevice/" + deviceKey(m_device)));
     }
     root->addWidget(m_remember);
 
-    auto* btns = new QHBoxLayout;
     m_status = makeLabel("", "caption", Qt::AlignLeft);
-    btns->addWidget(m_status, 1);
     m_apply = new QPushButton("Apply");
-    m_apply->setDefault(true);
     m_apply->setEnabled(false);
     auto* close = new QPushButton("Close");
-    btns->addWidget(m_apply);
-    btns->addWidget(close);
+    QBoxLayout* btns = bbdlg::buttonRow(m_apply, close);
+    btns->insertWidget(0, m_status, 1);
     root->addLayout(btns);
 
     connect(close,    &QPushButton::clicked, this, &QDialog::accept);
@@ -1002,7 +1465,11 @@ AutoEqDialog::AutoEqDialog(Shared* shm, int bus, QWidget* parent)
     });
     connect(m_list, &QListWidget::itemActivated, this, &AutoEqDialog::applySelected);
 
-    resize(680, 520);
+    resize(bbui::px(700), bbui::px(560));
+    bbdlg::rememberGeometry(this, "autoeq");
+    // Return in the search box applies the highlighted headphone, which is the
+    // only thing this dialog is for.
+    bbdlg::tameDefaults(this, m_apply);
 
     QString err;
     if (!loadIndex(&err)) {
@@ -1017,10 +1484,55 @@ AutoEqDialog::AutoEqDialog(Shared* shm, int bus, QWidget* parent)
 void AutoEqDialog::setStatus(const QString& text, bool busy)
 {
     m_status->setText(text);
-    setCursor(busy ? Qt::WaitCursor : Qt::ArrowCursor);
-    m_apply->setEnabled(!busy && m_list->currentRow() >= 0);
-    m_refresh->setEnabled(!busy);
+    m_busy->setVisible(busy);
+    // A 30 second timeout with no way out of it is a hang whatever it says on
+    // the label, so the button that started the download is the one that stops
+    // it. Everything else stands down while it is in flight.
+    m_refresh->setText(busy ? "Cancel" : "Update list");
+    QListWidgetItem* cur = m_list->currentItem();
+    m_apply->setEnabled(!busy && cur && cur->data(Qt::UserRole).isValid());
+    m_search->setEnabled(!busy);
+    m_list->setEnabled(!busy);
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+}
+
+// One blocking GET, with the busy bar running and Cancel live throughout. A
+// nested loop rather than a state machine because this dialog only ever has one
+// request outstanding, and both callers need the answer before they continue.
+QByteArray AutoEqDialog::fetch(const QUrl& url, const QString& what)
+{
+    QNetworkRequest req{ url };
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::NoLessSafeRedirectPolicy);
+    req.setHeader(QNetworkRequest::UserAgentHeader, "BetterBanana");
+
+    m_reply = m_net->get(req);
+    setStatus("Downloading " + what + "...", true);
+
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+    connect(m_reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    timeout.start(30000);
+    loop.exec();
+
+    QNetworkReply* reply = m_reply;
+    m_reply = nullptr;                      // Cancel has nothing left to abort
+    QByteArray body;
+    if (!reply->isFinished()) {
+        reply->abort();
+        setStatus("Timed out fetching " + what + " - check the network and try again.");
+    } else if (reply->error() == QNetworkReply::OperationCanceledError) {
+        setStatus("Cancelled.");
+    } else if (reply->error() != QNetworkReply::NoError) {
+        setStatus("Could not download " + what + ": " + reply->errorString());
+    } else {
+        body = reply->readAll();
+        setStatus(QString());
+    }
+    reply->deleteLater();
+    return body;
 }
 
 // One index line looks like
@@ -1070,36 +1582,12 @@ bool AutoEqDialog::loadIndex(QString* err)
 
 void AutoEqDialog::refreshIndex()
 {
-    setStatus("Downloading the headphone list...", true);
+    // While a download is in flight this button is the Cancel.
+    if (m_reply) { m_reply->abort(); return; }
 
-    QNetworkRequest req{ QUrl(QString(kAutoEqBase) + "INDEX.md") };
-    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                     QNetworkRequest::NoLessSafeRedirectPolicy);
-    req.setHeader(QNetworkRequest::UserAgentHeader, "BetterBanana");
-    QNetworkReply* reply = m_net->get(req);
-
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-    connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timeout.start(30000);
-    loop.exec();
-
-    if (!reply->isFinished()) {
-        reply->abort();
-        reply->deleteLater();
-        setStatus("Timed out fetching the list - check the network and try again.");
-        return;
-    }
-    if (reply->error() != QNetworkReply::NoError) {
-        const QString msg = reply->errorString();
-        reply->deleteLater();
-        setStatus("Could not download the list: " + msg);
-        return;
-    }
-    const QByteArray body = reply->readAll();
-    reply->deleteLater();
+    const QByteArray body = fetch(QUrl(QString(kAutoEqBase) + "INDEX.md"),
+                                  "the headphone list");
+    if (body.isEmpty()) return;
 
     QDir().mkpath(QFileInfo(autoeqCachePath()).absolutePath());
     QFile f(autoeqCachePath());
@@ -1184,35 +1672,8 @@ void AutoEqDialog::applySelected()
         QUrl::toPercentEncoding(dir + " ParametricEQ.txt"));
     const QUrl url(QString(kAutoEqBase) + path + "/" + file);
 
-    setStatus("Downloading " + name + "...", true);
-    QNetworkRequest req{ url };
-    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                     QNetworkRequest::NoLessSafeRedirectPolicy);
-    req.setHeader(QNetworkRequest::UserAgentHeader, "BetterBanana");
-    QNetworkReply* reply = m_net->get(req);
-
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-    connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timeout.start(30000);
-    loop.exec();
-
-    if (!reply->isFinished()) {
-        reply->abort();
-        reply->deleteLater();
-        setStatus("Timed out downloading " + name + ".");
-        return;
-    }
-    if (reply->error() != QNetworkReply::NoError) {
-        const QString msg = reply->errorString();
-        reply->deleteLater();
-        setStatus("Could not download " + name + ": " + msg);
-        return;
-    }
-    const QByteArray body = reply->readAll();
-    reply->deleteLater();
+    const QByteArray body = fetch(url, name);
+    if (body.isEmpty()) return;
 
     EqProfile prof = eq_parse_apo(body.toStdString());
     if (prof.bands.empty()) {

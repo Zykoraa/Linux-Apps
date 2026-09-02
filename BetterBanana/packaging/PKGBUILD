@@ -1,28 +1,46 @@
-# Maintainer: you
+# Maintainer: Zykoraa <thompsonj52d@gmail.com>
 pkgname=betterbanana
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="BetterBanana-style virtual audio mixer for PipeWire"
+pkgdesc="Virtual mixing console for PipeWire, modelled on Voicemeeter Banana"
 arch=('x86_64')
+url="https://github.com/Zykoraa/Linux-Apps"
 license=('MIT')
-depends=('pipewire' 'qt6-base' 'libsndfile' 'libpulse')
+# python is not optional: bb-health, bb-stream-guard, bb-stream-setup and
+# bb-autoeq are all python3, and the first two run as systemd user services.
+# libpulse is what provides pactl, which the GUI shells out to for the device
+# list. hicolor-icon-theme owns the directories the icons land in.
+depends=('pipewire' 'qt6-base' 'libsndfile' 'libpulse' 'python' 'hicolor-icon-theme')
 makedepends=('gcc' 'pkgconf' 'qt6-tools')
-optdepends=('pipewire-pulse: needed for the application routing panel')
-source=("$pkgname-$pkgver.tar.gz")
+optdepends=('pipewire-pulse: needed for the application routing panel'
+            'mic-gain: microphone analyser, opened from the Engine menu')
+
+# BetterBanana is one application inside the Linux-Apps monorepo, so the source
+# is the whole repository at the tag and every function works out of $_src.
+# The previous line named a bare tarball with no URL, which makepkg cannot
+# fetch from anywhere: it only built if the tarball happened to be sitting in
+# the build directory already.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgname-v$pkgver.tar.gz")
+# SKIP until the tag exists; run updpkgsums to pin it before publishing.
 sha256sums=('SKIP')
+_src="Linux-Apps-$pkgname-v$pkgver/BetterBanana"
 
 build() {
-  cd "$srcdir/$pkgname-$pkgver"
-  make all gui
+  cd "$srcdir/$_src"
+  make all
 }
 
 check() {
-  cd "$srcdir/$pkgname-$pkgver"
-  ./build/test_dsp
-  QT_QPA_PLATFORM=offscreen ./build/test_fader
+  cd "$srcdir/$_src"
+  # Two of the unit tests construct a QGuiApplication, and a package is built
+  # with no display.
+  QT_QPA_PLATFORM=offscreen make check
 }
 
 package() {
-  cd "$srcdir/$pkgname-$pkgver"
+  cd "$srcdir/$_src"
+  # install-system also lays down the MIT text at
+  # /usr/share/licenses/betterbanana/LICENSE, which the license=('MIT') line
+  # above requires a package to ship.
   make install-system PREFIX=/usr DESTDIR="$pkgdir"
 }

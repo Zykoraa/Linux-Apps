@@ -9,7 +9,9 @@
 
 #include "../common/protocol.h"
 #include "../common/eqprofile.h"
+#include "dialogbits.h"
 
+#include <QByteArray>
 #include <QDialog>
 #include <QElapsedTimer>
 #include <QString>
@@ -23,8 +25,15 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QNetworkAccessManager;
+class QNetworkReply;
+class QPainter;
+class QProgressBar;
 class QPushButton;
+class QScrollArea;
+class QShowEvent;
+class QSplitter;
 class QTimer;
+class QUrl;
 
 // Interactive magnitude plot of one EQ block, drawn over the engine's live
 // spectrum of the signal it sits in. Each enabled band gets a numbered handle:
@@ -60,14 +69,20 @@ protected:
     void leaveEvent(QEvent*) override;
 
 private:
-    QRectF plotRect() const;
+    QRectF cardRect() const;        // the whole widget, as a plate
+    QRectF plotRect() const;        // the well the curve is drawn in
+    QRectF readoutRect() const;     // the strip above it
     double xForFreq(double f) const;
     double freqForX(double x) const;
     double yForDb(double db) const;
     double dbForY(double y) const;
     double yForSpec(double dbfs) const;
-    void   drawSpectrum(class QPainter& p, const QRectF& r) const;
-    QPointF handlePos(int band) const;
+    void   drawSpectrum(QPainter& p, const QRectF& r) const;
+    void   drawGrid(QPainter& p, const QRectF& r) const;
+    void   drawReadout(QPainter& p) const;
+    void   fanHandles() const;
+    QPointF handlePos(int band) const;   // where the band's values put it
+    QPointF drawPos(int band) const;     // where it is drawn, after fanning
     int  bandAt(const QPoint& p) const;
 
     bb::Shared*   m_shm;
@@ -76,6 +91,23 @@ private:
     int m_sel   = 0;
     int m_drag  = -1;
     int m_hover = -1;
+
+    // The dB range the frame spans, chosen to fit whatever is drawn. It used to
+    // be a fixed 18 while a band reaches 24 and the preamp another 24 below
+    // that, so any real correction flattened against the frame with nothing to
+    // say it had been truncated.
+    double m_range = 18.0;
+
+    // Peak hold over the engine's spectrum, and the clock its fall is paced by.
+    // Mutable because drawSpectrum is const, and the alternative is to update
+    // the trace in paintEvent - two call frames from the code that reads it.
+    mutable float m_hold[bb::kSpecBins];
+    mutable QElapsedTimer m_holdClock;
+
+    // Vertical offsets that pull coincident handles apart. The Telephone preset
+    // puts two bands on 300 Hz and two on 3400 Hz, and the second of each pair
+    // was drawn exactly under the first, so it could never be clicked.
+    mutable double m_fan[bb::kEqBands];
 };
 
 // The full editor for one EQ block: profile bar, curve, twelve band rows,
@@ -90,6 +122,9 @@ public:
                    const QString& title, int bus, QWidget* parent = nullptr);
     ~EqEditorDialog() override;
 
+protected:
+    void showEvent(QShowEvent*) override;
+
 private slots:
     void onProfileChosen(int index);
     void saveProfile();
@@ -103,13 +138,18 @@ private slots:
 
 private:
     struct BandRow {
-        QWidget*        holder = nullptr;
+        QWidget*        holder = nullptr;   // the row's own plate, behind it
         QCheckBox*      on     = nullptr;
         QComboBox*      type   = nullptr;
         QDoubleSpinBox* freq   = nullptr;
         QDoubleSpinBox* gain   = nullptr;
         QDoubleSpinBox* q      = nullptr;
         QLabel*         num    = nullptr;
+        // What was last handed to each setStyleSheet. A drag re-pulls the whole
+        // block on every mouse move, and re-stating an unchanged sheet
+        // re-polishes the widget for nothing on the thread that also has to
+        // keep the curve at 20 fps.
+        QString         plateCss, chipCss;
     };
 
     // Records the state to come back to. `tag` is a band index, or -1 for a
@@ -122,6 +162,7 @@ private:
     void pullFromShm();            // shm -> widgets, without re-entering them
     void pushBand(int k);          // widgets -> shm, for one band
     void refreshRowEnables(int k);
+    void restyleRows();            // zebra, selection plate and band chips
     void highlight(int band);
 
     bb::Shared*   m_shm;
@@ -130,6 +171,8 @@ private:
     int           m_spec;
     QString       m_title;
     bool          m_updating = false;
+    bool          m_tabular  = false;   // feature tags re-stated after polish
+    int           m_selRow   = 0;
 
     QVector<bb::EqSnapshot> m_undo;
     uint32_t      m_specSeen = 0;
@@ -137,12 +180,14 @@ private:
     QElapsedTimer m_since;
 
     EqCurve*     m_curve   = nullptr;
+    QSplitter*   m_split   = nullptr;
+    QScrollArea* m_table   = nullptr;
     QComboBox*   m_profile = nullptr;
     QPushButton* m_delete  = nullptr;
     QPushButton* m_undoBtn = nullptr;
     QPushButton* m_eqOn    = nullptr;
     QDoubleSpinBox* m_preamp = nullptr;
-    QLabel*      m_note     = nullptr;
+    bbdlg::StatusStrip m_note;
     QTimer*      m_repaint  = nullptr;
     QVector<BandRow> m_rows;
 };
@@ -179,6 +224,10 @@ private:
     bool loadIndex(QString* err = nullptr);
     void setStatus(const QString& text, bool busy = false);
 
+    // One blocking GET with a live progress bar and a working Cancel. Returns
+    // an empty array and leaves the status line explaining itself on failure.
+    QByteArray fetch(const QUrl& url, const QString& what);
+
     bb::Shared* m_shm;
     int         m_bus;
     QString     m_applied;
@@ -186,10 +235,12 @@ private:
     QLineEdit*   m_search  = nullptr;
     QListWidget* m_list    = nullptr;
     QLabel*      m_status  = nullptr;
+    QProgressBar* m_busy   = nullptr;
     QCheckBox*   m_remember = nullptr;
     QPushButton* m_apply   = nullptr;
     QPushButton* m_refresh = nullptr;
     QNetworkAccessManager* m_net = nullptr;
+    QNetworkReply* m_reply = nullptr;   // non-null only while a GET is in flight
     QVector<Entry> m_all;
     QString m_device;      // node name of the sink this bus drives, if any
 };

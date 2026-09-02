@@ -1,25 +1,59 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>BetterBanana</title>
+  <!--
+    One channel strip: the fader, and the meter beside it.
+
+    The mark this replaces was three faders with caps, which is the same
+    silhouette as pavucontrol, GNOME's volume applet and every mixer applet
+    written since - it said "audio slider", not "this app". A fader next to a
+    lit meter is what the window actually shows, and the pairing is specific
+    enough to recognise in a taskbar.
+
+    The plate is mid-tone on purpose. The old one averaged a relative luminance
+    of 0.018, which is 1.10:1 against a GNOME dark shell and 1.24:1 against a
+    Nord panel - the tile dissolved and only the strokes were left floating.
+    This one averages 0.131: 2.94:1 on that same shell, 2.16:1 on Nord's
+    #2e3440, 5.2:1 on a light panel. It holds its shape in either.
+
+    Two marks rather than three because each SVG unit is 0.125 device px at
+    16x16, and a third column costs more than it says there. Everything is
+    sized so it survives that division: the 28-unit meter lands on 3.5px, the
+    48-unit lit bar on 6, and the gold cap - the only warm colour in the icon,
+    and the one that carries the name - on 4.75 x 2.5.
+  -->
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2b3140"/>
-      <stop offset="1" stop-color="#15181d"/>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6f7ea6"/><stop offset="1" stop-color="#414c68"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe07a"/><stop offset="1" stop-color="#f2b62c"/>
+    </linearGradient>
+    <linearGradient id="lit" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#3ccf7a"/><stop offset="1" stop-color="#7ff0ae"/>
     </linearGradient>
   </defs>
-  <rect width="128" height="128" rx="26" fill="url(#bg)"/>
-  <!-- three faders at different positions, the app's whole idea in one glance -->
-  <g stroke="#3d4658" stroke-width="7" stroke-linecap="round">
-    <line x1="34" y1="26" x2="34" y2="102"/>
-    <line x1="64" y1="26" x2="64" y2="102"/>
-    <line x1="94" y1="26" x2="94" y2="102"/>
+
+  <!-- Two rims, one for each ground: the dark one keeps the tile crisp on a
+       light panel, the light one catches an edge on a dark dock. -->
+  <rect x="2" y="2" width="124" height="124" rx="27" fill="url(#plate)"/>
+  <rect x="3.5" y="3.5" width="121" height="121" rx="25.5" fill="none"
+        stroke="#161b23" stroke-opacity="0.55" stroke-width="3"/>
+  <rect x="6" y="6" width="116" height="116" rx="23" fill="none"
+        stroke="#ffffff" stroke-opacity="0.14" stroke-width="2"/>
+
+  <!-- Fader, cap at unity. -->
+  <rect x="38" y="22" width="14" height="84" rx="7" fill="#171c25"/>
+  <rect x="26" y="54" width="38" height="20" rx="6" fill="url(#cap)"/>
+  <rect x="32" y="62.5" width="26" height="3" rx="1.5" fill="#2a2418" fill-opacity="0.45"/>
+
+  <!-- Meter: unlit trough with a ghosted ladder, a lit bar, and the held peak
+       above it. The ladder is at 30% so it is texture at 64px and gone by 16,
+       where two extra lines across 3.5px would only be noise. -->
+  <rect x="72" y="22" width="28" height="84" rx="5" fill="#171c25"/>
+  <g fill="#0f131b" fill-opacity="0.30">
+    <rect x="72" y="34" width="28" height="2"/>
+    <rect x="72" y="46" width="28" height="2"/>
   </g>
-  <g stroke="#6ee7a8" stroke-width="7" stroke-linecap="round">
-    <line x1="34" y1="70" x2="34" y2="102"/>
-    <line x1="64" y1="46" x2="64" y2="102"/>
-    <line x1="94" y1="84" x2="94" y2="102"/>
-  </g>
-  <g fill="#e8eef7">
-    <rect x="22" y="63" width="24" height="12" rx="4"/>
-    <rect x="52" y="39" width="24" height="12" rx="4"/>
-    <rect x="82" y="77" width="24" height="12" rx="4"/>
-  </g>
+  <rect x="72" y="58" width="28" height="48" rx="5" fill="url(#lit)"/>
+  <rect x="72" y="49" width="28" height="4" rx="2" fill="#e8eef7" fill-opacity="0.85"/>
 </svg>

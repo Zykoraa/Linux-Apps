@@ -1,5 +1,5 @@
 [Unit]
-Description=betterbanana Discord screen-share guard
+Description=BetterBanana Discord screen-share guard
 Documentation=https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana
 # Needs both the PipeWire graph and bb-ctl's engine to inspect and repair links.
 After=pipewire.service pipewire-pulse.service wireplumber.service betterbanana-engine.service

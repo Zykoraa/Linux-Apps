@@ -1,5 +1,5 @@
 [Unit]
-Description=betterbanana engine watchdog
+Description=BetterBanana engine watchdog
 Documentation=https://github.com/Zykoraa/Linux-Apps/tree/main/BetterBanana
 After=pipewire.service pipewire-pulse.service betterbanana-engine.service
 Wants=pipewire.service

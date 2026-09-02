@@ -10,6 +10,22 @@ Beyond the original it adds three standalone virtual cables, sidechain ducking,
 per-application routing with remembered rules, switchable colour themes, and a
 tape deck. It is an independent implementation, not affiliated with VB-Audio.
 
+## What it looks like
+
+![The BetterBanana console](docs/main-dark.png)
+
+Five input strips on the left, five buses on the right, the recorder underneath.
+Every fader in the window has the same travel and every meter the same
+dB-per-pixel, so a level is the same height whichever column you read it in.
+
+![The twelve-band parametric EQ over a live spectrum](docs/eq-dark.png)
+
+The parametric EQ. Every strip and every bus has one.
+
+![The same console in the Catppuccin Latte theme](docs/main-light.png)
+
+Ten colour themes ship with it; Catppuccin Latte is the light one.
+
 **Features**
 
 - 5×5 routing matrix, per-bus solo, per-strip gate / compressor / 3-band EQ
@@ -53,7 +69,7 @@ Cable), and set your chat app's microphone to **BetterBanana Out B1**.
 
 ## Getting it onto another Linux machine
 
-    make dist        # -> betterbanana-0.1.0.tar.gz, self-contained source
+    make dist        # -> betterbanana-0.2.0.tar.gz, self-contained source
 
 Copy that tarball over. Nothing in it is tied to this machine: the build asks Qt
 where its `moc` lives rather than hardcoding a path, and `make check-deps` runs
@@ -69,7 +85,7 @@ engine with `systemctl --user enable --now betterbanana-engine`.
 
 **Any other distribution** — build and install into your home directory:
 
-    tar xzf betterbanana-0.1.0.tar.gz && cd betterbanana-0.1.0
+    tar xzf betterbanana-0.2.0.tar.gz && cd betterbanana-0.2.0
     make && make gui && make install
 
 Dependencies:
@@ -93,7 +109,7 @@ Two things worth knowing when moving between machines:
   touches another app's config. `packaging/betterbanana.lua.example` is a
   ready-made copy — see [Keyboard shortcuts](#keyboard-shortcuts).
 
-## Install
+## Building from a checkout
 
     make && make gui && make install
 

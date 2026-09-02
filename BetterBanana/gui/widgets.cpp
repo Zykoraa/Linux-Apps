@@ -70,7 +70,7 @@ LevelMeter::LevelMeter(int channels, QWidget* parent)
 
 QSize LevelMeter::sizeHint() const
 {
-    return QSize(bbui::px(10) * m_channels + bbui::px(2) * (m_channels - 1) + 2, bbui::px(180));
+    return QSize(bbui::px(8) * m_channels + bbui::px(2) * (m_channels - 1) + 2, bbui::px(180));
 }
 
 QSize LevelMeter::minimumSizeHint() const
@@ -276,9 +276,15 @@ void LevelMeter::paintEvent(QPaintEvent*)
     }
 
     // --- latched clip -----------------------------------------------------
+    //
+    // A clip that happened while you were looking elsewhere is exactly the
+    // thing you need to notice, so this is the second of the app's two pieces
+    // of motion. setLevels keeps the repaints coming while it is latched.
     if (m_clipped) {
         const int ch = bbui::px(5);
-        p.fillRect(0, top, w, ch, t.meterPeak);
+        const double phase = (m_clock.elapsed() % 900) / 900.0;
+        const double k = 0.55 + 0.45 * std::cos(phase * 2.0 * M_PI);
+        p.fillRect(0, top, w, ch, bbcolor::mix(t.well, t.meterPeak, k));
         p.fillRect(0, top + ch, w, 1, bbcolor::onColor(t.meterPeak));
     }
 
