@@ -179,6 +179,15 @@ inline QColor hoverOf(const QColor& c)
     return nudge(c, toLab(c).l > 62.0 ? -7.0 : 8.0);
 }
 
+// CIE76 distance. Coarse, but the question here is only ever "would a user
+// call these two the same colour", and for that it is enough.
+inline double deltaE(const QColor& a, const QColor& b)
+{
+    const Lab x = toLab(a), y = toLab(b);
+    return std::sqrt((x.l - y.l) * (x.l - y.l) + (x.a - y.a) * (x.a - y.a)
+                   + (x.b - y.b) * (x.b - y.b));
+}
+
 // A colour blended toward another by t (0..1), in Lab. Used for ghosted rungs
 // and disabled ink, where alpha compositing over an unknown parent is wrong.
 inline QColor mix(const QColor& a, const QColor& b, double t)

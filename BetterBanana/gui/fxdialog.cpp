@@ -386,6 +386,7 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
     const QScreen* s = QGuiApplication::primaryScreen();
     const int avail = s ? s->availableGeometry().height() : 700;
     resize(bbui::px(720), std::min(bbui::px(880), avail - bbui::px(80)));
+    bbdlg::rememberGeometry(this, "fx");   // last, so a remembered size wins
 }
 
 void VoiceFxDialog::pull()

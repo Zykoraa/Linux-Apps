@@ -431,6 +431,8 @@ VoiceCalibDialog::VoiceCalibDialog(Shared* shm, int strip, const QString& device
 
     restage(m_device.isEmpty() ? "This strip has no capture device assigned."
                                : "Recording from " + m_device, false);
+    // A missing capture device is the one thing that stops this dialog working.
+    if (m_device.isEmpty()) say("This strip has no capture device assigned.", true);
 
     // Apply is what the dialog is for; playback is a rehearsal. Return used to
     // replay the last take instead of committing it.
@@ -468,9 +470,22 @@ VoiceCalibDialog::~VoiceCalibDialog()
 // is a take, and whether a pitch came out of it. Step 3 opens on the take
 // rather than on the measurement, because hearing what was captured is exactly
 // what diagnoses a measurement that failed.
+// Every message used to share role="value", the accent colour - so "Could not
+// start pw-play." was painted in the same green that says "Recording from ...".
+void VoiceCalibDialog::say(const QString& text, bool blocking)
+{
+    const char* want = blocking ? "alert" : "value";
+    if (m_status->property("role").toString() != QLatin1String(want)) {
+        m_status->setProperty("role", want);
+        m_status->style()->unpolish(m_status);
+        m_status->style()->polish(m_status);
+    }
+    m_status->setText(text);
+}
+
 void VoiceCalibDialog::restage(const QString& status, bool busy)
 {
-    m_status->setText(status);
+    say(status, false);
 
     const bool have     = !m_raw.isEmpty();
     const bool measured = m_measured > 0.0f;
@@ -531,7 +546,7 @@ void VoiceCalibDialog::startRecording()
     restage(QString("Recording... %1").arg(m_left), true);
     m_tick = new QTimer(this);
     connect(m_tick, &QTimer::timeout, this, [this] {
-        if (--m_left > 0) { m_status->setText(QString("Recording... %1").arg(m_left)); return; }
+        if (--m_left > 0) { say(QString("Recording... %1").arg(m_left), false); return; }
         m_tick->stop();
         finishRecording();
     });
@@ -600,8 +615,8 @@ void VoiceCalibDialog::retarget()
     m_pitch->setValue(std::clamp(st, -12.0f, 12.0f));
     m_updating = false;
     if (std::fabs(st) > 12.0f)
-        m_status->setText(QString("That target needs %1 semitones; the shifter "
-                                  "stops at 12.").arg(st, 0, 'f', 1));
+        say(QString("That target needs %1 semitones; the shifter stops at 12.")
+                .arg(st, 0, 'f', 1), true);
 }
 
 // Where the user will actually hear it: the device the first assigned physical
@@ -645,7 +660,7 @@ bool VoiceCalibDialog::play(const QVector<float>& samples)
 {
     const QString path = scratchDir() + "/preview.wav";
     if (!write_wav(path, samples, kRate)) {
-        m_status->setText("Could not write the preview file.");
+        say("Could not write the preview file.", true);
         return false;
     }
     QStringList args;
@@ -653,11 +668,10 @@ bool VoiceCalibDialog::play(const QVector<float>& samples)
     if (!sink.isEmpty()) args << ("--target=" + sink);
     args << path;
     if (!QProcess::startDetached("pw-play", args)) {
-        m_status->setText("Could not start pw-play.");
+        say("Could not start pw-play.", true);
         return false;
     }
-    m_status->setText(sink.isEmpty() ? "Playing to the default output."
-                                     : "Playing to " + sink);
+    say(sink.isEmpty() ? "Playing to the default output." : "Playing to " + sink, false);
     return true;
 }
 

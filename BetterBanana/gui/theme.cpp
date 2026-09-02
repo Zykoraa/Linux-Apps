@@ -118,6 +118,60 @@ static QColor deriveWell(const QColor& panel, bool dark)
 
 QColor onFill(const QColor& fill) { return bbcolor::onColor(fill); }
 
+// Five buses, five chips you can tell apart - without breaking "A is green,
+// B is blue", which is the thing the colours are for.
+//
+// All three A-chips used to be one colour and both B-chips another, so an
+// assign row said how many buses a strip fed but never which. Rotating the hue
+// per bus fixes that and costs the family: pushed far enough apart to be
+// legible at 18px, Mocha's A3 came out orange, which says the wrong thing.
+//
+// So the family keeps its hue and the members differ in lightness, which the
+// eye separates readily and which cannot leave the family. The offsets are then
+// searched outward from those defaults, because a lightness step can walk a
+// chip into `mono` or `eqOn` sitting on the same card - Everforest's B1 landed
+// 2.6 dE from mono. tests/test_contrast.cpp holds both properties.
+QColor busChipColour(const Theme& t, int bus)
+{
+    constexpr int kChips = 5, kPhys = 3;      // A1..A3, B1..B2
+    bus = qBound(0, bus, kChips - 1);
+
+    const QColor roles[] = {
+        bbcolor::fitFill(t.mute, bbcolor::kTextFloor),
+        bbcolor::fitFill(t.solo, bbcolor::kTextFloor),
+        bbcolor::fitFill(t.mono, bbcolor::kTextFloor),
+        bbcolor::fitFill(t.eqOn, bbcolor::kTextFloor),
+        bbcolor::fitFill(t.rec,  bbcolor::kTextFloor),
+    };
+    static const double kStep[kChips] = { 0.0, 15.0, -15.0, 0.0, 16.0 };
+
+    auto make = [&](int b, double extra) {
+        const QColor base = b < kPhys ? t.busA : t.busB;
+        return bbcolor::fitFill(bbcolor::nudge(base, kStep[b] + extra),
+                                bbcolor::kTextFloor);
+    };
+
+    QColor chosen[kChips];
+    for (int b = 0; b <= bus; ++b) {
+        double bestScore = -1.0, bestExtra = 0.0;
+        bool done = false;
+        for (double mag = 0.0; mag <= 26.0 && !done; mag += 2.0) {
+            for (int sign : { 1, -1 }) {
+                if (mag == 0.0 && sign < 0) continue;
+                const double extra = mag * sign;
+                const QColor c = make(b, extra);
+                double worst = 1e9;
+                for (const QColor& r : roles) worst = qMin(worst, bbcolor::deltaE(c, r));
+                for (int o = 0; o < b; ++o) worst = qMin(worst, bbcolor::deltaE(c, chosen[o]));
+                if (worst > bestScore) { bestScore = worst; bestExtra = extra; }
+                if (worst >= 12.0) { done = true; break; }
+            }
+        }
+        chosen[b] = make(b, bestExtra);
+    }
+    return chosen[bus];
+}
+
 QColor dimOn(const Theme& t, const QColor& bg)
 {
     return bbcolor::ensureContrast(t.textDim, bg, bbcolor::kTextFloor);
@@ -308,14 +362,9 @@ QString buildStyleSheet(const Theme& t)
 
     // Five buses, five hues. All A-buses used to share one colour and all
     // B-buses another, so an assign row said how many buses a strip fed but
-    // never which. Small hue steps, so nothing collides with mono/eqOn.
+    // never which.
     for (int b = 0; b < 5; ++b) {
-        const QColor base = b < 3 ? t.busA : t.busB;
-        QColor h = base.toHsv();
-        const int shift = (b < 3 ? (b - 1) : (b - 3 == 0 ? -1 : 1)) * 16;
-        h = QColor::fromHsv((h.hue() < 0 ? 0 : (h.hue() + shift + 360) % 360),
-                            h.saturation(), h.value());
-        h = bbcolor::fitFill(h, bbcolor::kTextFloor);
+        QColor h = busChipColour(t, b);
         s += QString("QPushButton[bus=\"%1\"]:checked{background:%2;color:%3;"
                      "border-color:%2;}")
                 .arg(b).arg(c(h), c(onFill(h)));

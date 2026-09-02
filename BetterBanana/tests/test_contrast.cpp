@@ -11,6 +11,7 @@
 #include "../gui/theme.h"
 
 #include <QGuiApplication>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -115,6 +116,37 @@ int main(int argc, char** argv)
             chk(bbcolor::contrast(onFill(h), h) >= bbcolor::kTextFloor,
                 "hovered ink still clears 4.5:1",
                 n + ": " + pair("ink", onFill(h), "hover", h));
+        }
+    }
+
+    // --- bus chips do not collide with the roles beside them --------------
+    //
+    // Every one of these sits on the same strip card as MUTE, SOLO, MONO, EQ
+    // and FX. Two chips a user cannot tell apart is the same defect as all
+    // five A-buses sharing one colour, just harder to see coming.
+    for (const Theme& t : themes) {
+        struct Role { const char* name; QColor col; };
+        const Role beside[] = {
+            { "mute", t.mute }, { "solo", t.solo }, { "mono", t.mono },
+            { "eqOn", t.eqOn }, { "rec", t.rec },
+        };
+        for (int b = 0; b < 5; ++b) {
+            const QColor chip = busChipColour(t, b);
+            chk(bbcolor::contrast(onFill(chip), chip) >= bbcolor::kTextFloor,
+                "a lit bus chip and its ink clear 4.5:1",
+                t.name + QString(": bus%1 ").arg(b) + pair("ink", onFill(chip), "chip", chip));
+            for (const Role& r : beside)
+                chk(bbcolor::deltaE(chip, bbcolor::fitFill(r.col, bbcolor::kTextFloor)) >= 7.0,
+                    "a bus chip is distinguishable from the roles beside it",
+                    t.name + QString(": bus%1 %2 vs %3 dE=%4")
+                                 .arg(b).arg(chip.name(QColor::HexRgb), r.name)
+                                 .arg(bbcolor::deltaE(chip, bbcolor::fitFill(r.col, bbcolor::kTextFloor)),
+                                      0, 'f', 1));
+            for (int o = 0; o < b; ++o)
+                chk(bbcolor::deltaE(chip, busChipColour(t, o)) >= 8.0,
+                    "two bus chips are distinguishable from each other",
+                    t.name + QString(": bus%1 vs bus%2 dE=%3").arg(b).arg(o)
+                                 .arg(bbcolor::deltaE(chip, busChipColour(t, o)), 0, 'f', 1));
         }
     }
 

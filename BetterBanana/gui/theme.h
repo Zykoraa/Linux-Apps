@@ -60,6 +60,10 @@ QPalette              themePalette(const Theme& t);
 // Ink for a fill, and dim text lifted to clear its floor. Both derived rather
 // than written, so a palette cannot ship an unreadable pair. See gui/color.h.
 QColor                onFill(const QColor& fill);
+// The colour of one strip's bus-assign chip when lit. Five buses, five hues,
+// stepped away from busA/busB - and away from the role colours sitting on the
+// same card, which is what tests/test_contrast.cpp checks.
+QColor                busChipColour(const Theme& t, int bus);
 QColor                dimOn(const Theme& t, const QColor& bg);
 
 const QVector<Theme>& builtinThemes();

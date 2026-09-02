@@ -40,6 +40,10 @@ public:
 
     bool applied() const { return m_applied; }
 
+private:
+    // `blocking` picks the alert role: something the user must fix, not progress.
+    void say(const QString& text, bool blocking = false);
+
 private slots:
     void startRecording();
     void finishRecording();

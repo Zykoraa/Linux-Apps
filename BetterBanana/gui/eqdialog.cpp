@@ -1022,8 +1022,22 @@ EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
            std::min(bbui::px(880), avail.height() - 80));
     bbdlg::rememberGeometry(this, "eq");
 
-    // Three to one, restored from last time if the split was ever dragged.
-    m_split->setSizes({ height() * 3 / 4, height() / 4 });
+    // The table asks for what it needs; the plot gets the rest.
+    //
+    // A flat 3:1 of the dialog height left the band table 170px, which is 7.4
+    // of its twelve rows with the last one sliced through its own widgets - a
+    // table that cannot show twelve rows was the thing the splitter was added
+    // to fix. Ask the table how tall twelve rows are, cap it at half the
+    // dialog so the plot stays the larger half, and round to a whole row.
+    {
+        const int want = m_table->widget() ? m_table->widget()->sizeHint().height()
+                                              : height() / 4;
+        const int pitch = qMax(1, m_rows.isEmpty() ? 23 : m_rows.first().holder->sizeHint().height());
+        const int chrome = m_table->height() - m_table->viewport()->height();
+        int table = qBound(height() / 4, want + chrome, height() / 2);
+        table -= (table - chrome) % pitch;          // no half-drawn last row
+        m_split->setSizes({ height() - table, table });
+    }
     const QByteArray st = QSettings("betterbanana", "gui").value("eqsplit").toByteArray();
     if (!st.isEmpty()) m_split->restoreState(st);
 

@@ -2168,16 +2168,27 @@ void MainWindow::buildMenus()
         auto* zg = new QActionGroup(this);
         const int cur = QSettings("betterbanana", "gui").value("uiScale", 100).toInt();
         for (int pct : { 100, 125, 150, 175 }) {
-            QAction* a = zoom->addAction(QString::number(pct) + "%", this, [this, pct] {
-                QSettings("betterbanana", "gui").setValue("uiScale", pct);
+            QAction* a = zoom->addAction(QString::number(pct) + "%", this, [this, pct, zg] {
+                // Written only once the restart is agreed to. It used to be
+                // stored first, so answering No still resized the next launch
+                // and the radio button had already moved to say so.
                 if (QMessageBox::question(this, "BetterBanana",
-                        "Restart the mixer window to apply the new size?\n\n"
-                        "The audio engine keeps running, so nothing you hear stops.")
-                    == QMessageBox::Yes) {
-                    saveWindowGeometry();
-                    QProcess::startDetached(QApplication::applicationFilePath(), {});
-                    close();
+                        QString("Restart the mixer window at %1%?\n\n"
+                                "The audio engine keeps running, so nothing you "
+                                "hear stops.").arg(pct))
+                    != QMessageBox::Yes) {
+                    const int cur = QSettings("betterbanana", "gui")
+                                        .value("uiScale", 100).toInt();
+                    for (QAction* other : zg->actions())
+                        other->setChecked(other->text() == QString::number(cur) + "%");
+                    return;
                 }
+                QSettings("betterbanana", "gui").setValue("uiScale", pct);
+                saveWindowGeometry();
+                // Carry the flags forward, or --apps and friends are lost.
+                QProcess::startDetached(QApplication::applicationFilePath(),
+                                        QApplication::arguments().mid(1));
+                close();
             });
             a->setCheckable(true);
             a->setChecked(pct == cur);
