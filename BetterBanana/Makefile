@@ -25,7 +25,7 @@ QT_LD    := $(shell pkg-config --libs Qt6Widgets Qt6Network)
 SND_CF   := $(shell pkg-config --cflags sndfile)
 SND_LD   := $(shell pkg-config --libs sndfile)
 
-.PHONY: all engine gui ctl tests clean run install install-system check-deps dist
+.PHONY: all engine gui ctl tests check clean run install install-system check-deps dist
 
 all: engine gui ctl tests
 
@@ -154,6 +154,24 @@ install-system: engine gui ctl
 	  $(DESTDIR)$(PREFIX)/lib/systemd/user/betterbanana-engine.service
 	sed -i 's|^Exec=bb-gui$$|Exec=$(PREFIX)/bin/bb-gui|' \
 	  $(DESTDIR)$(PREFIX)/share/applications/betterbanana.desktop
+
+# Run every unit test and say plainly which one broke. The integration script
+# is deliberately not part of this: it needs a running engine and it moves the
+# caller's applications around for half a minute.
+UNIT := test_dsp test_eq test_fader test_pitch test_preset test_spectrum test_voicefx
+
+check: tests
+	@fail=0; \
+	for t in $(UNIT); do \
+	  printf '  %-14s ' "$$t"; \
+	  if ./$(BUILD)/$$t >/dev/null 2>&1; then echo ok; \
+	  else echo FAILED; fail=1; fi; \
+	done; \
+	if [ $$fail != 0 ]; then \
+	  echo; echo "Run the failing one directly to see the assertions."; exit 1; \
+	fi; \
+	echo; echo "All unit tests passed."; \
+	echo "./tests/integration.sh drives real audio through a running engine."
 
 run: engine
 	./$(BUILD)/bb-engine

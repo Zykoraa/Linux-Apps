@@ -556,6 +556,17 @@ That config is Lua-based, not hyprlang, so the binds use `hl.bind` and
 They call `bb-ctl ... toggle`, which flips the current value and prints the new
 one. Delete that file and its `require()` line in `hyprland.lua` to remove them.
 
+## DSP load
+
+The status bar and `bb-ctl status` show what fraction of its realtime deadline
+the mixer is actually using — 100% would mean it took exactly as long to compute
+a block as the block lasts, and anything near that drops out. It rises instantly
+and falls about 1.5% per block, so a brief spike stays visible long enough to
+read.
+
+Idle sits under 1%. A strip with the voice changer's formant shifting on costs
+roughly 2.5% on top, since that is the one part of the chain doing an FFT.
+
 ## Metering
 
 Each strip shows gain reduction the engine was already computing: a bar under
@@ -852,6 +863,8 @@ strip** (`s0`–`s4`), because they are the same kind of block:
 
 ## Tests
 
+    make check                # every unit test, naming whichever one broke
+
     ./build/test_dsp          # 30 DSP assertions, no audio server needed
     ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
@@ -860,6 +873,11 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
+
+`tests/integration.sh` needs a running engine and drives real audio through it,
+so it is deliberately not part of `make check`. It parks any application sitting
+on a BetterBanana sink for the duration and puts each one back on the sink it
+came from.
 
 `test_preset` checks that serialise → deserialise → serialise is byte-identical
 on a fully populated mixer. Undo is built out of those two functions, so a field

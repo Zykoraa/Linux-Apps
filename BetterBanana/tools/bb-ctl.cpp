@@ -333,8 +333,9 @@ int main(int argc, char** argv)
     const std::string cmd = argv[1];
 
     if (cmd == "status") {
-        std::printf("engine pid %d   heartbeat %u   rate %.0f\n\n",
-                    s->engine_pid.load(), s->engine_heartbeat.load(), s->samplerate.load());
+        std::printf("engine pid %d   heartbeat %u   rate %.0f   dsp load %.1f%%\n\n",
+                    s->engine_pid.load(), s->engine_heartbeat.load(),
+                    s->samplerate.load(), s->dsp_load.load() / 10.0);
         char hw[kHwStrips][kNameLen], out[kPhysBuses][kNameLen];
         uint32_t seq;
         for (int t = 0; t < 8 && !routing_read(s->routing, seq, hw, out); ++t) {}

@@ -394,6 +394,10 @@ void Engine::mix_chunk(uint32_t n)
 {
     if (n > kMaxChunk) n = kMaxChunk;
     Shared* s = shm;
+    // clock_gettime is a vDSO read, tens of nanoseconds, and this is per block
+    // rather than per sample - cheap enough to leave on always.
+    timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int b = 0; b < kBuses; ++b)
         std::memset(acc[b], 0, sizeof(float) * n * kChan);
@@ -611,6 +615,23 @@ void Engine::mix_chunk(uint32_t n)
         rec_ring.write(acc[src], n);
     }
     s->engine_heartbeat.fetch_add(1, std::memory_order_relaxed);
+
+    // Time spent as a fraction of the time this block represents: 1000 means
+    // the mixer took exactly as long as the audio it produced, and anything
+    // approaching that will drop out.
+    timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double spent = double(t1.tv_sec - t0.tv_sec)
+                       + 1e-9 * double(t1.tv_nsec - t0.tv_nsec);
+    const double budget = double(n) / double(sr);
+    if (budget > 0.0) {
+        const uint32_t pm = (uint32_t)(spent / budget * 1000.0);
+        const uint32_t prev = s->dsp_load.load(std::memory_order_relaxed);
+        // Rise instantly, fall about 1.5% a block, so a brief spike is visible
+        // for a moment rather than for a frame.
+        s->dsp_load.store(pm > prev ? pm : (prev * 63) / 64,
+                          std::memory_order_relaxed);
+    }
 }
 
 // Runs the mixer until `r` holds at least n frames. Every output endpoint

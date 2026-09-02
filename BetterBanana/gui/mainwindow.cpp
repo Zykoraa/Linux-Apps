@@ -1948,7 +1948,10 @@ void MainWindow::tick()
     m_lastHeartbeat = hb;
     const bool live = m_stallTicks < 30;
     m_status->setText(live
-        ? QString("engine %1  ·  %2 Hz").arg(m_shm->engine_pid.load()).arg(m_shm->samplerate.load())
+        ? QString("engine %1  ·  %2 Hz  ·  dsp %3%")
+              .arg(m_shm->engine_pid.load())
+              .arg(m_shm->samplerate.load())
+              .arg(m_shm->dsp_load.load() / 10.0, 0, 'f', 1)
         : QString("engine not responding"));
     m_status->setStyleSheet(live ? QString("color:%1;").arg(theme().busA.name())
                                  : QString("color:%1;").arg(theme().mute.name()));

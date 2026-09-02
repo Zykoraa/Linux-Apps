@@ -274,7 +274,12 @@ struct Shared {
     ai  engine_pid;
     af  samplerate;
     au  quantum;
-    au  xruns;
+    // How much of its realtime deadline the mixer is actually using, in tenths
+    // of a percent, as a decaying peak. This used to be an `xruns` counter that
+    // nothing ever incremented - a gauge permanently reading zero is worse than
+    // no gauge, and now that a strip can switch on an FFT this is the number
+    // that says whether there is room for it.
+    au  dsp_load;
     au  engine_heartbeat;         // engine bumps every graph cycle
 
     StripParams strip[kStrips];
@@ -345,7 +350,7 @@ inline void set_defaults(Shared* s)
     s->struct_size.store((uint32_t)sizeof(Shared));
     s->samplerate.store(48000.0f);
     s->quantum.store(1024);
-    s->xruns.store(0);
+    s->dsp_load.store(0);
 
     for (int i = 0; i < kStrips; ++i) {
         StripParams& p = s->strip[i];
