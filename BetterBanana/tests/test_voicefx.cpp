@@ -1,6 +1,7 @@
 // The voice changer. The pitch shifter is checked by measuring what comes out
 // with the analyser's own FFT rather than by trusting the arithmetic.
 #include "../engine/voicefx.h"
+#include "../engine/formant.h"
 #include "../engine/spectrum.h"
 
 #include <cmath>
@@ -60,6 +61,50 @@ static std::vector<float> run(F&& step, double freq, double sr, int warm, int ke
         const float x = (float)std::sin(2.0 * M_PI * freq * i / sr);
         const float y = step(x);
         if (i >= warm) out.push_back(y);
+    }
+    return out;
+}
+
+// A vowel: harmonics of f0 under two formant bumps.
+static double vowel_envelope(double f)
+{
+    auto bump = [&](double c, double w) {
+        const double t = std::log(f / c) / w;
+        return std::exp(-0.5 * t * t);
+    };
+    return bump(700.0, 0.28) + 0.7 * bump(1800.0, 0.22) + 0.02;
+}
+
+// Magnitude-weighted mean of the harmonic amplitudes: a continuous read on
+// where the envelope sits, rather than one quantised to the harmonic spacing.
+static double harmonic_centroid(const float* x, int n, double f0, double sr)
+{
+    std::vector<float> re(x, x + n), im(n, 0.0f);
+    for (int i = 0; i < n; ++i)
+        re[i] *= 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / (n - 1)));
+    fft(re.data(), im.data(), n);
+    double num = 0.0, den = 0.0;
+    for (int h = 1; h * f0 < 4000.0; ++h) {
+        const int k = (int)std::lround(h * f0 * n / sr);
+        const double m = std::hypot(re[k], im[k]);
+        num += h * f0 * m; den += m;
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
+// Runs a vowel through a formant shift and returns the tail of the output.
+static std::vector<float> shifted_vowel(float semitones, double f0, double sr)
+{
+    FormantShifter fs;
+    fs.configure();
+    fs.set_shift(semitones);
+    std::vector<float> out;
+    for (int i = 0; i < 40000; ++i) {
+        double v = 0.0;
+        for (int h = 1; h * f0 <= 12000.0; ++h)
+            v += vowel_envelope(h * f0) * std::sin(2.0 * M_PI * h * f0 * i / sr);
+        const float y = fs.process(float(v * 0.15));
+        if (i >= 24000) out.push_back(y);
     }
     return out;
 }
@@ -200,6 +245,55 @@ int main()
         }
         near(dominant_hz(out.data(), 8192, SR), 880.0, 20.0,
              "the rack shifts pitch when the block asks for it");
+    }
+
+    // --- formant shifter ----------------------------------------------------
+    {
+        FormantShifter fs;
+        fs.configure();
+        fs.set_shift(0.0f);
+        bool same = true;
+        for (int i = 0; i < 4096; ++i) {
+            const float x = (float)std::sin(2.0 * M_PI * 300.0 * i / SR);
+            if (fs.process(x) != x) { same = false; break; }
+        }
+        chk(same, "formant: zero shift is bit-identical");
+    }
+    {
+        const double f0 = 120.0;
+        const double flat = harmonic_centroid(shifted_vowel(0.0f, f0, SR).data(), 8192, f0, SR);
+        struct Case { float st; };
+        for (float st : { 3.0f, 6.0f, -3.0f }) {
+            auto out = shifted_vowel(st, f0, SR);
+            const double got = harmonic_centroid(out.data(), 8192, f0, SR);
+            const double want = std::pow(2.0, st / 12.0);
+            char msg[110];
+            std::snprintf(msg, sizeof(msg),
+                          "formant: %+.0f st moves the envelope by %.2fx (got %.2fx)",
+                          st, want, got / flat);
+            near(got / flat, want, 0.12, msg);
+        }
+    }
+    {
+        // The whole point: the envelope moves and the harmonics do not. A comb
+        // still standing well clear of the gaps between its teeth is what says
+        // the pitch was left alone.
+        const double f0 = 120.0;
+        auto out = shifted_vowel(4.0f, f0, SR);
+        std::vector<float> re(out.begin(), out.begin() + 8192), im(8192, 0.0f);
+        for (int i = 0; i < 8192; ++i)
+            re[i] *= 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / 8191));
+        fft(re.data(), im.data(), 8192);
+        auto mag = [&](double hz) {
+            const int k = (int)std::lround(hz * 8192 / SR);
+            return std::hypot(re[k], im[k]);
+        };
+        chk(mag(720.0) > 50.0 * mag(780.0), "formant: the harmonic comb survives at 720 Hz");
+        chk(mag(960.0) > 50.0 * mag(1020.0), "formant: and at 960 Hz");
+
+        float peak = 0.0f;
+        for (float v : out) peak = std::max(peak, std::fabs(v));
+        chk(peak > 0.05f && peak < 2.0f, "formant: level stays sane");
     }
 
     std::printf("%d/%d checks passed\n", g_total - g_fail, g_total);

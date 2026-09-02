@@ -90,6 +90,7 @@ static void usage()
       "  strip <i> fx on|off|show\n"
       "  strip <i> fx preset <name>       voice changer preset (bb-ctl fx list)\n"
       "  strip <i> fx pitch <semitones>   -12 .. +12, 0 is off\n"
+      "  strip <i> fx formant <st>|off    move formants independently of pitch\n"
       "  strip <i> fx drive <0..10> | gain <dB>\n"
       "  strip <i> fx ring <Hz> <mix>     ring modulator, 0 Hz is off\n"
       "  strip <i> fx crush <bits> <n>    bit depth (0 off), sample-hold (1 off)\n"
@@ -153,11 +154,14 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
     else if (w == "off") { p.on.store(0); return true; }
     else if (w == "show") {
         const int idx = fx_preset_index(v);
-        std::printf("on %d  preset %s\n  pitch %.2f st  drive %.2f  gain %.2f dB\n"
+        std::printf("on %d  preset %s\n  pitch %.2f st  formant %s  drive %.2f  gain %.2f dB\n"
                     "  ring %.1f Hz mix %.2f\n  crush %d bits, downsample %d\n"
                     "  echo %.0f ms fb %.2f mix %.2f\n  chorus %.2f ms %.2f Hz mix %.2f\n",
                     p.on.load(), idx >= 0 ? fx_presets()[idx].name : "(custom)",
-                    v.pitch, v.drive, v.gain_db, v.ring_hz, v.ring_mix,
+                    v.pitch,
+                    v.formant_on ? (std::to_string(v.formant) + " st").c_str()
+                                 : "follows pitch",
+                    v.drive, v.gain_db, v.ring_hz, v.ring_mix,
                     v.bits, v.downsample, v.echo_ms, v.echo_fb, v.echo_mix,
                     v.chorus_ms, v.chorus_hz, v.chorus_mix);
         return true;
@@ -174,6 +178,11 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
         return true;
     }
     else if (w == "pitch")  { if (!need(1)) return false; v.pitch = atof(argv[5]); }
+    else if (w == "formant") {
+        if (!need(1)) return false;
+        if (std::string(argv[5]) == "off") { v.formant_on = false; v.formant = 0.0f; }
+        else { v.formant_on = true; v.formant = atof(argv[5]); }
+    }
     else if (w == "drive")  { if (!need(1)) return false; v.drive = atof(argv[5]); }
     else if (w == "gain")   { if (!need(1)) return false; v.gain_db = atof(argv[5]); }
     else if (w == "ring")   { if (!need(2)) return false; v.ring_hz = atof(argv[5]); v.ring_mix = atof(argv[6]); }

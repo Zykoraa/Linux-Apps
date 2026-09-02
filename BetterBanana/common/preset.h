@@ -21,12 +21,13 @@
 
 namespace bb {
 
-// 4 added the per-strip voice changer. 3 added the per-strip parametric EQ,
+// 5 added independent formant control to the voice changer. 4 added the voice
+// changer itself. 3 added the per-strip parametric EQ,
 // and the two strip fields (mono-source fold, limiter ceiling) that had never
 // been written. 2 added the per-band filter type / bypass flag and the bus EQ
 // preamp. All still load: every field a file omits is reset to its default
 // rather than left over from whatever was loaded before.
-constexpr int kPresetVersion = 4;
+constexpr int kPresetVersion = 5;
 
 inline std::string preset_dir()
 {
@@ -127,6 +128,7 @@ inline void write_fx(std::string& out, const std::string& kp, const VoiceFx& p)
 {
     addf(out, "%son %d\n",          kp.c_str(), p.on.load());
     addf(out, "%spitch %.3f\n",     kp.c_str(), p.pitch.load());
+    addf(out, "%sformant %d %.3f\n", kp.c_str(), p.formant_on.load(), p.formant.load());
     addf(out, "%sdrive %.3f\n",     kp.c_str(), p.drive.load());
     addf(out, "%sring %.3f %.4f\n", kp.c_str(), p.ring_hz.load(), p.ring_mix.load());
     addf(out, "%scrush %d %d\n",    kp.c_str(), p.bits.load(), p.downsample.load());
@@ -144,6 +146,10 @@ inline bool read_fx(VoiceFx& p, const char* what, const char* val)
     int   ia = 0, ib = 0;
     if      (!std::strcmp(what, "on"))    p.on.store(atoi(val) ? 1 : 0);
     else if (!std::strcmp(what, "pitch")) p.pitch.store(atof(val));
+    else if (!std::strcmp(what, "formant")) {
+        if (sscanf(val, "%d %f", &ia, &a) != 2) return false;
+        p.formant_on.store(ia ? 1 : 0); p.formant.store(a);
+    }
     else if (!std::strcmp(what, "drive")) p.drive.store(atof(val));
     else if (!std::strcmp(what, "gain"))  p.gain_db.store(atof(val));
     else if (!std::strcmp(what, "ring")) {

@@ -68,6 +68,8 @@ static void scramble(Shared* s)
         }
         p.fx.on.store(i != 2);
         p.fx.pitch.store(-3.0f + 2.0f * i);
+        p.fx.formant_on.store(i % 2);
+        p.fx.formant.store(1.5f - 0.8f * i);
         p.fx.drive.store(0.5f * i);
         p.fx.ring_hz.store(40.0f + 13.0f * i);
         p.fx.ring_mix.store(0.1f * i);
@@ -179,6 +181,9 @@ int main()
     chk(blank->strip[1].mono_source.load() == 1, "mono-source fold round trips");
     near(blank->strip[4].limit_db.load(), 2.0, 1e-3, "limiter ceiling round trips");
     near(blank->strip[3].fx.pitch.load(), 3.0, 1e-3, "voice-changer pitch round trips");
+    near(blank->strip[3].fx.formant.load(), -0.9, 1e-3, "formant shift round trips");
+    chk(blank->strip[3].fx.formant_on.load() == 1, "and its enable flag");
+    chk(blank->strip[2].fx.formant_on.load() == 0, "including when it is off");
     near(blank->strip[4].fx.echo_ms.load(), 240.0, 1e-2, "echo time round trips");
     chk(blank->strip[2].fx.on.load() == 0, "a voice changer left off stays off");
     chk(blank->strip[3].fx.downsample.load() == 4, "the crusher's decimation round trips");

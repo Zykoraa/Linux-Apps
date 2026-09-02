@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 7;
+constexpr uint32_t kVersion    = 8;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -99,6 +99,12 @@ inline void eq_set_defaults(EqParams& p)
 struct VoiceFx {
     ai  on;                       // whole-block bypass
     af  pitch;                    // semitones, -12 .. +12; 0 bypasses
+    // Formants are what carry perceived body size. The pitch shifter is a
+    // resampler, so it drags them along with it - which is why a big shift
+    // sounds like a small person. Turn this on and they are controlled
+    // separately: `formant` is the NET shift, whatever pitch is doing.
+    ai  formant_on;
+    af  formant;                  // semitones, -12 .. +12
     af  drive;                    // 0 .. 10 waveshaper amount
     af  ring_hz;                  // ring modulator, 0 = off
     af  ring_mix;                 // 0 .. 1
@@ -117,6 +123,8 @@ inline void fx_set_defaults(VoiceFx& p)
 {
     p.on.store(0);
     p.pitch.store(0.0f);
+    p.formant_on.store(0);
+    p.formant.store(0.0f);
     p.drive.store(0.0f);
     p.ring_hz.store(0.0f);
     p.ring_mix.store(0.0f);

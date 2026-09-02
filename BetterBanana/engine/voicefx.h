@@ -6,6 +6,7 @@
 #pragma once
 
 #include "dsp.h"
+#include "formant.h"
 #include "../common/protocol.h"
 
 #include <cmath>
@@ -237,7 +238,8 @@ inline float drive_shape(float x, float k)
 // update() off the shm block, and a per-sample process().
 // ---------------------------------------------------------------------------
 struct VoiceFxChain {
-    PitchShifter pitch[kChan];
+    PitchShifter   pitch[kChan];
+    FormantShifter formant[kChan];
     RingMod      ring[kChan];
     Crusher      crush[kChan];
     Chorus       chorus[kChan];
@@ -246,7 +248,8 @@ struct VoiceFxChain {
     float        drive_k = 1.0f;
     bool         drive_on = false;
 
-    float c_pitch = 1e9f, c_drive = -1.0f;
+    float c_pitch = 1e9f, c_fmt = 1e9f, c_drive = -1.0f;
+    int   c_fmt_on = -1;
     float c_rhz = -1.0f, c_rmix = -1.0f;
     int   c_bits = -1, c_down = -1;
     float c_ems = -1.0f, c_efb = -1.0f, c_emix = -1.0f;
@@ -259,12 +262,15 @@ struct VoiceFxChain {
             out[c].configure(sr, 15.0f);
             out[c].snap(1.0f);
             pitch[c].reset();
+            formant[c].configure();
         }
     }
 
     void update(const VoiceFx& p, float sr)
     {
         const float st   = p.pitch.load(std::memory_order_relaxed);
+        const float fst  = p.formant.load(std::memory_order_relaxed);
+        const int   fon  = p.formant_on.load(std::memory_order_relaxed);
         const float dr   = p.drive.load(std::memory_order_relaxed);
         const float rhz  = p.ring_hz.load(std::memory_order_relaxed);
         const float rmix = p.ring_mix.load(std::memory_order_relaxed);
@@ -279,6 +285,13 @@ struct VoiceFxChain {
 
         for (int c = 0; c < kChan; ++c) {
             if (!init || st != c_pitch) pitch[c].set_semitones(st);
+            // The pitch stage has already moved the formants by its own ratio,
+            // so this stage only has to make up the difference. That is what
+            // lets the two controls read as absolutes: "pitch +6, formant +3"
+            // means exactly that, and leaving formant at 0 while pitching up
+            // pulls the formants back down to where they started.
+            if (!init || fst != c_fmt || st != c_pitch || fon != c_fmt_on)
+                formant[c].set_shift(fon ? fst - st : 0.0f);
             if (!init || rhz != c_rhz || rmix != c_rmix) ring[c].configure(sr, rhz, rmix);
             if (!init || bits != c_bits || down != c_down) {
                 crush[c].bits = bits;
@@ -294,7 +307,7 @@ struct VoiceFxChain {
             drive_on = dr > 0.01f;
             drive_k = 1.0f + clampf(dr, 0.0f, 10.0f) * 1.5f;
         }
-        c_pitch = st; c_drive = dr;
+        c_pitch = st; c_fmt = fst; c_fmt_on = fon; c_drive = dr;
         c_rhz = rhz; c_rmix = rmix;
         c_bits = bits; c_down = down;
         c_ems = ems; c_efb = efb; c_emix = emix;
@@ -305,6 +318,7 @@ struct VoiceFxChain {
     inline float process(int c, float x)
     {
         x = pitch[c].process(x);
+        x = formant[c].process(x);
         if (drive_on) x = drive_shape(x, drive_k);
         x = ring[c].process(x);
         x = crush[c].process(x);

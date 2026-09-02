@@ -83,20 +83,43 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
     bar->addWidget(m_preset, 1);
     root->addLayout(bar);
 
-    // --- pitch, on its own: it is the reason the dialog exists --------------
-    auto* pitchBox = new QGroupBox("PITCH");
+    // --- the voice itself: pitch and formants, the reason this dialog exists -
+    auto* pitchBox = new QGroupBox("VOICE");
     auto* pg = new QGridLayout(pitchBox);
-    m_pitch = addKnob(pg, 0, 0, "SEMITONES", -120, 120, 0.1, 1, " st", true);
-    m_pitch->setToolTip("Zero is a true bypass. Around ±5 sounds like a "
-                        "different person;\n±12 is an octave and obviously "
-                        "an effect.");
+    m_pitch = addKnob(pg, 0, 0, "PITCH", -120, 120, 0.1, 1, " st", true);
+    m_pitch->setToolTip("Zero is a true bypass.");
+
+    m_formant = addKnob(pg, 0, 1, "FORMANT", -120, 120, 0.1, 1, " st", true);
+    m_formant->setToolTip("Where your vocal tract resonates - what a listener "
+                          "hears as body size.\nThis is the NET shift: it already "
+                          "accounts for what pitch is doing.");
+
+    m_fmtOn = new QPushButton("SEPARATE");
+    m_fmtOn->setCheckable(true);
+    m_fmtOn->setFixedHeight(20);
+    m_fmtOn->setProperty("role", "eq");
+    m_fmtOn->setToolTip("Off: formants ride along with pitch - a chipmunk, a "
+                        "giant.\nOn: they move on their own, which is what makes "
+                        "a voice sound\nlike a different person rather than a "
+                        "different size.");
+    connect(m_fmtOn, &QPushButton::toggled, this, [this](bool b) {
+        if (m_updating) return;
+        m_shm->strip[m_strip].fx.formant_on.store(b ? 1 : 0);
+        m_formant->setEnabled(b);
+        refreshPresetCombo();
+    });
+    pg->addWidget(m_fmtOn, 2, 1);
+
     auto* pn = new QLabel(
-        "A delay-line shifter: about 20 ms of added delay, and a faint warble "
-        "on speech.\nHarmless to listeners, but do not monitor yourself through "
-        "it - use your\ninterface's direct monitoring instead.");
+        "Pitch alone is tape speed: it moves the formants too, so a big shift "
+        "sounds like a\nsmaller person rather than a different one. Turn on "
+        "SEPARATE and set both.\n\n"
+        "Costs about 20 ms of delay, and another 20 with SEPARATE on. Your "
+        "listeners will\nnot notice; you will, so monitor through your "
+        "interface rather than through this.");
     pn->setProperty("role", "caption");
-    pg->addWidget(pn, 0, 1, 2, 1);
-    pg->setColumnStretch(1, 1);
+    pg->addWidget(pn, 0, 2, 3, 1);
+    pg->setColumnStretch(2, 1);
     root->addWidget(pitchBox);
 
     // --- character ---------------------------------------------------------
@@ -156,6 +179,10 @@ void VoiceFxDialog::pull()
     const VoiceFx& p = m_shm->strip[m_strip].fx;
     m_on->setChecked(p.on.load() != 0);
     m_pitch->setValue(int(std::lround(p.pitch.load() * 10)));
+    m_formant->setValue(int(std::lround(p.formant.load() * 10)));
+    const bool fon = p.formant_on.load() != 0;
+    m_fmtOn->setChecked(fon);
+    m_formant->setEnabled(fon);
     m_drive->setValue(int(std::lround(p.drive.load() * 10)));
     m_ringHz->setValue(int(std::lround(p.ring_hz.load())));
     m_ringMix->setValue(int(std::lround(p.ring_mix.load() * 100)));
@@ -176,6 +203,8 @@ void VoiceFxDialog::push()
 {
     FxValues v;
     v.pitch      = m_pitch->value() / 10.0f;
+    v.formant_on = m_fmtOn->isChecked();
+    v.formant    = m_formant->value() / 10.0f;
     v.drive      = m_drive->value() / 10.0f;
     v.ring_hz    = float(m_ringHz->value());
     v.ring_mix   = m_ringMix->value() / 100.0f;

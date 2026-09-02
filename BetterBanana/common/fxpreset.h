@@ -17,6 +17,8 @@ namespace bb {
 
 struct FxValues {
     float pitch      = 0.0f;    // semitones
+    bool  formant_on = false;
+    float formant    = 0.0f;    // net semitones, when formant_on
     float drive      = 0.0f;    // 0 .. 10
     float ring_hz    = 0.0f;
     float ring_mix   = 0.0f;
@@ -35,6 +37,8 @@ inline void fx_apply(VoiceFx& p, const FxValues& v)
 {
     auto cl = [](float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); };
     p.pitch.store(cl(v.pitch, -12.0f, 12.0f));
+    p.formant_on.store(v.formant_on ? 1 : 0);
+    p.formant.store(cl(v.formant, -12.0f, 12.0f));
     p.drive.store(cl(v.drive, 0.0f, 10.0f));
     p.ring_hz.store(cl(v.ring_hz, 0.0f, 2000.0f));
     p.ring_mix.store(cl(v.ring_mix, 0.0f, 1.0f));
@@ -53,6 +57,8 @@ inline FxValues fx_capture(const VoiceFx& p)
 {
     FxValues v;
     v.pitch      = p.pitch.load();
+    v.formant_on = p.formant_on.load() != 0;
+    v.formant    = p.formant.load();
     v.drive      = p.drive.load();
     v.ring_hz    = p.ring_hz.load();
     v.ring_mix   = p.ring_mix.load();
@@ -73,23 +79,38 @@ struct FxPreset {
     FxValues    v;
 };
 
-// Somewhere to start from. Every one of these is reachable by hand from the
-// controls; they exist so the first thing you do is not stare at twelve knobs.
+// Somewhere to start from. Every one of these is reachable by hand; they exist
+// so the first thing you do is not stare at fourteen knobs.
+//
+// The first group shifts formants independently, which is what makes a voice
+// read as a different person rather than a different size. The second group
+// deliberately does NOT - letting the formants ride along with the pitch is
+// exactly what makes a chipmunk sound like a chipmunk.
 inline const std::vector<FxPreset>& fx_presets()
 {
-    // pitch drive ring_hz ring_mix bits down echo_ms echo_fb echo_mix
-    //   chorus_ms chorus_hz chorus_mix gain
     static const std::vector<FxPreset> kPresets = {
-        { "Off",       {   0, 0,   0,    0,   0, 1,   0,    0,    0,    0,    0,    0,   0 } },
-        { "Chipmunk",  {  +7, 0,   0,    0,   0, 1,   0,    0,    0,    0,    0,    0,  -1 } },
-        { "Squeaky",   { +12, 0,   0,    0,   0, 1,   0,    0,    0,    0,    0,    0,  -1 } },
-        { "Deep",      {  -5, 0,   0,    0,   0, 1,   0,    0,    0,    0,    0,    0,   0 } },
-        { "Demon",     {  -9, 3,   0,    0,   0, 1,  90, 0.25f, 0.30f,  0,    0,    0,  -2 } },
-        { "Robot",     {   0, 0,  60, 0.85f,  8, 1,   0,    0,    0,    0,    0,    0,  -1 } },
-        { "Alien",     {  +4, 0, 180, 0.50f,  0, 1,   0,    0,    0,    6, 0.6f, 0.50f, -1 } },
-        { "Lo-fi",     {   0, 2,   0,    0,   6, 3,   0,    0,    0,    0,    0,    0,  -1 } },
-        { "Cave",      {   0, 0,   0,    0,   0, 1, 160, 0.45f, 0.40f,  0,    0,    0,  -2 } },
-        { "Detuned",   {   0, 0,   0,    0,   0, 1,   0,    0,    0,    8, 0.35f,0.60f,  0 } },
+        { "Off",       {} },
+
+        { "Feminine",  { .pitch = 6.0f,  .formant_on = true, .formant = 3.0f,
+                         .gain_db = -1.0f } },
+        { "Masculine", { .pitch = -5.0f, .formant_on = true, .formant = -2.5f } },
+        { "Higher",    { .pitch = 3.0f,  .formant_on = true, .formant = 1.5f } },
+        { "Deeper",    { .pitch = -3.0f, .formant_on = true, .formant = -1.5f } },
+
+        { "Chipmunk",  { .pitch = 7.0f,  .gain_db = -1.0f } },
+        { "Squeaky",   { .pitch = 12.0f, .gain_db = -1.0f } },
+        { "Deep",      { .pitch = -5.0f } },
+        { "Demon",     { .pitch = -9.0f, .drive = 3.0f, .echo_ms = 90.0f,
+                         .echo_fb = 0.25f, .echo_mix = 0.30f, .gain_db = -2.0f } },
+        { "Robot",     { .ring_hz = 60.0f, .ring_mix = 0.85f, .bits = 8,
+                         .gain_db = -1.0f } },
+        { "Alien",     { .pitch = 4.0f, .ring_hz = 180.0f, .ring_mix = 0.50f,
+                         .chorus_ms = 6.0f, .chorus_hz = 0.6f, .chorus_mix = 0.50f,
+                         .gain_db = -1.0f } },
+        { "Lo-fi",     { .drive = 2.0f, .bits = 6, .downsample = 3, .gain_db = -1.0f } },
+        { "Cave",      { .echo_ms = 160.0f, .echo_fb = 0.45f, .echo_mix = 0.40f,
+                         .gain_db = -2.0f } },
+        { "Detuned",   { .chorus_ms = 8.0f, .chorus_hz = 0.35f, .chorus_mix = 0.60f } },
     };
     return kPresets;
 }
@@ -109,7 +130,9 @@ inline int fx_preset_index(const FxValues& v)
     const std::vector<FxPreset>& all = fx_presets();
     for (size_t i = 0; i < all.size(); ++i) {
         const FxValues& p = all[i].v;
-        if (same(v.pitch, p.pitch) && same(v.drive, p.drive)
+        if (same(v.pitch, p.pitch) && v.formant_on == p.formant_on
+            && (!v.formant_on || same(v.formant, p.formant))
+            && same(v.drive, p.drive)
             && same(v.ring_hz, p.ring_hz) && same(v.ring_mix, p.ring_mix)
             && v.bits == p.bits && v.downsample == p.downsample
             && same(v.echo_ms, p.echo_ms) && same(v.echo_fb, p.echo_fb)

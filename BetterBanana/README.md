@@ -17,8 +17,8 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 - Sidechain ducking: music steps back while you talk
 - 12-band parametric EQ on **every strip and every bus**: shelves, pass filters,
   preamp, draggable curve over a live spectrum analyser
-- Voice changer per input strip: pitch shift, drive, ring mod, bit crush,
-  chorus and echo, with presets
+- Voice changer per input strip: independent pitch **and formant** shifting,
+  drive, ring mod, bit crush, chorus and echo, with presets
 - Undo and redo across the whole mixer, however a change was made
 - Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
 - Headphone corrections for ~8850 models from the AutoEq database, searchable
@@ -282,6 +282,7 @@ rather than the artefacts coming out, and the fader still means level.
 | Control | What it does |
 |---|---|
 | **PITCH** | ±12 semitones. Zero is a true bypass. |
+| **FORMANT** + **SEPARATE** | ±12 semitones of vocal-tract resonance, moved independently of pitch |
 | **DRIVE** | tanh saturation, normalised so it changes shape rather than level |
 | **RING** / **RING MIX** | ring modulator — the robot voice. 0 Hz is off. |
 | **BITS** / **HOLD** | bit depth and sample-and-hold, separately |
@@ -289,9 +290,10 @@ rather than the artefacts coming out, and the fader still means level.
 | **ECHO** / **FEEDBACK** / **ECHO MIX** | up to 1 s |
 | **GAIN** | makeup, because most of the above change the level |
 
-Ten presets ship with it — Chipmunk, Squeaky, Deep, Demon, Robot, Alien, Lo-fi,
-Cave, Detuned and Off — and the combo drops to *(custom)* the moment you move a
-knob off one. Everything a preset does is reachable by hand; they exist so the
+Fourteen presets ship with it. **Feminine, Masculine, Higher** and **Deeper**
+move the formants separately; **Chipmunk, Squeaky, Deep, Demon, Robot, Alien,
+Lo-fi, Cave** and **Detuned** deliberately do not. The combo drops to
+*(custom)* the moment you move a knob off one. Everything a preset does is reachable by hand; they exist so the
 first thing you do is not stare at twelve knobs.
 
     bb-ctl fx list                          # what is available
@@ -305,6 +307,38 @@ first thing you do is not stare at twelve knobs.
 300 Hz and a low pass at 3.4 kHz on the strip's own EQ is the whole trick. No
 preset touches your EQ, because silently rewriting a curve you tuned would be a
 nasty surprise.
+
+### Sounding like a different person, not a different size
+
+Two things decide whether a voice reads as female or male, and they are
+independent:
+
+- **Pitch.** Typical adult male speech sits around 110–130 Hz, female around
+  190–220 Hz — six to nine semitones apart.
+- **Formants**, the resonances of your vocal tract. A shorter tract puts them
+  perhaps 15–20% higher. This is the one a listener hears as *body size*.
+
+The pitch shifter is a resampler with the duration patched up, so on its own it
+moves **both** — that is tape speed, and it is why a large shift sounds like a
+small person rather than a different one. Turn on **SEPARATE** and the FORMANT
+knob becomes the net formant shift, whatever pitch is doing: the stage behind it
+only has to make up the difference, so both numbers read as absolutes.
+
+Leaving FORMANT at 0 with SEPARATE on and PITCH up is therefore *not* a no-op —
+it pulls the formants back down to where they started, giving a high voice from
+an unchanged body.
+
+Formant shifting is a short-time Fourier transform: each frame's magnitude is
+split into a smooth envelope (the formants) and everything else (the harmonics,
+which carry pitch), the envelope is stretched along the frequency axis, and it
+is put back with the phase untouched. Not touching the phase is why it avoids
+the smeared quality a full phase vocoder has. It costs another ~20 ms of latency
+and about 4–5% of a core, and it runs only when SEPARATE is on.
+
+`tests/test_voicefx.cpp` checks the property that matters: after a shift the
+envelope has moved by the requested ratio, while the harmonic comb still stands
+50× clear of the gaps between its teeth — the envelope moved and the pitch did
+not.
 
 ### How the pitch shifter works, and what it costs
 
@@ -327,9 +361,9 @@ Two consequences worth knowing:
   period, which sounds hollow. `tests/test_voicefx.cpp` measures the result with
   the analyser's own FFT and checks the shifted tone is the dominant partial.
 
-Pitch is not formant-corrected, so a large shift sounds like tape speed rather
-than a different-sized person. Doing better means a phase vocoder with spectral
-envelope warping, or linking RubberBand — which is GPL, and this is MIT.
+RubberBand would do the pitch side better than this, but it is GPL and this is
+MIT; the formant stage above is what actually mattered, and it needed no
+dependency at all.
 
 ## Analysing a microphone
 
@@ -786,7 +820,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
-    ./build/test_voicefx      # 22 voice changer assertions, pitch measured by FFT
+    ./build/test_voicefx      # 29 voice changer assertions, measured by FFT
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
 
@@ -824,7 +858,8 @@ binaries refuse to talk instead of silently writing to the wrong offsets.
 Working and verified: virtual devices, routing matrix, per-strip gate /
 compressor / tone knobs / audibility / Intellipan / mono / solo / mute / fader,
 the 12-band parametric EQ on every strip and bus with profiles, AutoEq import
-and a live spectrum analyser, the per-strip voice changer, undo across the whole
+and a live spectrum analyser, the per-strip voice changer with independent
+pitch and formant shifting, undo across the whole
 mixer, per-bus mono / mute / fader, metering, hardware assignment, the tape deck,
 and VBAN send/receive.
 
