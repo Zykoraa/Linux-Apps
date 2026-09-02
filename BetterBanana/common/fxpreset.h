@@ -114,9 +114,10 @@ struct FxPreset {
 // the formants ride along with the pitch, because that is exactly what makes a
 // chipmunk sound like a chipmunk.
 //
-// No preset touches the strip's EQ. A telephone or radio voice is an EQ recipe
-// - high pass at 300 Hz, low pass at 3.4 kHz - and silently rewriting a curve
-// somebody tuned would be a nasty surprise.
+// No preset here touches the strip's EQ. The band-limited voices - telephone,
+// radio, megaphone, walkie-talkie - are EQ profiles instead, over in
+// eqprofile.h, because silently rewriting a curve somebody tuned would be a
+// nasty surprise.
 inline const std::vector<FxPreset>& fx_presets()
 {
     static const std::vector<FxPreset> kPresets = {

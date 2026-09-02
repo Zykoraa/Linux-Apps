@@ -229,9 +229,34 @@ shape and the parametric as the surgical one.
 ### EQ profiles
 
 The **PROFILE** row saves and recalls just the EQ, separately from mixer
-presets. Twelve built-ins ship with it — Bass Boost, Loudness, Vocal Clarity,
-Speech / Podcast, Gaming (footsteps), De-harsh, Warm, Small Speakers and the
-rest — each with a preamp that keeps it clipping-safe.
+presets. Sixteen built-ins ship with it, each with a preamp that keeps it
+clipping-safe.
+
+Most are for a **bus** — what you are listening on: Bass Boost, Loudness, Vocal
+Clarity, Speech / Podcast, Gaming (footsteps), De-harsh, Warm, Small Speakers
+and the rest.
+
+Four are for an **input strip** — what you sound like. A telephone, radio,
+megaphone or walkie-talkie voice is EQ rather than an effect: it is entirely a
+question of throwing away the bandwidth the real device never had, so it lives
+here rather than in the voice changer, where a preset would have to overwrite a
+curve you had tuned.
+
+| Preset | Band | Character |
+|---|---|---|
+| **Telephone** | 300 Hz – 3.4 kHz, steep both ends | the ITU phone band, plus the nasal honk at 1.8 kHz |
+| **Radio** | 180 Hz – 5 kHz | wider and fuller, but the edges still steep enough to stop sibilance walking through |
+| **Megaphone** | 500 Hz – 4 kHz | a resonant +8 dB at 1.6 kHz and a scooped 900 Hz |
+| **Walkie-Talkie** | 500 Hz – 2.8 kHz | narrower and harsher than the telephone |
+
+Measured through the running engine, Telephone drops 119 Hz by 35 dB and 8.9 kHz
+by 41 dB while leaving its passband alone; Radio is looser at both ends by
+design. `tests/test_eq.cpp` checks each one actually cuts outside its band and
+keeps what is inside it — being clipping-safe is not the same as sounding like
+a telephone.
+
+    bb-ctl eq load s0 Telephone      # onto hardware input 1
+    bb-ctl strip 0 eqon 1
 
 **Save as…** writes your own to `~/.config/betterbanana/eq/<name>.txt`, and
 **Import…** / **Export…** read and write the same files. That format *is*
@@ -954,7 +979,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     make check                # every unit test, naming whichever one broke
 
     ./build/test_dsp          # 30 DSP assertions, no audio server needed
-    ./build/test_eq           # 45 EQ profile / import / preset assertions
+    ./build/test_eq           # 61 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
     ./build/test_voicefx      # 54 voice changer assertions, measured by FFT

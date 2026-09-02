@@ -342,9 +342,9 @@ int main(int argc, char** argv)
             std::printf("    %s\n", f.name);
         }
         std::printf("\nApply one with:  bb-ctl strip <i> fx preset \"<name>\"\n"
-                    "A telephone or radio voice is an EQ recipe rather than an effect:\n"
-                    "  bb-ctl strip 0 band 0 0 300 0.7 hp\n"
-                    "  bb-ctl strip 0 band 1 0 3400 0.7 lp\n"
+                    "A telephone, radio, megaphone or walkie-talkie voice is EQ, "
+                    "not an effect:\n"
+                    "  bb-ctl eq load s0 Telephone    (also Radio, Megaphone, Walkie-Talkie)\n"
                     "  bb-ctl strip 0 eqon 1\n");
         return 0;
     }

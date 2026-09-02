@@ -251,8 +251,9 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
     m_gain = addKnob(og, 0, 0, "GAIN", -240, 240, 0.1, 1, " dB", true);
     m_gain->setToolTip("Makeup: most of these change the level as well as the sound.");
     auto* hint = new QLabel(
-        "For a telephone or radio voice, use this strip's EQ instead: a high "
-        "pass at 300 Hz\nand a low pass at 3.4 kHz is the whole trick.");
+        "A telephone, radio, megaphone or walkie-talkie voice is EQ rather than "
+        "an effect.\nOpen this strip's EQ and pick one from its profile list - "
+        "they live there so\nthat a preset here never rewrites a curve you tuned.");
     hint->setProperty("role", "caption");
     og->addWidget(hint, 0, 1, 2, 1);
     og->setColumnStretch(1, 1);

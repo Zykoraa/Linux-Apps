@@ -218,6 +218,37 @@ int main()
         delete s;
     }
 
+    // --- the voice-character presets actually band-limit --------------------
+    // Clipping-safety is asserted for every built-in above; these are about
+    // whether they sound like the thing they are named after, which is entirely
+    // a question of what they throw away.
+    {
+        struct Band { const char* name; double lo_hz; double lo_max;
+                      double mid_hz; double mid_min; double hi_hz; double hi_max; };
+        static const Band kBands[] = {
+            // preset          below     under    passband    over     above     under
+            { "Telephone",       100.0,  -25.0,     1000.0,   -8.0,     8000.0,  -25.0 },
+            { "Radio",            80.0,  -20.0,     1500.0,   -8.0,    10000.0,  -20.0 },
+            { "Megaphone",       200.0,  -25.0,     1600.0,   -8.0,     9000.0,  -20.0 },
+            { "Walkie-Talkie",   200.0,  -25.0,     1400.0,   -8.0,     7000.0,  -25.0 },
+        };
+        char msg[140];
+        for (const Band& b : kBands) {
+            EqProfile prof;
+            snprintf(msg, sizeof(msg), "%s is a built-in", b.name);
+            yes(eq_factory_profile(b.name, prof), msg);
+            snprintf(msg, sizeof(msg), "%s cuts %.0f Hz away (%.1f dB)",
+                     b.name, b.lo_hz, eq_response_db(prof, (float)b.lo_hz));
+            yes(eq_response_db(prof, (float)b.lo_hz) < b.lo_max, msg);
+            snprintf(msg, sizeof(msg), "%s keeps %.0f Hz (%.1f dB)",
+                     b.name, b.mid_hz, eq_response_db(prof, (float)b.mid_hz));
+            yes(eq_response_db(prof, (float)b.mid_hz) > b.mid_min, msg);
+            snprintf(msg, sizeof(msg), "%s cuts %.0f Hz away (%.1f dB)",
+                     b.name, b.hi_hz, eq_response_db(prof, (float)b.hi_hz));
+            yes(eq_response_db(prof, (float)b.hi_hz) < b.hi_max, msg);
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

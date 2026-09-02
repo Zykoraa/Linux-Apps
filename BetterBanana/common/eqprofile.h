@@ -437,6 +437,48 @@ inline const std::vector<EqFactoryPreset>& eq_factory_presets()
           "Filter 1: ON LSC Fc 200 Hz Gain 3.5 dB Q 0.70\n"
           "Filter 2: ON HSC Fc 8000 Hz Gain -2.5 dB Q 0.70\n" },
 
+        // --- voice characters, for an input strip rather than a bus ----------
+        // All of these work by throwing away the bandwidth a real device never
+        // had. A telephone is 300-3400 Hz because that is what the ITU decided
+        // a phone line carries, and the reason it sounds like a phone is the
+        // steepness of the edges as much as where they sit - hence two poles a
+        // side rather than one.
+        { "Telephone",
+          "Preamp: -3.4 dB\n"
+          "Filter 1: ON HPQ Fc 300 Hz Q 0.70\n"
+          "Filter 2: ON HPQ Fc 300 Hz Q 0.70\n"
+          "Filter 3: ON LPQ Fc 3400 Hz Q 0.70\n"
+          "Filter 4: ON LPQ Fc 3400 Hz Q 0.70\n"
+          "Filter 5: ON PK Fc 1800 Hz Gain 4.0 dB Q 1.20\n" },
+
+        // Wider than a telephone - 180 Hz to 5 kHz rather than 300 to 3400 - but
+        // the edges still have to be steep, or sibilance walks straight through
+        // and it stops sounding like a radio at all.
+        { "Radio",
+          "Preamp: -2.7 dB\n"
+          "Filter 1: ON HPQ Fc 180 Hz Q 0.70\n"
+          "Filter 2: ON HPQ Fc 180 Hz Q 0.70\n"
+          "Filter 3: ON LPQ Fc 5000 Hz Q 0.70\n"
+          "Filter 4: ON LPQ Fc 5000 Hz Q 0.70\n"
+          "Filter 5: ON LSC Fc 300 Hz Gain -2.0 dB Q 0.70\n"
+          "Filter 6: ON PK Fc 2200 Hz Gain 3.0 dB Q 1.00\n" },
+
+        { "Megaphone",
+          "Preamp: -7.1 dB\n"
+          "Filter 1: ON HPQ Fc 500 Hz Q 0.70\n"
+          "Filter 2: ON HPQ Fc 500 Hz Q 0.70\n"
+          "Filter 3: ON LPQ Fc 4000 Hz Q 0.70\n"
+          "Filter 4: ON PK Fc 1600 Hz Gain 8.0 dB Q 2.00\n"
+          "Filter 5: ON PK Fc 900 Hz Gain -3.0 dB Q 1.50\n" },
+
+        { "Walkie-Talkie",
+          "Preamp: -5.3 dB\n"
+          "Filter 1: ON HPQ Fc 500 Hz Q 0.70\n"
+          "Filter 2: ON HPQ Fc 500 Hz Q 0.70\n"
+          "Filter 3: ON LPQ Fc 2800 Hz Q 0.70\n"
+          "Filter 4: ON LPQ Fc 2800 Hz Q 0.70\n"
+          "Filter 5: ON PK Fc 1400 Hz Gain 6.0 dB Q 2.50\n" },
+
         { "Small Speakers",
           "Preamp: -3.2 dB\n"
           "Filter 1: ON HPQ Fc 120 Hz Q 0.70\n"
