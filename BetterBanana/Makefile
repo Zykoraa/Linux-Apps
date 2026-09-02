@@ -14,7 +14,8 @@ MOC ?= $(shell \
     [ -x "$$c" ] && echo "$$c" && exit 0; done; echo moc)
 BUILD    := build
 HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset.h \
-            engine/dsp.h engine/spectrum.h engine/voicefx.h
+            engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
+            engine/pitchtrack.h
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)
@@ -63,7 +64,8 @@ dist:
 engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
 tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
-        $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx
+        $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx \
+        $(BUILD)/test_pitch
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -94,6 +96,9 @@ $(BUILD)/test_spectrum: tests/test_spectrum.cpp $(HDRS) | $(BUILD)
 $(BUILD)/test_voicefx: tests/test_voicefx.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+$(BUILD)/test_pitch: tests/test_pitch.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 # GUI: moc the header that declares QObject subclasses, compile alongside.
 $(BUILD)/moc_mainwindow.cpp: gui/mainwindow.h | $(BUILD)
 	$(MOC) $< -o $@
@@ -107,16 +112,21 @@ $(BUILD)/moc_eqdialog.cpp: gui/eqdialog.h | $(BUILD)
 $(BUILD)/moc_fxdialog.cpp: gui/fxdialog.h | $(BUILD)
 	$(MOC) $< -o $@
 
+$(BUILD)/moc_calibdialog.cpp: gui/calibdialog.h | $(BUILD)
+	$(MOC) $< -o $@
+
 $(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
-                  gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+                  gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
                   $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
-                  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_knob.cpp \
-                  gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h $(HDRS) | $(BUILD)
+                  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp \
+                  $(BUILD)/moc_knob.cpp \
+                  gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
+                  $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
-	  gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp gui/widgets.cpp \
-	  gui/theme.cpp gui/knob.cpp \
+	  gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
+	  gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
 	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
-	  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_knob.cpp \
+	  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp $(BUILD)/moc_knob.cpp \
 	  -o $@ $(QT_LD) -lrt -lpthread
 
 $(BUILD):

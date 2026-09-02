@@ -2,6 +2,8 @@
 #include "knob.h"
 #include "theme.h"
 
+#include "calibdialog.h"
+
 #include "../common/fxpreset.h"
 
 #include <QComboBox>
@@ -81,6 +83,32 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
         m_note->setText(QString("applied \"%1\"").arg(fx_presets()[idx].name));
     });
     bar->addWidget(m_preset, 1);
+
+    m_calib = new QPushButton("Calibrate to my voice...");
+    m_calib->setToolTip("Record a few seconds, measure where your voice actually "
+                        "sits,\nand work the shift out from there. A preset has to "
+                        "guess.");
+    connect(m_calib, &QPushButton::clicked, this, [this] {
+        // The strip's own capture device, so the measurement is of the real
+        // voice rather than of whatever the mix happens to be doing to it.
+        QString dev;
+        if (m_strip < kHwStrips) {
+            char hw[kHwStrips][kNameLen], out[kPhysBuses][kNameLen];
+            uint32_t seq = 0;
+            for (int t = 0; t < 16; ++t)
+                if (routing_read(m_shm->routing, seq, hw, out)) {
+                    dev = QString::fromUtf8(hw[m_strip]);
+                    break;
+                }
+            if (dev.startsWith(kCablePrefix)) dev.clear();   // a cable is not a mic
+        }
+        VoiceCalibDialog dlg(m_shm, m_strip, dev, windowTitle().section(" - ", 0, 0), this);
+        if (dlg.exec() == QDialog::Accepted && dlg.applied()) {
+            pull();
+            m_note->setText("calibrated to your voice");
+        }
+    });
+    bar->addWidget(m_calib);
     root->addLayout(bar);
 
     // --- the voice itself: pitch and formants, the reason this dialog exists -

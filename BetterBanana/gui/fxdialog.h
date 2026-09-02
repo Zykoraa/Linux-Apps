@@ -38,6 +38,7 @@ private:
     QLabel*      m_note   = nullptr;
 
     QPushButton* m_fmtOn = nullptr;
+    QPushButton* m_calib = nullptr;
     Knob* m_pitch = nullptr;
     Knob* m_formant = nullptr;
     Knob* m_drive = nullptr;

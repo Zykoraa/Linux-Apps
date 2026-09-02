@@ -19,6 +19,8 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
   preamp, draggable curve over a live spectrum analyser
 - Voice changer per input strip: independent pitch **and formant** shifting,
   drive, ring mod, bit crush, chorus and echo, with presets
+- Calibrates itself to your voice: records you, measures your pitch, works out
+  the shift, and plays it back so you can judge it
 - Undo and redo across the whole mixer, however a change was made
 - Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
 - Headphone corrections for ~8850 models from the AutoEq database, searchable
@@ -339,6 +341,40 @@ and about 4–5% of a core, and it runs only when SEPARATE is on.
 envelope has moved by the requested ratio, while the harmonic comb still stands
 50× clear of the gaps between its teeth — the envelope moved and the pitch did
 not.
+
+### Calibrating it to your own voice
+
+**Calibrate to my voice…** in the voice changer records a few seconds, measures
+where your voice actually sits, and works the shift out from there. A preset
+cannot do this: lifting six semitones lands a 95 Hz voice at 134 Hz and a 140 Hz
+voice at 198 Hz — the same setting, two completely different results.
+
+1. Read the phrase aloud for eight seconds.
+2. It reports your median pitch, the range around it, and how much of the
+   recording was actually voiced.
+3. Set a **target** — adult female speech typically sits around 190–220 Hz — and
+   the pitch shift follows from it.
+4. **Play what I said** and **Play it shifted** run your own recording through
+   the real DSP, so you judge it by ear rather than by number. Adjust, replay.
+5. **Apply to this strip.**
+
+It is a measurement, not a model: it runs offline in a second, needs no network,
+no training and no GPU, and every number it picks is visible and editable
+afterwards. Nothing is recorded until you press the button, the recording never
+leaves the machine, and it is deleted when the dialog closes.
+
+Pitch is measured by normalised square difference (`engine/pitchtrack.h`),
+picking the lowest strong lag rather than the largest peak — the classic failure
+of autocorrelation on a voice is locking onto twice the true period and
+reporting an octave low. `tests/test_pitch.cpp` checks it against synthetic
+voices from 85 to 300 Hz and confirms it stays quiet on noise and silence.
+
+**Formants are the part you have to judge by ear.** Pitch measures reliably;
+picking formants off a live microphone does not, because the room and the mic
+colour the spectrum as much as the speaker does. So the wizard measures pitch,
+starts formants at a sensible +3 semitones, and expects you to try a semitone
+either side. That honesty is the reason the playback loop matters more than the
+cleverness of the analysis.
 
 ### How the pitch shifter works, and what it costs
 
@@ -821,6 +857,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
     ./build/test_voicefx      # 29 voice changer assertions, measured by FFT
+    ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
 
