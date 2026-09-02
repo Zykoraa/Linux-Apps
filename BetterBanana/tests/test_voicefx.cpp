@@ -358,6 +358,44 @@ int main()
         chk(peak > 0.05f && peak < 2.0f, "formant: level stays sane");
     }
 
+    // --- reverb -------------------------------------------------------------
+    {
+        Reverb r;
+        r.configure((float)SR, 0);
+        r.set(0.5f, 0.5f, 0.0f);
+        bool same = true;
+        for (int i = 0; i < 4096; ++i) {
+            const float x = 0.3f * (float)std::sin(i * 0.01);
+            if (r.process(x) != x) { same = false; break; }
+        }
+        chk(same, "reverb: a zero mix is a literal bypass");
+
+        // A bigger room rings for longer. Measured as the time the tail takes
+        // to fall 60 dB below its first moments.
+        auto rt60 = [&](float size) {
+            Reverb v;
+            v.configure((float)SR, 0);
+            v.set(size, 0.4f, 1.0f);
+            std::vector<float> y;
+            y.push_back(v.process(1.0f));
+            for (int i = 1; i < int(SR * 6); ++i) y.push_back(v.process(0.0f));
+            const int W = 2400;
+            double early = 0.0;
+            for (int i = 0; i < W; ++i) early += double(y[i]) * y[i];
+            early = std::sqrt(early / W);
+            for (int s = 0; s + W < (int)y.size(); s += W) {
+                double e = 0.0;
+                for (int i = 0; i < W; ++i) e += double(y[s + i]) * y[s + i];
+                if (std::sqrt(e / W) < early / 1000.0) return s / SR;
+            }
+            return 99.0;
+        };
+        const double small = rt60(0.2f), big = rt60(0.85f);
+        chk(small > 0.2 && small < 1.5, "reverb: a small room decays in well under a second");
+        chk(big > small * 2.0, "reverb: a large room rings much longer than a small one");
+        chk(big < 5.0, "reverb: and does not run away");
+    }
+
     std::printf("%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }

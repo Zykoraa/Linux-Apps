@@ -290,12 +290,25 @@ rather than the artefacts coming out, and the fader still means level.
 | **BITS** / **HOLD** | bit depth and sample-and-hold, separately |
 | **CHORUS** / **CH RATE** / **CH MIX** | modulated delay, for thickening or detune |
 | **ECHO** / **FEEDBACK** / **ECHO MIX** | up to 1 s |
+| **ROOM** / **DAMPING** / **REVERB** | a real reverb — about 0.7 s of tail at 20%, 2.6 s at 85% |
 | **GAIN** | makeup, because most of the above change the level |
 
-Fourteen presets ship with it. **Feminine, Masculine, Higher** and **Deeper**
-move the formants separately; **Chipmunk, Squeaky, Deep, Demon, Robot, Alien,
-Lo-fi, Cave** and **Detuned** deliberately do not. The combo drops to
-*(custom)* the moment you move a knob off one. Everything a preset does is reachable by hand; they exist so the
+Thirty presets ship with it, in four groups:
+
+- **Voice** — Feminine, Masculine, Higher, Deeper. These move the formants
+  separately, which is what changes *who* you sound like.
+- **Singing** — Vocal Room, Vocal Plate, Vocal Hall, Vocal Double, Slapback,
+  Warm Vocal, Big Choir. These are about sounding *good* rather than sounding
+  like someone else, and they are mostly reverb, because reverb is the effect
+  that does most of that work.
+- **Character** — Chipmunk, Squeaky, Deep, Demon, Robot, Alien, Lo-fi, Cave,
+  Detuned.
+- **Fun** — Helium, Giant, Monster, Vader, Ghost, Dalek, Drunk, Underwater,
+  Stadium, Broken Radio.
+
+Character and Fun deliberately let the formants ride along with the pitch —
+that is exactly what makes a chipmunk sound like a chipmunk. The combo drops to
+*(custom)* the moment you move a knob off a preset. Everything a preset does is reachable by hand; they exist so the
 first thing you do is not stare at twelve knobs.
 
     bb-ctl fx list                          # what is available
@@ -309,6 +322,22 @@ first thing you do is not stare at twelve knobs.
 300 Hz and a low pass at 3.4 kHz on the strip's own EQ is the whole trick. No
 preset touches your EQ, because silently rewriting a curve you tuned would be a
 nasty surprise.
+
+### The reverb
+
+Eight damped comb filters in parallel into four allpasses in series — the
+Schroeder/Freeverb arrangement, which is decades old, costs almost nothing, and
+is the reason a voice sounds like it is in a room rather than in a wire. The
+comb lengths are mutually prime so their echoes do not pile up into a ringing
+tone, and the damping is a one-pole lowpass *inside* each feedback loop, which
+is what makes the tail lose its highs the way a real room does.
+
+The right channel runs slightly longer delays than the left. That offset is the
+whole of the stereo image; without it both channels decay identically and the
+result collapses to the middle.
+
+Measured decay: **0.70 s at ROOM 20%, 1.05 s at 50%, 2.60 s at 85%.** A REVERB
+mix of 0 is a literal bypass, so it costs nothing when you are not using it.
 
 ### Sounding like a different person, not a different size
 
@@ -891,7 +920,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
-    ./build/test_voicefx      # 36 voice changer assertions, measured by FFT
+    ./build/test_voicefx      # 40 voice changer assertions, measured by FFT
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine

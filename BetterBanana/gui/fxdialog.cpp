@@ -51,7 +51,9 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
 
     root->addWidget(new QLabel(
         "Sits after this strip's EQ and before its fader, so the EQ cleans the "
-        "voice going in\nrather than the artefacts coming out."));
+        "voice going in\nrather than the artefacts coming out.  Presets are "
+        "grouped: VOICE changes who you sound\nlike, SINGING makes you sound "
+        "good, CHARACTER and FUN are effects."));
 
     // --- preset bar --------------------------------------------------------
     auto* bar = new QHBoxLayout;
@@ -69,8 +71,14 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
     m_preset = new QComboBox;
     m_preset->setMinimumWidth(160);
     m_preset->addItem("(custom)", -1);
-    for (int i = 0; i < (int)fx_presets().size(); ++i)
+    QString group;
+    for (int i = 0; i < (int)fx_presets().size(); ++i) {
+        if (group != fx_presets()[i].group) {
+            group = fx_presets()[i].group;
+            m_preset->insertSeparator(m_preset->count());
+        }
         m_preset->addItem(fx_presets()[i].name, i);
+    }
     connect(m_preset, &QComboBox::currentIndexChanged, this, [this] {
         if (m_updating) return;
         const int idx = m_preset->currentData().toInt();
@@ -172,6 +180,16 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
     m_echoMs = addKnob(sg, 0, 3, "ECHO",     0, 1000, 1.0, 0, " ms");
     m_echoFb = addKnob(sg, 0, 4, "FEEDBACK", 0, 95, 1.0, 0, " %");
     m_echoMix= addKnob(sg, 0, 5, "ECHO MIX", 0, 100, 1.0, 0, " %");
+    m_rvSize = addKnob(sg, 1, 0, "ROOM",     0, 100, 1.0, 0, " %");
+    m_rvDamp = addKnob(sg, 1, 1, "DAMPING",  0, 100, 1.0, 0, " %");
+    m_rvMix  = addKnob(sg, 1, 2, "REVERB",   0, 100, 1.0, 0, " %");
+    m_rvSize->setToolTip("How big the room is: about 0.7 s of tail at 20%, "
+                         "2.6 s at 85%.");
+    m_rvDamp->setToolTip("How fast the tail loses its highs, the way a room "
+                         "full of soft things does.");
+    m_rvMix->setToolTip("0% is off entirely. Reverb is the effect that does most "
+                        "of the work\nof making a voice sound good rather than "
+                        "sound like someone else.");
     root->addWidget(spaceBox);
 
     // --- output ------------------------------------------------------------
@@ -222,6 +240,9 @@ void VoiceFxDialog::pull()
     m_echoMs->setValue(int(std::lround(p.echo_ms.load())));
     m_echoFb->setValue(int(std::lround(p.echo_fb.load() * 100)));
     m_echoMix->setValue(int(std::lround(p.echo_mix.load() * 100)));
+    m_rvSize->setValue(int(std::lround(p.reverb_size.load() * 100)));
+    m_rvDamp->setValue(int(std::lround(p.reverb_damp.load() * 100)));
+    m_rvMix->setValue(int(std::lround(p.reverb_mix.load() * 100)));
     m_gain->setValue(int(std::lround(p.gain_db.load() * 10)));
     m_updating = false;
     refreshPresetCombo();
@@ -244,6 +265,9 @@ void VoiceFxDialog::push()
     v.echo_ms    = float(m_echoMs->value());
     v.echo_fb    = m_echoFb->value() / 100.0f;
     v.echo_mix   = m_echoMix->value() / 100.0f;
+    v.reverb_size = m_rvSize->value() / 100.0f;
+    v.reverb_damp = m_rvDamp->value() / 100.0f;
+    v.reverb_mix  = m_rvMix->value() / 100.0f;
     v.gain_db    = m_gain->value() / 10.0f;
     fx_apply(m_shm->strip[m_strip].fx, v);
 }

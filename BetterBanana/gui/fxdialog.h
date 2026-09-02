@@ -52,5 +52,8 @@ private:
     Knob* m_echoMs = nullptr;
     Knob* m_echoFb = nullptr;
     Knob* m_echoMix = nullptr;
+    Knob* m_rvSize = nullptr;
+    Knob* m_rvDamp = nullptr;
+    Knob* m_rvMix = nullptr;
     Knob* m_gain = nullptr;
 };

@@ -96,6 +96,7 @@ static void usage()
       "  strip <i> fx crush <bits> <n>    bit depth (0 off), sample-hold (1 off)\n"
       "  strip <i> fx echo <ms> <fb> <mix>\n"
       "  strip <i> fx chorus <ms> <Hz> <mix>\n"
+      "  strip <i> fx reverb <size> <damp> <mix>   all 0..1, mix 0 is off\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
       "  bus <b> preamp <dB>         EQ preamp, -24 .. +12\n"
@@ -156,14 +157,16 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
         const int idx = fx_preset_index(v);
         std::printf("on %d  preset %s\n  pitch %.2f st  formant %s  drive %.2f  gain %.2f dB\n"
                     "  ring %.1f Hz mix %.2f\n  crush %d bits, downsample %d\n"
-                    "  echo %.0f ms fb %.2f mix %.2f\n  chorus %.2f ms %.2f Hz mix %.2f\n",
+                    "  echo %.0f ms fb %.2f mix %.2f\n  chorus %.2f ms %.2f Hz mix %.2f\n"
+                    "  reverb size %.2f damp %.2f mix %.2f\n",
                     p.on.load(), idx >= 0 ? fx_presets()[idx].name : "(custom)",
                     v.pitch,
                     v.formant_on ? (std::to_string(v.formant) + " st").c_str()
                                  : "follows pitch",
                     v.drive, v.gain_db, v.ring_hz, v.ring_mix,
                     v.bits, v.downsample, v.echo_ms, v.echo_fb, v.echo_mix,
-                    v.chorus_ms, v.chorus_hz, v.chorus_mix);
+                    v.chorus_ms, v.chorus_hz, v.chorus_mix,
+                    v.reverb_size, v.reverb_damp, v.reverb_mix);
         return true;
     }
     else if (w == "preset") {
@@ -189,6 +192,7 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
     else if (w == "crush")  { if (!need(2)) return false; v.bits = atoi(argv[5]); v.downsample = atoi(argv[6]); }
     else if (w == "echo")   { if (!need(3)) return false; v.echo_ms = atof(argv[5]); v.echo_fb = atof(argv[6]); v.echo_mix = atof(argv[7]); }
     else if (w == "chorus") { if (!need(3)) return false; v.chorus_ms = atof(argv[5]); v.chorus_hz = atof(argv[6]); v.chorus_mix = atof(argv[7]); }
+    else if (w == "reverb") { if (!need(3)) return false; v.reverb_size = atof(argv[5]); v.reverb_damp = atof(argv[6]); v.reverb_mix = atof(argv[7]); }
     else { usage(); return false; }
     fx_apply(p, v);
     return true;
@@ -294,7 +298,14 @@ int main(int argc, char** argv)
     // want to look one up.
     if (std::string(argv[1]) == "fx" && argc >= 3 && std::string(argv[2]) == "list") {
         std::printf("voice changer presets:\n");
-        for (const FxPreset& f : fx_presets()) std::printf("  %s\n", f.name);
+        const char* seen = "";
+        for (const FxPreset& f : fx_presets()) {
+            if (std::strcmp(seen, f.group) != 0) {
+                std::printf("\n  %s\n", f.group);
+                seen = f.group;
+            }
+            std::printf("    %s\n", f.name);
+        }
         std::printf("\nApply one with:  bb-ctl strip <i> fx preset \"<name>\"\n"
                     "A telephone or radio voice is an EQ recipe rather than an effect:\n"
                     "  bb-ctl strip 0 band 0 0 300 0.7 hp\n"

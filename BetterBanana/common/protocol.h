@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 8;
+constexpr uint32_t kVersion    = 9;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -116,6 +116,9 @@ struct VoiceFx {
     af  chorus_ms;                // modulation depth, 0 = off
     af  chorus_hz;                // 0.05 .. 8
     af  chorus_mix;               // 0 .. 1
+    af  reverb_size;              // 0 .. 1, small room to large hall
+    af  reverb_damp;              // 0 .. 1, how fast the tail loses its highs
+    af  reverb_mix;               // 0 = off
     af  gain_db;                  // makeup, -24 .. +24
 };
 
@@ -136,6 +139,9 @@ inline void fx_set_defaults(VoiceFx& p)
     p.chorus_ms.store(0.0f);
     p.chorus_hz.store(0.0f);
     p.chorus_mix.store(0.0f);
+    p.reverb_size.store(0.5f);
+    p.reverb_damp.store(0.5f);
+    p.reverb_mix.store(0.0f);
     p.gain_db.store(0.0f);
 }
 

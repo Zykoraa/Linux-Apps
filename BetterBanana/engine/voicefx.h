@@ -373,6 +373,83 @@ struct Echo {
 };
 
 // ---------------------------------------------------------------------------
+// Reverb: eight damped comb filters in parallel into four allpasses in series.
+//
+// The Schroeder/Freeverb arrangement - decades old, cheap, and the reason a
+// voice sounds like it is in a room rather than in a wire. The comb lengths are
+// mutually prime so their echoes do not pile up into a ringing tone, and the
+// damping is a one-pole lowpass inside each feedback loop, which is what makes
+// the tail lose its highs the way a real room does.
+//
+// The right channel runs slightly longer delays than the left. That offset is
+// the whole of the stereo image: without it both channels decay identically and
+// the result collapses to the middle.
+// ---------------------------------------------------------------------------
+constexpr int kRvCombs   = 8;
+constexpr int kRvAps     = 4;
+constexpr int kRvMaxComb = 2048;
+constexpr int kRvMaxAp   = 768;
+
+struct Reverb {
+    float comb[kRvCombs][kRvMaxComb] = {};
+    float ap[kRvAps][kRvMaxAp] = {};
+    int   comb_len[kRvCombs] = {}, comb_i[kRvCombs] = {};
+    int   ap_len[kRvAps] = {}, ap_i[kRvAps] = {};
+    float store[kRvCombs] = {};          // damping lowpass state, one per comb
+    float feedback = 0.0f, damp1 = 0.0f, damp2 = 1.0f, mix = 0.0f;
+    bool  active = false;
+
+    void configure(float sr, int spread)
+    {
+        // Freeverb's tunings, quoted at 44.1 kHz and scaled to whatever we run at.
+        static const int kComb[kRvCombs] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
+        static const int kAp[kRvAps]     = { 556, 441, 341, 225 };
+        const float k = sr / 44100.0f;
+        for (int i = 0; i < kRvCombs; ++i) {
+            comb_len[i] = std::min(int(kComb[i] * k) + spread, kRvMaxComb - 1);
+            comb_i[i] = 0;
+            store[i] = 0.0f;
+            for (int j = 0; j < kRvMaxComb; ++j) comb[i][j] = 0.0f;
+        }
+        for (int i = 0; i < kRvAps; ++i) {
+            ap_len[i] = std::min(int(kAp[i] * k) + spread, kRvMaxAp - 1);
+            ap_i[i] = 0;
+            for (int j = 0; j < kRvMaxAp; ++j) ap[i][j] = 0.0f;
+        }
+    }
+
+    void set(float size, float damp, float m)
+    {
+        active = m > 0.001f;
+        feedback = 0.70f + clampf(size, 0.0f, 1.0f) * 0.28f;   // 0.70 .. 0.98
+        damp1 = clampf(damp, 0.0f, 1.0f) * 0.4f;
+        damp2 = 1.0f - damp1;
+        mix = clampf(m, 0.0f, 1.0f);
+    }
+
+    inline float process(float x)
+    {
+        if (!active) return x;
+        const float in = x * 0.015f;          // the classic input gain; the combs are hot
+        float wet = 0.0f;
+        for (int i = 0; i < kRvCombs; ++i) {
+            const float y = comb[i][comb_i[i]];
+            store[i] = y * damp2 + store[i] * damp1;
+            comb[i][comb_i[i]] = in + store[i] * feedback;
+            if (++comb_i[i] >= comb_len[i]) comb_i[i] = 0;
+            wet += y;
+        }
+        for (int i = 0; i < kRvAps; ++i) {
+            const float y = ap[i][ap_i[i]];
+            ap[i][ap_i[i]] = wet + y * 0.5f;
+            wet = y - wet;
+            if (++ap_i[i] >= ap_len[i]) ap_i[i] = 0;
+        }
+        return x * (1.0f - mix * 0.5f) + wet * mix;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // tanh saturation, normalised so turning it up changes the shape rather than
 // just the level.
 inline float drive_shape(float x, float k)
@@ -392,6 +469,7 @@ struct VoiceFxChain {
     Crusher      crush[kChan];
     Chorus       chorus[kChan];
     Echo         echo[kChan];
+    Reverb       reverb[kChan];
     SmoothGain   out[kChan];
     float        drive_k = 1.0f;
     bool         drive_on = false;
@@ -402,6 +480,7 @@ struct VoiceFxChain {
     int   c_bits = -1, c_down = -1;
     float c_ems = -1.0f, c_efb = -1.0f, c_emix = -1.0f;
     float c_cms = -1.0f, c_chz = -1.0f, c_cmix = -1.0f;
+    float c_vsize = -1.0f, c_vdamp = -1.0f, c_vmix = -1.0f;
     bool  init = false;
 
     void configure(float sr)
@@ -411,6 +490,9 @@ struct VoiceFxChain {
             out[c].snap(1.0f);
             pitch[c].reset();
             formant[c].configure();
+            // The right channel's delays run a little longer; that offset is
+            // the entire stereo image of the reverb.
+            reverb[c].configure(sr, c == 0 ? 0 : 23);
         }
         period.reset();
     }
@@ -431,6 +513,9 @@ struct VoiceFxChain {
         const float cms  = p.chorus_ms.load(std::memory_order_relaxed);
         const float chz  = p.chorus_hz.load(std::memory_order_relaxed);
         const float cmix = p.chorus_mix.load(std::memory_order_relaxed);
+        const float rsz  = p.reverb_size.load(std::memory_order_relaxed);
+        const float rdp  = p.reverb_damp.load(std::memory_order_relaxed);
+        const float rmx  = p.reverb_mix.load(std::memory_order_relaxed);
 
         for (int c = 0; c < kChan; ++c) {
             if (!init || st != c_pitch) pitch[c].set_semitones(st);
@@ -450,6 +535,8 @@ struct VoiceFxChain {
                 echo[c].configure(sr, ems, efb, emix);
             if (!init || cms != c_cms || chz != c_chz || cmix != c_cmix)
                 chorus[c].configure(sr, cms, chz, cmix);
+            if (!init || rsz != c_vsize || rdp != c_vdamp || rmx != c_vmix)
+                reverb[c].set(rsz, rdp, rmx);
             out[c].set_target(db_to_lin(p.gain_db.load(std::memory_order_relaxed)));
         }
         if (!init || dr != c_drive) {
@@ -461,6 +548,7 @@ struct VoiceFxChain {
         c_bits = bits; c_down = down;
         c_ems = ems; c_efb = efb; c_emix = emix;
         c_cms = cms; c_chz = chz; c_cmix = cmix;
+        c_vsize = rsz; c_vdamp = rdp; c_vmix = rmx;
         init = true;
     }
 
@@ -482,6 +570,9 @@ struct VoiceFxChain {
         x = crush[c].process(x);
         x = chorus[c].process(x);
         x = echo[c].process(x);
+        // Reverb last: it should be the room the finished voice is standing in,
+        // not something the distortion then chews on.
+        x = reverb[c].process(x);
         return x * out[c].next();
     }
 };
