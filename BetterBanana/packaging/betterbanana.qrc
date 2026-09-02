@@ -1,0 +1,10 @@
+<!DOCTYPE RCC>
+<!-- The window icon, compiled into the binary. QIcon::fromTheme only finds
+     betterbanana once the app has been installed into a hicolor theme, so
+     without this a build run straight out of build/ has no icon at all - and
+     said so, once per launch, in the journal. -->
+<RCC version="1.0">
+  <qresource prefix="/">
+    <file alias="betterbanana.svg">betterbanana.svg</file>
+  </qresource>
+</RCC>

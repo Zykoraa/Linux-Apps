@@ -4,6 +4,13 @@
 CXX      ?= g++
 # /usr/bin/moc is often Qt5's, and Qt6 puts its own moc in a different place on
 # every distribution. Ask Qt where it lives, then fall back to known locations.
+RCC ?= $(shell \
+  for c in "$$(qmake6 -query QT_HOST_LIBEXECS 2>/dev/null)/rcc" \
+           "$$(qmake6 -query QT_HOST_BINS 2>/dev/null)/rcc" \
+           /usr/lib/qt6/rcc /usr/lib/qt6/libexec/rcc \
+           /usr/lib/x86_64-linux-gnu/qt6/libexec/rcc \
+           /usr/lib64/qt6/libexec/rcc /usr/bin/rcc-qt6; do \
+    [ -x "$$c" ] && echo "$$c" && exit 0; done; echo rcc)
 MOC ?= $(shell \
   for c in "$$(qmake6 -query QT_HOST_LIBEXECS 2>/dev/null)/moc" \
            "$$(qmake6 -query QT_HOST_BINS 2>/dev/null)/moc" \
@@ -117,6 +124,10 @@ $(BUILD)/moc_mainwindow.cpp: gui/mainwindow.h | $(BUILD)
 $(BUILD)/moc_knob.cpp: gui/knob.h | $(BUILD)
 	$(MOC) $< -o $@
 
+# The window icon, compiled in so it works before the app is installed.
+$(BUILD)/qrc_betterbanana.cpp: packaging/betterbanana.qrc packaging/betterbanana.svg | $(BUILD)
+	$(RCC) $< -o $@
+
 $(BUILD)/moc_eqdialog.cpp: gui/eqdialog.h | $(BUILD)
 	$(MOC) $< -o $@
 
@@ -131,7 +142,7 @@ $(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.c
                   gui/dialogbits.cpp \
                   $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
                   $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp \
-                  $(BUILD)/moc_knob.cpp \
+                  $(BUILD)/moc_knob.cpp $(BUILD)/qrc_betterbanana.cpp \
                   $(GUI_HDRS) $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
@@ -139,6 +150,7 @@ $(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.c
 	  gui/dialogbits.cpp \
 	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
 	  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp $(BUILD)/moc_knob.cpp \
+	  $(BUILD)/qrc_betterbanana.cpp \
 	  -o $@ $(QT_LD) -lrt -lpthread
 
 $(BUILD):
