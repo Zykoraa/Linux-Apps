@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 9;
+constexpr uint32_t kVersion    = 10;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -119,6 +119,13 @@ struct VoiceFx {
     af  reverb_size;              // 0 .. 1, small room to large hall
     af  reverb_damp;              // 0 .. 1, how fast the tail loses its highs
     af  reverb_mix;               // 0 = off
+    // Pitch correction. The period tracker already measures the singer, so this
+    // is a control loop over the pitch shifter rather than a new effect.
+    ai  tune_on;
+    af  tune_speed_ms;            // 0 snaps instantly - the hard-tune sound
+    af  tune_amount;              // 0 .. 1, how much of the error to take out
+    ai  tune_key;                 // pitch class of the tonic, 0 = C
+    ai  tune_scale;               // TuneScale: chromatic, major, minor
     af  gain_db;                  // makeup, -24 .. +24
 };
 
@@ -142,6 +149,11 @@ inline void fx_set_defaults(VoiceFx& p)
     p.reverb_size.store(0.5f);
     p.reverb_damp.store(0.5f);
     p.reverb_mix.store(0.0f);
+    p.tune_on.store(0);
+    p.tune_speed_ms.store(40.0f);
+    p.tune_amount.store(1.0f);
+    p.tune_key.store(0);
+    p.tune_scale.store(0);
     p.gain_db.store(0.0f);
 }
 

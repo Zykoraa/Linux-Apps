@@ -6,6 +6,7 @@
 #pragma once
 
 #include "dsp.h"
+#include "autotune.h"
 #include "formant.h"
 #include "../common/protocol.h"
 
@@ -97,8 +98,8 @@ struct PeriodTracker {
         for (int i = 0; i < kWin; ++i) e0 += double(lin[i]) * lin[i];
         if (e0 < 1e-6) { period = 0; return; }           // silence: nothing to lock to
 
+        double nsdf[kLagHi + 2] = {};
         double best = 0.0;
-        int    bestLag = 0;
         for (int lag = kLagLo; lag <= kLagHi; ++lag) {
             const int m = kWin - lag;
             double num = 0.0, ea = 0.0, eb = 0.0;
@@ -108,8 +109,20 @@ struct PeriodTracker {
                 eb  += double(lin[i + lag]) * lin[i + lag];
             }
             const double den = std::sqrt(ea * eb) + 1e-12;
-            const double r = num / den;
-            if (r > best) { best = r; bestLag = lag; }
+            nsdf[lag] = num / den;
+            if (nsdf[lag] > best) best = nsdf[lag];
+        }
+
+        // Twice the period correlates as well as the period, and so does three
+        // times, and seven. Taking the global maximum therefore reports a voice
+        // an octave - or two, or a twelfth - too low, which is invisible to the
+        // seam alignment (a multiple of a period is still a whole number of
+        // them) but ruins anything that cares about the actual frequency. Take
+        // the SHORTEST lag that is nearly as good instead.
+        int bestLag = 0;
+        for (int lag = kLagLo + 1; lag < kLagHi; ++lag) {
+            if (nsdf[lag] <= nsdf[lag - 1] || nsdf[lag] < nsdf[lag + 1]) continue;
+            if (nsdf[lag] >= 0.85 * best) { bestLag = lag; break; }
         }
         // Below this the signal is a consonant or noise; there is no period to
         // preserve, and forcing one would be worse than leaving it alone. Two
@@ -163,12 +176,19 @@ struct PitchShifter {
     float lo() const { return len * 0.5f; }
     float hi() const { return len * 1.5f; }
 
+    // How far to shift, and whether to shift at all, are separate questions
+    // now: pitch correction moves the ratio continuously while the stage stays
+    // switched on, and re-running reset() for that would clear the buffer
+    // several times a second.
     void set_semitones(float st)
     {
-        const bool was = active;
-        active = std::fabs(st) > 0.01f;
         ratio = std::pow(2.0f, clampf(st, -24.0f, 24.0f) / 12.0f);
-        if (active && !was) reset();
+    }
+
+    void set_active(bool on)
+    {
+        if (on && !active) reset();     // stale audio in the buffer would splutter
+        active = on;
     }
 
     // Sweep an exact whole number of pitch periods, as near the nominal window
@@ -233,6 +253,13 @@ struct PitchShifter {
         buf[wr] = x;
         wr = (wr + 1) % kPitchBuf;
         if (!active) return x;
+
+        // A ratio of exactly one freezes the head. On its own that is a pure
+        // delay and harmless, but freezing part-way through a crossfade leaves
+        // a fixed blend of two taps a fixed distance apart - a comb filter, and
+        // audibly hollow. Pitch correction passes through unity constantly, so
+        // hold a single tap instead.
+        if (std::fabs(ratio - 1.0f) < 1e-4f) return tap(phase);
 
         phase += 1.0f - ratio;              // ratio > 1: the head catches up
 
@@ -489,6 +516,14 @@ struct VoiceFxChain {
     FormantShifter formant[kChan];
     PeriodTracker  period;          // one voice, so one period for both channels
     float          last_period = -1.0f;
+
+    // Pitch correction state.
+    bool  tune_on = false;
+    int   tune_key = 0, tune_scale = 0;
+    float tune_amount = 1.0f, tune_coeff = 0.0f;
+    float tune_target = 0.0f, tune_corr = 0.0f;
+    float base_st = 0.0f;           // the manual shift, before correction
+    float sr_hz = 48000.0f;
     RingMod      ring[kChan];
     Crusher      crush[kChan];
     Chorus       chorus[kChan];
@@ -541,7 +576,21 @@ struct VoiceFxChain {
         const float rdp  = p.reverb_damp.load(std::memory_order_relaxed);
         const float rmx  = p.reverb_mix.load(std::memory_order_relaxed);
 
+        sr_hz = sr;
+        base_st = st;
+        tune_on = p.tune_on.load(std::memory_order_relaxed) != 0;
+        tune_key = p.tune_key.load(std::memory_order_relaxed);
+        tune_scale = p.tune_scale.load(std::memory_order_relaxed);
+        tune_amount = clampf(p.tune_amount.load(std::memory_order_relaxed), 0.0f, 1.0f);
+        {
+            const float ms = p.tune_speed_ms.load(std::memory_order_relaxed);
+            tune_coeff = ms < 1.0f ? 0.0f : std::exp(-1.0f / (ms * 0.001f * sr));
+        }
+
         for (int c = 0; c < kChan; ++c) {
+            // The stage has to keep running while correcting, even at a manual
+            // shift of zero, or there would be nothing to correct with.
+            pitch[c].set_active(std::fabs(st) > 0.01f || tune_on);
             if (!init || st != c_pitch) pitch[c].set_semitones(st);
             // The pitch stage has already moved the formants by its own ratio,
             // so this stage only has to make up the difference. That is what
@@ -587,6 +636,19 @@ struct VoiceFxChain {
             if (period.period != last_period) {
                 last_period = period.period;
                 for (int i = 0; i < kChan; ++i) pitch[i].set_period(last_period);
+                if (tune_on && last_period > 0.0f) {
+                    // Clamped: a misdetected octave must nudge the voice, not
+                    // hurl it. Through an unvoiced patch the target simply
+                    // holds, rather than snapping home on every consonant.
+                    const float hz = sr_hz / last_period;
+                    tune_target = clampf(tune_correction(hz, tune_key, tune_scale),
+                                         -2.0f, 2.0f) * tune_amount;
+                }
+            }
+            if (tune_on) {
+                tune_corr = tune_target + (tune_corr - tune_target) * tune_coeff;
+                const float r = std::pow(2.0f, (base_st + tune_corr) / 12.0f);
+                for (int i = 0; i < kChan; ++i) pitch[i].ratio = r;
             }
         }
         x = pitch[c].process(x);

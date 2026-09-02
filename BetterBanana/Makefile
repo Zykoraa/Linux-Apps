@@ -15,7 +15,7 @@ MOC ?= $(shell \
 BUILD    := build
 HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset.h \
             engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
-            engine/pitchtrack.h
+            engine/pitchtrack.h engine/autotune.h
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)
@@ -65,7 +65,7 @@ engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
 tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx \
-        $(BUILD)/test_pitch
+        $(BUILD)/test_pitch $(BUILD)/test_autotune
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -97,6 +97,9 @@ $(BUILD)/test_voicefx: tests/test_voicefx.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_pitch: tests/test_pitch.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/test_autotune: tests/test_autotune.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 # GUI: moc the header that declares QObject subclasses, compile alongside.
@@ -158,7 +161,8 @@ install-system: engine gui ctl
 # Run every unit test and say plainly which one broke. The integration script
 # is deliberately not part of this: it needs a running engine and it moves the
 # caller's applications around for half a minute.
-UNIT := test_dsp test_eq test_fader test_pitch test_preset test_spectrum test_voicefx
+UNIT := test_autotune test_dsp test_eq test_fader test_pitch test_preset \
+        test_spectrum test_voicefx
 
 check: tests
 	@fail=0; \

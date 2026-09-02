@@ -5,6 +5,7 @@
 #include "calibdialog.h"
 
 #include "../common/fxpreset.h"
+#include "../engine/autotune.h"
 
 #include <QComboBox>
 #include <QGridLayout>
@@ -192,6 +193,58 @@ VoiceFxDialog::VoiceFxDialog(Shared* shm, int strip, const QString& title, QWidg
                         "sound like someone else.");
     root->addWidget(spaceBox);
 
+    // --- pitch correction ---------------------------------------------------
+    auto* tuneBox = new QGroupBox("PITCH CORRECTION");
+    auto* tg = new QGridLayout(tuneBox);
+    m_tuneOn = new QPushButton("TUNE");
+    m_tuneOn->setCheckable(true);
+    m_tuneOn->setFixedHeight(22);
+    m_tuneOn->setProperty("role", "eq");
+    m_tuneOn->setToolTip("Snaps what you sing to the nearest note. Uses the same "
+                         "pitch tracker\nthe shifter already runs, so it costs "
+                         "almost nothing extra.");
+    connect(m_tuneOn, &QPushButton::toggled, this, [this](bool b) {
+        if (m_updating) return;
+        m_shm->strip[m_strip].fx.tune_on.store(b ? 1 : 0);
+        refreshPresetCombo();
+    });
+    tg->addWidget(m_tuneOn, 1, 0);
+
+    m_tuneSpeed  = addKnob(tg, 0, 1, "SPEED",  0, 400, 1.0, 0, " ms");
+    m_tuneAmount = addKnob(tg, 0, 2, "AMOUNT", 0, 100, 1.0, 0, " %");
+    m_tuneSpeed->setToolTip("How fast it pulls you onto the note. 0 ms is the "
+                            "instant snap\neveryone recognises; 100-200 ms is "
+                            "correction you do not hear.");
+    m_tuneAmount->setToolTip("How much of the error to take out. Less than 100% "
+                             "leaves some\nof your own intonation in.");
+
+    tg->addWidget(cap("KEY"), 0, 3);
+    m_key = new QComboBox;
+    for (int i = 0; i < 12; ++i) m_key->addItem(tune_note_name(i));
+    connect(m_key, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (m_updating) return;
+        m_shm->strip[m_strip].fx.tune_key.store(i);
+        refreshPresetCombo();
+    });
+    tg->addWidget(m_key, 1, 3);
+
+    tg->addWidget(cap("SCALE"), 0, 4);
+    m_scale = new QComboBox;
+    m_scale->addItem("Chromatic");
+    m_scale->addItem("Major");
+    m_scale->addItem("Minor");
+    m_scale->setToolTip("Chromatic snaps to any semitone. A key and scale refuse "
+                        "the notes\nthat are not in it, which is what keeps a "
+                        "correction musical.");
+    connect(m_scale, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (m_updating) return;
+        m_shm->strip[m_strip].fx.tune_scale.store(i);
+        refreshPresetCombo();
+    });
+    tg->addWidget(m_scale, 1, 4);
+    tg->setColumnStretch(5, 1);
+    root->addWidget(tuneBox);
+
     // --- output ------------------------------------------------------------
     auto* outBox = new QGroupBox("OUTPUT");
     auto* og = new QGridLayout(outBox);
@@ -243,6 +296,11 @@ void VoiceFxDialog::pull()
     m_rvSize->setValue(int(std::lround(p.reverb_size.load() * 100)));
     m_rvDamp->setValue(int(std::lround(p.reverb_damp.load() * 100)));
     m_rvMix->setValue(int(std::lround(p.reverb_mix.load() * 100)));
+    m_tuneOn->setChecked(p.tune_on.load() != 0);
+    m_tuneSpeed->setValue(int(std::lround(p.tune_speed_ms.load())));
+    m_tuneAmount->setValue(int(std::lround(p.tune_amount.load() * 100)));
+    m_key->setCurrentIndex(std::clamp<int>(p.tune_key.load(), 0, 11));
+    m_scale->setCurrentIndex(std::clamp<int>(p.tune_scale.load(), 0, 2));
     m_gain->setValue(int(std::lround(p.gain_db.load() * 10)));
     m_updating = false;
     refreshPresetCombo();
@@ -268,6 +326,11 @@ void VoiceFxDialog::push()
     v.reverb_size = m_rvSize->value() / 100.0f;
     v.reverb_damp = m_rvDamp->value() / 100.0f;
     v.reverb_mix  = m_rvMix->value() / 100.0f;
+    v.tune_on     = m_tuneOn->isChecked();
+    v.tune_speed_ms = float(m_tuneSpeed->value());
+    v.tune_amount = m_tuneAmount->value() / 100.0f;
+    v.tune_key    = m_key->currentIndex();
+    v.tune_scale  = m_scale->currentIndex();
     v.gain_db    = m_gain->value() / 10.0f;
     fx_apply(m_shm->strip[m_strip].fx, v);
 }

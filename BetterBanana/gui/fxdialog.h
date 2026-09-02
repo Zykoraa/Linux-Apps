@@ -55,5 +55,10 @@ private:
     Knob* m_rvSize = nullptr;
     Knob* m_rvDamp = nullptr;
     Knob* m_rvMix = nullptr;
+    QPushButton* m_tuneOn = nullptr;
+    Knob* m_tuneSpeed = nullptr;
+    Knob* m_tuneAmount = nullptr;
+    QComboBox* m_key = nullptr;
+    QComboBox* m_scale = nullptr;
     Knob* m_gain = nullptr;
 };

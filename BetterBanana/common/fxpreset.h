@@ -33,6 +33,11 @@ struct FxValues {
     float reverb_size = 0.5f;
     float reverb_damp = 0.5f;
     float reverb_mix  = 0.0f;
+    bool  tune_on     = false;
+    float tune_speed_ms = 40.0f;
+    float tune_amount = 1.0f;
+    int   tune_key    = 0;        // pitch class of the tonic, 0 = C
+    int   tune_scale  = 0;        // TuneScale
     float gain_db    = 0.0f;
 };
 
@@ -56,6 +61,11 @@ inline void fx_apply(VoiceFx& p, const FxValues& v)
     p.reverb_size.store(cl(v.reverb_size, 0.0f, 1.0f));
     p.reverb_damp.store(cl(v.reverb_damp, 0.0f, 1.0f));
     p.reverb_mix.store(cl(v.reverb_mix, 0.0f, 1.0f));
+    p.tune_on.store(v.tune_on ? 1 : 0);
+    p.tune_speed_ms.store(cl(v.tune_speed_ms, 0.0f, 400.0f));
+    p.tune_amount.store(cl(v.tune_amount, 0.0f, 1.0f));
+    p.tune_key.store(v.tune_key < 0 ? 0 : (v.tune_key > 11 ? 11 : v.tune_key));
+    p.tune_scale.store(v.tune_scale < 0 ? 0 : (v.tune_scale > 2 ? 2 : v.tune_scale));
     p.gain_db.store(cl(v.gain_db, -24.0f, 24.0f));
 }
 
@@ -79,6 +89,11 @@ inline FxValues fx_capture(const VoiceFx& p)
     v.reverb_size = p.reverb_size.load();
     v.reverb_damp = p.reverb_damp.load();
     v.reverb_mix  = p.reverb_mix.load();
+    v.tune_on     = p.tune_on.load() != 0;
+    v.tune_speed_ms = p.tune_speed_ms.load();
+    v.tune_amount = p.tune_amount.load();
+    v.tune_key    = p.tune_key.load();
+    v.tune_scale  = p.tune_scale.load();
     v.gain_db    = p.gain_db.load();
     return v;
 }
@@ -130,6 +145,11 @@ inline const std::vector<FxPreset>& fx_presets()
                                        .chorus_hz = 0.20f, .chorus_mix = 0.15f,
                                        .reverb_size = 0.60f, .reverb_damp = 0.60f,
                                        .reverb_mix = 0.22f } },
+        { "Singing", "Gentle Tune", { .tune_on = true, .tune_speed_ms = 150.0f,
+                                      .tune_amount = 0.7f } },
+        { "Singing", "Hard Tune",   { .reverb_size = 0.4f, .reverb_damp = 0.4f,
+                                      .reverb_mix = 0.12f, .tune_on = true,
+                                      .tune_speed_ms = 0.0f, .tune_amount = 1.0f } },
         { "Singing", "Big Choir",    { .chorus_ms = 9.0f, .chorus_hz = 0.40f,
                                        .chorus_mix = 0.55f, .reverb_size = 0.75f,
                                        .reverb_damp = 0.30f, .reverb_mix = 0.32f,
@@ -211,6 +231,11 @@ inline int fx_preset_index(const FxValues& v)
             && same(v.echo_ms, p.echo_ms) && same(v.echo_fb, p.echo_fb)
             && same(v.echo_mix, p.echo_mix) && same(v.chorus_ms, p.chorus_ms)
             && same(v.chorus_hz, p.chorus_hz) && same(v.chorus_mix, p.chorus_mix)
+            && v.tune_on == p.tune_on
+            && (!v.tune_on || (same(v.tune_speed_ms, p.tune_speed_ms)
+                               && same(v.tune_amount, p.tune_amount)
+                               && v.tune_key == p.tune_key
+                               && v.tune_scale == p.tune_scale))
             && same(v.reverb_mix, p.reverb_mix)
             && (v.reverb_mix <= 0.0f
                 || (same(v.reverb_size, p.reverb_size) && same(v.reverb_damp, p.reverb_damp)))

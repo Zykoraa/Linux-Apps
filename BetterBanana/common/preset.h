@@ -21,13 +21,13 @@
 
 namespace bb {
 
-// 6 added reverb to the voice changer. 5 added its independent formant control,
+// 7 added pitch correction to the voice changer. 6 added its reverb. 5 added its independent formant control,
 // 4 the voice changer itself. 3 added the per-strip parametric EQ,
 // and the two strip fields (mono-source fold, limiter ceiling) that had never
 // been written. 2 added the per-band filter type / bypass flag and the bus EQ
 // preamp. All still load: every field a file omits is reset to its default
 // rather than left over from whatever was loaded before.
-constexpr int kPresetVersion = 6;
+constexpr int kPresetVersion = 7;
 
 inline std::string preset_dir()
 {
@@ -138,6 +138,9 @@ inline void write_fx(std::string& out, const std::string& kp, const VoiceFx& p)
          p.chorus_ms.load(), p.chorus_hz.load(), p.chorus_mix.load());
     addf(out, "%sreverb %.4f %.4f %.4f\n", kp.c_str(),
          p.reverb_size.load(), p.reverb_damp.load(), p.reverb_mix.load());
+    addf(out, "%stune %d %.2f %.4f %d %d\n", kp.c_str(), p.tune_on.load(),
+         p.tune_speed_ms.load(), p.tune_amount.load(),
+         p.tune_key.load(), p.tune_scale.load());
     addf(out, "%sgain %.3f\n",      kp.c_str(), p.gain_db.load());
 }
 
@@ -173,6 +176,12 @@ inline bool read_fx(VoiceFx& p, const char* what, const char* val)
     else if (!std::strcmp(what, "reverb")) {
         if (sscanf(val, "%f %f %f", &a, &b, &c) != 3) return false;
         p.reverb_size.store(a); p.reverb_damp.store(b); p.reverb_mix.store(c);
+    }
+    else if (!std::strcmp(what, "tune")) {
+        int on = 0, key = 0, sc = 0;
+        if (sscanf(val, "%d %f %f %d %d", &on, &a, &b, &key, &sc) != 5) return false;
+        p.tune_on.store(on ? 1 : 0); p.tune_speed_ms.store(a);
+        p.tune_amount.store(b); p.tune_key.store(key); p.tune_scale.store(sc);
     }
     else return false;
     return true;

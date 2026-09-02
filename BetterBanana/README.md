@@ -291,6 +291,7 @@ rather than the artefacts coming out, and the fader still means level.
 | **CHORUS** / **CH RATE** / **CH MIX** | modulated delay, for thickening or detune |
 | **ECHO** / **FEEDBACK** / **ECHO MIX** | up to 1 s |
 | **ROOM** / **DAMPING** / **REVERB** | a real reverb — about 0.7 s of tail at 20%, 2.6 s at 85% |
+| **TUNE** / **SPEED** / **AMOUNT** / **KEY** / **SCALE** | pitch correction |
 | **GAIN** | makeup, because most of the above change the level |
 
 Thirty presets ship with it, in four groups:
@@ -322,6 +323,42 @@ first thing you do is not stare at twelve knobs.
 300 Hz and a low pass at 3.4 kHz on the strip's own EQ is the whole trick. No
 preset touches your EQ, because silently rewriting a curve you tuned would be a
 nasty surprise.
+
+### Pitch correction
+
+**TUNE** snaps what you sing to the nearest note. It is a control loop rather
+than a new effect: the pitch shifter was already tracking your period fifty
+times a second to keep its seams aligned, so the only new part is deciding
+which note you were aiming at.
+
+- **SPEED** — how fast it pulls you onto the note. **0 ms** is the instant snap
+  everyone recognises; 100–200 ms is correction you do not hear as an effect.
+- **AMOUNT** — how much of the error to remove. Below 100% leaves some of your
+  own intonation in, which usually sounds more human.
+- **KEY** and **SCALE** — chromatic snaps to any semitone. Choosing a key with
+  major or minor refuses the notes that are not in it, which is what keeps a
+  correction musical rather than merely in tune.
+
+Corrections are clamped to two semitones, so a misdetected octave nudges you
+rather than hurling you. Through an unvoiced patch — a consonant, a breath —
+the target simply holds instead of snapping home and warbling.
+
+Two presets use it: **Gentle Tune** (150 ms, 70%) and **Hard Tune** (instant,
+100%, with a little room on it).
+
+Measured through the running engine: a tone 40 cents sharp of A4 came out at
+**439.98 Hz**, against A4 = 440.00.
+
+    bb-ctl strip 0 fx tune 0            # instant snap
+    bb-ctl strip 0 fx tune 150 0.7      # gentle: 150 ms, 70% of the error
+    bb-ctl strip 0 fx key C
+    bb-ctl strip 0 fx scale major
+    bb-ctl strip 0 fx tune off
+
+**A caveat worth knowing.** The tracker uses a 43 ms window and updates every
+21 ms, so corrections lag a note onset by roughly that much. That is fine for
+sustained singing and for the hard-tune effect; it is not a substitute for a
+dedicated tool on fast, melismatic material.
 
 ### The reverb
 
@@ -920,7 +957,8 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_eq           # 45 EQ profile / import / preset assertions
     ./build/test_preset       # 53 preset, startup and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
-    ./build/test_voicefx      # 40 voice changer assertions, measured by FFT
+    ./build/test_voicefx      # 54 voice changer assertions, measured by FFT
+    ./build/test_autotune     # 20 note-snapping assertions
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine

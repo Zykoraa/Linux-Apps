@@ -4,6 +4,7 @@
 #include "../common/preset.h"
 #include "../common/eqprofile.h"
 #include "../common/fxpreset.h"
+#include "../engine/autotune.h"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -97,6 +98,8 @@ static void usage()
       "  strip <i> fx echo <ms> <fb> <mix>\n"
       "  strip <i> fx chorus <ms> <Hz> <mix>\n"
       "  strip <i> fx reverb <size> <damp> <mix>   all 0..1, mix 0 is off\n"
+      "  strip <i> fx tune off | <speed_ms> [amount]   pitch correction, 0 ms snaps\n"
+      "  strip <i> fx key <C..B> | scale <chromatic|major|minor>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
       "  bus <b> preamp <dB>         EQ preamp, -24 .. +12\n"
@@ -158,7 +161,8 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
         std::printf("on %d  preset %s\n  pitch %.2f st  formant %s  drive %.2f  gain %.2f dB\n"
                     "  ring %.1f Hz mix %.2f\n  crush %d bits, downsample %d\n"
                     "  echo %.0f ms fb %.2f mix %.2f\n  chorus %.2f ms %.2f Hz mix %.2f\n"
-                    "  reverb size %.2f damp %.2f mix %.2f\n",
+                    "  reverb size %.2f damp %.2f mix %.2f\n"
+                    "  tune %s  speed %.0f ms  amount %.0f%%  key %s  scale %s\n",
                     p.on.load(), idx >= 0 ? fx_presets()[idx].name : "(custom)",
                     v.pitch,
                     v.formant_on ? (std::to_string(v.formant) + " st").c_str()
@@ -166,7 +170,11 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
                     v.drive, v.gain_db, v.ring_hz, v.ring_mix,
                     v.bits, v.downsample, v.echo_ms, v.echo_fb, v.echo_mix,
                     v.chorus_ms, v.chorus_hz, v.chorus_mix,
-                    v.reverb_size, v.reverb_damp, v.reverb_mix);
+                    v.reverb_size, v.reverb_damp, v.reverb_mix,
+                    v.tune_on ? "ON " : "off", v.tune_speed_ms, 100.0f * v.tune_amount,
+                    tune_note_name(v.tune_key),
+                    v.tune_scale == kTuneMajor ? "major"
+                      : (v.tune_scale == kTuneMinor ? "minor" : "chromatic"));
         return true;
     }
     else if (w == "preset") {
@@ -193,6 +201,33 @@ static bool set_fx(VoiceFx& p, int argc, char** argv)
     else if (w == "echo")   { if (!need(3)) return false; v.echo_ms = atof(argv[5]); v.echo_fb = atof(argv[6]); v.echo_mix = atof(argv[7]); }
     else if (w == "chorus") { if (!need(3)) return false; v.chorus_ms = atof(argv[5]); v.chorus_hz = atof(argv[6]); v.chorus_mix = atof(argv[7]); }
     else if (w == "reverb") { if (!need(3)) return false; v.reverb_size = atof(argv[5]); v.reverb_damp = atof(argv[6]); v.reverb_mix = atof(argv[7]); }
+    else if (w == "tune") {
+        if (!need(1)) return false;
+        const std::string a = argv[5];
+        if (a == "off") v.tune_on = false;
+        else if (a == "on") v.tune_on = true;
+        else {
+            v.tune_on = true;
+            v.tune_speed_ms = atof(argv[5]);
+            if (argc >= 7) v.tune_amount = atof(argv[6]);
+        }
+    }
+    else if (w == "key") {
+        if (!need(1)) return false;
+        static const char* kNames[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+        int k = -1;
+        for (int i = 0; i < 12; ++i) if (strcasecmp(argv[5], kNames[i]) == 0) k = i;
+        if (k < 0) { k = atoi(argv[5]); if (k < 0 || k > 11) { std::fprintf(stderr, "key: C..B or 0..11\n"); return false; } }
+        v.tune_key = k;
+    }
+    else if (w == "scale") {
+        if (!need(1)) return false;
+        const std::string a = argv[5];
+        if      (a == "chromatic") v.tune_scale = kTuneChromatic;
+        else if (a == "major")     v.tune_scale = kTuneMajor;
+        else if (a == "minor")     v.tune_scale = kTuneMinor;
+        else { std::fprintf(stderr, "scale: chromatic, major or minor\n"); return false; }
+    }
     else { usage(); return false; }
     fx_apply(p, v);
     return true;

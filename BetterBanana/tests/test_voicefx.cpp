@@ -119,6 +119,7 @@ int main()
         // Zero semitones must be a literal pass-through: the two heads sit at
         // fixed offsets there, and summing them would be a comb filter.
         PitchShifter ps;
+        ps.set_active(false);          // nothing to shift: the stage is not running
         ps.set_semitones(0.0f);
         bool same = true;
         for (int i = 0; i < 4096; ++i) {
@@ -137,7 +138,7 @@ int main()
         };
         for (const Case& cs : cases) {
             PitchShifter ps;
-            ps.set_semitones(cs.st);
+            ps.set_active(true); ps.set_semitones(cs.st);
             auto out = run([&](float x) { return ps.process(x); }, 440.0, SR, 16384, 8192);
             const double f = dominant_hz(out.data(), 8192, SR);
             // A granular shifter puts sidebands a grain rate either side; the
@@ -148,7 +149,7 @@ int main()
     {
         // It must not fall apart into silence or blow up.
         PitchShifter ps;
-        ps.set_semitones(-9.0f);
+        ps.set_active(true); ps.set_semitones(-9.0f);
         auto out = run([&](float x) { return ps.process(x); }, 200.0, SR, 16384, 8192);
         float peak = 0.0f;
         for (float v : out) peak = std::max(peak, std::fabs(v));
@@ -377,6 +378,71 @@ int main()
                       "and the sweep still follows the voice (%d adjustments while drifting)",
                       drift_changes);
         chk(drift_changes > 20, msg);
+    }
+
+    // --- the realtime period tracker ----------------------------------------
+    {
+        // Twice a period correlates as well as the period, and so does three
+        // times and seven. A detector that takes the global maximum of its
+        // autocorrelation therefore reports a voice an octave or more too low.
+        // That is invisible to the seam alignment - a multiple of a period is
+        // still a whole number of periods - so nothing else here would catch it,
+        // and pitch correction built on it would be nonsense.
+        for (double f0 : { 98.0, 130.8, 165.0, 220.0, 293.7, 329.6, 440.0 }) {
+            PeriodTracker pt;
+            pt.reset();
+            for (int i = 0; i < int(SR * 1.5); ++i) {
+                double v = 0.0;
+                for (int h = 1; h * f0 <= 12000.0; ++h)
+                    v += std::sin(2.0 * M_PI * h * f0 * i / SR) / h;
+                pt.push(float(v * 0.15));
+            }
+            const double hz = pt.period > 0.0f ? SR / pt.period : 0.0;
+            char msg[110];
+            std::snprintf(msg, sizeof(msg),
+                          "tracker reads %.1f Hz as %.1f Hz, not a subharmonic", f0, hz);
+            near(hz, f0, f0 * 0.01, msg);
+        }
+    }
+
+    // --- pitch correction ---------------------------------------------------
+    {
+        auto sung = [&](double f0) {
+            std::vector<float> in;
+            for (int i = 0; i < int(SR * 3); ++i) {
+                double v = 0.0;
+                for (int h = 1; h * f0 <= 12000.0; ++h)
+                    v += std::sin(2.0 * M_PI * h * f0 * i / SR) / h;
+                in.push_back(float(v * 0.15));
+            }
+            return in;
+        };
+        auto tuned = [&](double f0, int key, int scale, float speed) {
+            VoiceFx p;
+            fx_set_defaults(p);
+            p.on.store(1);
+            p.tune_on.store(1);
+            p.tune_speed_ms.store(speed);
+            p.tune_key.store(key);
+            p.tune_scale.store(scale);
+            auto ch = std::make_unique<VoiceFxChain>();
+            ch->configure((float)SR);
+            ch->update(p, (float)SR);
+            std::vector<float> out;
+            const auto in = sung(f0);
+            out.reserve(in.size());
+            for (float v : in) out.push_back(ch->process(0, v));
+            return dominant_hz(out.data() + 100000, 16384, SR);
+        };
+        auto midi = [](double m) { return 440.0 * std::pow(2.0, (m - 69.0) / 12.0); };
+
+        near(tuned(440.0, 0, 0, 40.0f), 440.0, 3.0, "an in-tune note is left where it is");
+        near(tuned(midi(69.4), 0, 0, 40.0f), 440.0, 4.0, "40 cents sharp is pulled to A");
+        near(tuned(midi(68.65), 0, 0, 40.0f), 440.0, 4.0, "35 cents flat is pulled up to A");
+        near(tuned(midi(64.0), 0, 0, 40.0f), midi(64.0), 4.0, "and E is left alone too");
+        // C# is not in C major, and 61.2 is nearer D than C.
+        near(tuned(midi(61.2), 0, 1, 40.0f), midi(62.0), 4.0,
+             "a C# in C major is pulled to the nearest scale note");
     }
 
     // --- formant shifter ----------------------------------------------------

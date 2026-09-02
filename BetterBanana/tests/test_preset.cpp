@@ -84,6 +84,11 @@ static void scramble(Shared* s)
         p.fx.reverb_size.store(0.2f + 0.15f * i);
         p.fx.reverb_damp.store(0.9f - 0.1f * i);
         p.fx.reverb_mix.store(0.05f * i);
+        p.fx.tune_on.store(i % 2 == 0);
+        p.fx.tune_speed_ms.store(20.0f * i);
+        p.fx.tune_amount.store(0.15f * i);
+        p.fx.tune_key.store(i * 2);
+        p.fx.tune_scale.store(i % 3);
         p.fx.gain_db.store(-1.5f * i);
     }
     for (int b = 0; b < kBuses; ++b) {
@@ -190,6 +195,10 @@ int main()
     near(blank->strip[4].fx.echo_ms.load(), 240.0, 1e-2, "echo time round trips");
     near(blank->strip[3].fx.reverb_size.load(), 0.65, 1e-3, "reverb size round trips");
     near(blank->strip[2].fx.reverb_mix.load(), 0.10, 1e-3, "reverb mix round trips");
+    chk(blank->strip[3].fx.tune_key.load() == 6, "the tuning key round trips");
+    chk(blank->strip[3].fx.tune_scale.load() == 0, "and the scale");
+    near(blank->strip[4].fx.tune_speed_ms.load(), 80.0, 1e-3, "and the retune speed");
+    chk(blank->strip[2].fx.tune_on.load() == 1, "and whether correction is on");
     chk(blank->strip[2].fx.on.load() == 0, "a voice changer left off stays off");
     chk(blank->strip[3].fx.downsample.load() == 4, "the crusher's decimation round trips");
 
