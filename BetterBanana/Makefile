@@ -16,7 +16,11 @@ BUILD    := build
 HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset.h \
             engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
             engine/pitchtrack.h engine/autotune.h
-CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
+GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
+            gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
+            gui/dialogbits.h
+VERSION := 0.2.0
+CXXFLAGS := -O2 -std=c++20 -DBB_VERSION='"$(VERSION)"' -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)
 # Qt6Network is only used by the AutoEq headphone browser in the EQ editor.
@@ -29,7 +33,6 @@ SND_LD   := $(shell pkg-config --libs sndfile)
 
 all: engine gui ctl tests
 
-VERSION := 0.1.0
 DISTNAME := betterbanana-$(VERSION)
 
 # Fail early and legibly instead of part-way through a build.
@@ -65,7 +68,7 @@ engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
 tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx \
-        $(BUILD)/test_pitch $(BUILD)/test_autotune
+        $(BUILD)/test_pitch $(BUILD)/test_autotune $(BUILD)/test_contrast
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -73,10 +76,15 @@ $(BUILD)/bb-engine: engine/engine.cpp engine/dsp.h $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(PW_CF) $(SND_CF) $< -o $@ $(PW_LD) $(SND_LD) -lrt -lpthread
 
 $(BUILD)/test_fader: tests/test_fader.cpp gui/knob.cpp gui/theme.cpp \
-                     $(BUILD)/moc_knob.cpp gui/knob.h gui/theme.h | $(BUILD)
+                     $(BUILD)/moc_knob.cpp $(GUI_HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  tests/test_fader.cpp gui/knob.cpp gui/theme.cpp $(BUILD)/moc_knob.cpp \
 	  -o $@ $(QT_LD)
+
+# Needs Qt for QColor only; no display, no event loop.
+$(BUILD)/test_contrast: tests/test_contrast.cpp gui/theme.cpp $(GUI_HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
+	  tests/test_contrast.cpp gui/theme.cpp -o $@ $(QT_LD)
 
 $(BUILD)/bb-ctl: tools/bb-ctl.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@ -lrt -lpthread
@@ -120,14 +128,15 @@ $(BUILD)/moc_calibdialog.cpp: gui/calibdialog.h | $(BUILD)
 
 $(BUILD)/bb-gui: gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
                   gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+                  gui/dialogbits.cpp \
                   $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
                   $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp \
                   $(BUILD)/moc_knob.cpp \
-                  gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
-                  $(HDRS) | $(BUILD)
+                  $(GUI_HDRS) $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  gui/main.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
 	  gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+	  gui/dialogbits.cpp \
 	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
 	  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp $(BUILD)/moc_knob.cpp \
 	  -o $@ $(QT_LD) -lrt -lpthread
@@ -161,8 +170,8 @@ install-system: engine gui ctl
 # Run every unit test and say plainly which one broke. The integration script
 # is deliberately not part of this: it needs a running engine and it moves the
 # caller's applications around for half a minute.
-UNIT := test_autotune test_dsp test_eq test_fader test_pitch test_preset \
-        test_spectrum test_voicefx
+UNIT := test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
+        test_preset test_spectrum test_voicefx
 
 check: tests
 	@fail=0; \

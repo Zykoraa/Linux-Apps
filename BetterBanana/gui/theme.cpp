@@ -1,9 +1,13 @@
 #include "theme.h"
+#include "color.h"
+#include "metrics.h"
 #include <QPainter>
 #include <QProxyStyle>
 #include <QStyleOption>
 
 static int g_index = 0;
+
+static QColor deriveWell(const QColor& panel, bool dark);
 
 // Palettes are transcribed from each project's published colour definitions.
 const QVector<Theme>& builtinThemes()
@@ -22,6 +26,7 @@ const QVector<Theme>& builtinThemes()
         t.name = name; t.dark = dark;
         t.bg = QColor(bg); t.panel = QColor(panel); t.panelAlt = QColor(panelAlt);
         t.header = QColor(header); t.border = QColor(border);
+        t.well = deriveWell(t.panel, dark);
         t.text = QColor(text); t.textDim = QColor(textDim); t.accent = QColor(accent);
         t.busA = QColor(busA); t.busB = QColor(busB); t.mute = QColor(mute);
         t.solo = QColor(solo); t.mono = QColor(mono); t.eqOn = QColor(eqOn); t.rec = QColor(rec);
@@ -91,101 +96,322 @@ const Theme& theme()
 void setThemeIndex(int i) { g_index = qBound(0, i, builtinThemes().size() - 1); }
 int  themeIndex()        { return g_index; }
 
+// A recess against the card it sits in. Derived, so the ten palettes need no
+// hand-editing and an eleventh gets a correct trough for free. panelAlt used to
+// do this job as well as being the face of every button and combo - one value
+// with two opposite meanings is why nothing looked pressable and nothing looked
+// inset.
+static QColor deriveWell(const QColor& panel, bool dark)
+{
+    QColor w = bbcolor::nudge(panel, dark ? -6.0 : -7.0);
+    for (int i = 0; i < 14 && bbcolor::contrast(w, panel) < 1.28; ++i)
+        w = bbcolor::nudge(w, -2.0);
+    // Near the black end of the range there is no room left below, and every
+    // dark UI answers that the same way: the trough goes up, not down.
+    if (bbcolor::contrast(w, panel) < 1.18) {
+        w = panel;
+        for (int i = 0; i < 14 && bbcolor::contrast(w, panel) < 1.28; ++i)
+            w = bbcolor::nudge(w, 2.0);
+    }
+    return w;
+}
+
+QColor onFill(const QColor& fill) { return bbcolor::onColor(fill); }
+
+QColor dimOn(const Theme& t, const QColor& bg)
+{
+    return bbcolor::ensureContrast(t.textDim, bg, bbcolor::kTextFloor);
+}
+
 QString buildStyleSheet(const Theme& t)
 {
-    auto c   = [](const QColor& x) { return x.name(QColor::HexRgb); };
-    // Text that sits on top of a saturated "on" colour.
-    const QString onText = t.dark ? "#12141a" : "#ffffff";
+    auto c = [](const QColor& x) { return x.name(QColor::HexRgb); };
+    using namespace bbui;
+
+    // Captions land on bg, on a card and on a control face. Solve dim text
+    // against the worst of the three rather than picking one and hoping - it
+    // used to fail 4.5:1 on `panel` in six themes, and captions are the only
+    // thing naming half these controls.
+    QColor worst = t.bg;
+    double lo = bbcolor::contrast(t.textDim, t.bg);
+    for (const QColor& s : { t.panel, t.panelAlt }) {
+        const double r = bbcolor::contrast(t.textDim, s);
+        if (r < lo) { lo = r; worst = s; }
+    }
+    const QString dim  = c(dimOn(t, worst));
+    // Ink that is only ever disabled, and boundaries that must still be seen.
+    const QString off  = c(bbcolor::mix(dimOn(t, t.panel), t.panel, 0.45));
+    const QString edge = c(bbcolor::ensureContrast(t.border, t.well, bbcolor::kBoundFloor));
+
+    const QString onAccent = c(onFill(t.accent));
 
     QString s;
-    s += QString("QWidget{color:%1;font-size:11px;}").arg(c(t.text));
+    s += QString("QWidget{color:%1;font-size:%2px;}").arg(c(t.text)).arg(fsControl());
     s += QString("QMainWindow,QDialog,QScrollArea,QScrollArea>QWidget>QWidget{background:%1;}")
             .arg(c(t.bg));
 
-    s += QString("QGroupBox{background:transparent;border:1px solid %1;border-radius:6px;"
-                 "margin-top:14px;padding-top:6px;font-weight:bold;color:%2;}")
-            .arg(c(t.border), c(t.textDim));
-    // Strips, buses and the tape deck are raised cards against the window.
-    s += QString("QWidget[role=\"card\"]{background:%1;border:1px solid %2;border-radius:5px;}")
-            .arg(c(t.panel), c(t.border));
+    // --- surfaces ---------------------------------------------------------
+    s += QString("QGroupBox{background:transparent;border:1px solid %1;border-radius:%2px;"
+                 "margin-top:14px;padding-top:6px;font-size:%3px;font-weight:bold;color:%4;}")
+            .arg(c(t.border)).arg(radCard()).arg(fsControl()).arg(dim);
     s += QString("QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;color:%1;}")
-            .arg(c(t.textDim));
+            .arg(dim);
+    s += QString("QGroupBox:disabled{border-color:%1;color:%1;}").arg(off);
 
+    // Strips, buses and the tape deck are raised cards against the window.
+    // WA_StyledBackground has to be set on each of them for Qt to honour this -
+    // a moc'd QWidget subclass never gets it automatically, which is why this
+    // rule painted nothing at all for the whole life of the app.
+    s += QString("QWidget[role=\"card\"]{background:%1;border:1px solid %2;border-radius:%3px;}")
+            .arg(c(t.panel), c(t.border)).arg(radCard());
+    // Virtual inputs and virtual buses carry the distinction in the edge, not
+    // the fill: panelAlt is the face of every button and combo sitting on them,
+    // so a second plate colour would swallow its own controls.
+    s += QString("QWidget[role=\"cardVirtual\"]{background:%1;border:1px solid %2;"
+                 "border-radius:%3px;}").arg(c(t.panel), c(t.busB)).arg(radCard());
+
+    // A strip that is not soloed while something else is, and a strip whose
+    // device is named but not attached. Both are states the engine already
+    // knew about and the window never showed.
+    s += QString("QWidget[role=\"card\"][dim=\"true\"],"
+                 "QWidget[role=\"cardVirtual\"][dim=\"true\"]"
+                 "{background:%1;border-color:%2;}")
+            .arg(c(bbcolor::mix(t.panel, t.bg, 0.75)), c(bbcolor::mix(t.border, t.bg, 0.6)));
+    s += QString("QLabel[role=\"header\"][nodev=\"true\"],"
+                 "QLabel[role=\"headerA\"][nodev=\"true\"]"
+                 "{background:%1;color:%2;}")
+            .arg(c(bbcolor::mix(t.mute, t.panel, 0.62)), c(t.text));
+    {
+        const QColor a = bbcolor::fitFill(t.mute, bbcolor::kTextFloor);
+        s += QString("QLabel[role=\"alert\"]{background:%1;color:%2;font-size:%3px;"
+                     "font-weight:bold;padding:6px 10px;border-radius:%4px;}")
+                .arg(c(a), c(onFill(a))).arg(fsBody()).arg(radCtl());
+    }
+
+    // --- text -------------------------------------------------------------
     s += QString("QLabel{background:transparent;color:%1;}").arg(c(t.text));
-    s += QString("QLabel[role=\"caption\"]{color:%1;font-size:9px;}").arg(c(t.textDim));
-    s += QString("QLabel[role=\"value\"]{color:%1;font-size:9px;font-weight:bold;}").arg(c(t.accent));
-    s += QString("QLabel[role=\"header\"]{background:%1;color:%2;font-weight:bold;font-size:9px;"
-                 "padding:4px 2px;border-radius:3px;}").arg(c(t.header), c(t.text));
-    s += QString("QLabel[role=\"headerA\"]{background:%1;color:%2;font-weight:bold;font-size:10px;"
-                 "padding:4px 2px;border-radius:3px;}").arg(c(t.busA), onText);
-    s += QString("QLabel[role=\"headerB\"]{background:%1;color:%2;font-weight:bold;font-size:10px;"
-                 "padding:4px 2px;border-radius:3px;}").arg(c(t.busB), onText);
-    s += QString("QLabel[role=\"gain\"]{color:%1;font-size:10px;font-weight:bold;}").arg(c(t.text));
+    s += QString("QLabel[role=\"caption\"]{color:%1;font-size:%2px;}").arg(dim).arg(fsCaption());
+    s += QString("QLabel[role=\"value\"]{color:%1;font-size:%2px;font-weight:bold;}")
+            .arg(c(bbcolor::ensureContrast(t.accent, t.panel, bbcolor::kTextFloor)))
+            .arg(fsCaption());
+    {
+        const QColor plate = bbcolor::fitFill(t.header, bbcolor::kTextFloor);
+        s += QString("QLabel[role=\"header\"]{background:%1;color:%2;font-weight:bold;"
+                     "font-size:%3px;padding:4px 2px;border-radius:%4px;}")
+                .arg(c(plate), c(onFill(plate))).arg(fsControl()).arg(radCtl());
+    }
+    // Bus plates used to be a saturated slab with hard-coded ink on top - four
+    // of the eight AA failures in the app lived here. The identity moves to the
+    // edge and the label goes back to ordinary card text.
+    s += QString("QLabel[role=\"headerA\"]{background:%1;color:%2;font-weight:bold;font-size:%3px;"
+                 "padding:4px 2px 4px 6px;border-radius:%4px;border-left:3px solid %5;}")
+            .arg(c(t.panelAlt), c(t.text)).arg(fsControl()).arg(radCtl()).arg(c(t.busA));
+    s += QString("QLabel[role=\"headerB\"]{background:%1;color:%2;font-weight:bold;font-size:%3px;"
+                 "padding:4px 2px 4px 6px;border-radius:%4px;border-left:3px solid %5;}")
+            .arg(c(t.panelAlt), c(t.text)).arg(fsControl()).arg(radCtl()).arg(c(t.busB));
+    s += QString("QLabel[role=\"gain\"]{color:%1;font-size:%2px;font-weight:bold;}")
+            .arg(c(t.text)).arg(fsReadout());
+    s += QString("QLabel[role=\"display\"]{color:%1;font-size:%2px;font-weight:bold;}")
+            .arg(c(t.text)).arg(fsDisplay());
+    s += QString("QLabel[role=\"prose\"]{color:%1;font-size:%2px;}").arg(dim).arg(fsBody());
+    s += QString("QLabel[role=\"tag\"]{background:%1;color:%2;font-size:%3px;font-weight:bold;"
+                 "padding:1px 4px;border-radius:%4px;}")
+            .arg(c(t.well), dim).arg(fsCaption()).arg(radWell());
+    s += QString("QLabel:disabled{color:%1;}").arg(off);
 
-    s += QString("QComboBox{background:%1;color:%2;border:1px solid %3;border-radius:3px;"
-                 "padding:2px 4px;font-size:9px;}")
-            .arg(c(t.panelAlt), c(t.text), c(t.border));
+    // --- device pickers ---------------------------------------------------
+    s += QString("QComboBox{background:%1;color:%2;border:1px solid %3;border-radius:%4px;"
+                 "padding:1px 4px;font-size:%5px;}")
+            .arg(c(t.panelAlt), c(t.text), c(t.border)).arg(radCtl()).arg(fsControl());
     s += QString("QComboBox:hover{border-color:%1;}").arg(c(t.accent));
+    s += QString("QComboBox:focus{border-color:%1;outline:1px solid %1;}").arg(c(t.accent));
+    s += QString("QComboBox:disabled{color:%1;border-color:%1;}").arg(off);
+    // The popup used to jump from 9px to 11px the moment it opened, a 22% step
+    // on every device list. Same size as the closed control, set on the view
+    // selector that already existed - the ::drop-down subcontrol stays
+    // untouched, so the style keeps drawing the arrow.
     s += QString("QComboBox QAbstractItemView{background:%1;color:%2;selection-background-color:%3;"
-                 "selection-color:%4;border:1px solid %5;}")
-            .arg(c(t.panelAlt), c(t.text), c(t.accent), onText, c(t.border));
-    // Deliberately no QComboBox::drop-down rule: styling that subcontrol makes
-    // the stylesheet engine own it, and it then never asks the style to draw an
-    // arrow - which is how the drop-downs ended up looking like flat text
-    // fields. createThemedStyle() paints the arrow instead.
+                 "selection-color:%4;border:1px solid %5;font-size:%6px;padding:2px;}")
+            .arg(c(t.panelAlt), c(t.text), c(t.accent), onAccent, c(t.border)).arg(fsControl());
 
-    // Base toggle button, then one rule per role for the checked state.
-    s += QString("QPushButton{background:%1;color:%2;border:1px solid %3;border-radius:3px;"
-                 "padding:2px 3px;font-size:9px;font-weight:bold;}")
-            .arg(c(t.panelAlt), c(t.textDim), c(t.border));
-    s += QString("QPushButton:hover{border-color:%1;color:%2;}").arg(c(t.accent), c(t.text));
+    // --- buttons ----------------------------------------------------------
+    //
+    // Two populations, one rule each. Prose buttons ("Calibrate to my voice...",
+    // "Save as...") were being set in 9px bold caps-styled chrome because the
+    // three-letter mixer chips and they shared a single rule. makeToggle()
+    // always sets a role property and no prose button anywhere does, so the
+    // split is free.
+    s += QString("QPushButton{background:%1;color:%2;border:1px solid %3;border-radius:%4px;"
+                 "padding:5px 12px;font-size:%5px;font-weight:400;}")
+            .arg(c(t.panelAlt), c(t.text), c(t.border)).arg(radCtl()).arg(fsBody());
+    s += QString("QPushButton:hover{border-color:%1;}").arg(c(t.accent));
     s += QString("QPushButton:pressed{background:%1;}").arg(c(t.header));
+    s += QString("QPushButton:focus{outline:1px solid %1;}").arg(c(t.accent));
+    s += QString("QPushButton:disabled{color:%1;border-color:%1;}").arg(off);
+
+    s += QString("QPushButton[role]{padding:2px 3px;font-size:%1px;font-weight:bold;color:%2;}")
+            .arg(fsChip()).arg(dim);
+    s += QString("QPushButton[role]:hover{border-color:%1;color:%2;}")
+            .arg(c(t.accent), c(t.text));
+    s += QString("QPushButton[role]:disabled{color:%1;border-color:%1;}").arg(off);
 
     struct RoleColour { const char* role; QColor col; };
     const RoleColour roles[] = {
         { "busA", t.busA }, { "busB", t.busB }, { "mute", t.mute }, { "solo", t.solo },
         { "mono", t.mono }, { "eq",   t.eqOn }, { "rec",  t.rec  }, { "accent", t.accent },
     };
-    for (const auto& r : roles) {
+    for (const auto& r0 : roles) {
+        // A lit chip is a fill and its ink together; the pair has to clear the
+        // floor, and where no ink can, the fill moves.
+        const RoleColour r{ r0.role, bbcolor::fitFill(r0.col, bbcolor::kTextFloor) };
         s += QString("QPushButton[role=\"%1\"]:checked{background:%2;color:%3;border-color:%2;}")
-                .arg(r.role, c(r.col), onText);
-        s += QString("QPushButton[role=\"%1\"]:checked:hover{background:%2;}")
-                .arg(r.role, c(r.col.lighter(115)));
+                .arg(r.role, c(r.col), c(onFill(r.col)));
+        // lighter() clamps once a channel is at 255, which left a checked MUTE,
+        // SOLO, MONO, EQ and REC with no hover feedback at all in the default
+        // theme. A Lab step always moves, in whichever direction there is room.
+        s += QString("QPushButton[role=\"%1\"]:checked:hover{background:%2;color:%3;}")
+                .arg(r.role, c(bbcolor::hoverOf(r.col)), c(onFill(bbcolor::hoverOf(r.col))));
+        // A checked chip out-specifies a bare :disabled, so it needs its own.
+        s += QString("QPushButton[role=\"%1\"]:checked:disabled{background:%2;color:%3;"
+                     "border-color:%2;}")
+                .arg(r.role, c(bbcolor::mix(r.col, t.panel, 0.55)), off);
     }
 
-    s += QString("QSlider::groove:vertical{background:%1;width:5px;border-radius:2px;}")
-            .arg(c(t.panelAlt));
-    s += QString("QSlider::sub-page:vertical{background:%1;border-radius:2px;}").arg(c(t.panelAlt));
-    s += QString("QSlider::add-page:vertical{background:%1;border-radius:2px;}").arg(c(t.panelAlt));
-    s += QString("QSlider::handle:vertical{background:%1;border:1px solid %2;height:11px;"
-                 "margin:0 -7px;border-radius:2px;}")
-            .arg(c(t.text), c(t.border));
-    s += QString("QSlider::handle:vertical:hover{background:%1;border-color:%1;}").arg(c(t.accent));
+    // Five buses, five hues. All A-buses used to share one colour and all
+    // B-buses another, so an assign row said how many buses a strip fed but
+    // never which. Small hue steps, so nothing collides with mono/eqOn.
+    for (int b = 0; b < 5; ++b) {
+        const QColor base = b < 3 ? t.busA : t.busB;
+        QColor h = base.toHsv();
+        const int shift = (b < 3 ? (b - 1) : (b - 3 == 0 ? -1 : 1)) * 16;
+        h = QColor::fromHsv((h.hue() < 0 ? 0 : (h.hue() + shift + 360) % 360),
+                            h.saturation(), h.value());
+        h = bbcolor::fitFill(h, bbcolor::kTextFloor);
+        s += QString("QPushButton[bus=\"%1\"]:checked{background:%2;color:%3;"
+                     "border-color:%2;}")
+                .arg(b).arg(c(h), c(onFill(h)));
+        s += QString("QPushButton[bus=\"%1\"]:checked:hover{background:%2;color:%3;}")
+                .arg(b).arg(c(bbcolor::hoverOf(h)), c(onFill(bbcolor::hoverOf(h))));
+    }
 
-    s += QString("QMenuBar{background:%1;color:%2;}").arg(c(t.bg), c(t.text));
-    s += QString("QMenuBar::item:selected{background:%1;color:%2;}").arg(c(t.accent), onText);
-    s += QString("QMenu{background:%1;color:%2;border:1px solid %3;}")
+    // Call-to-action weight, so Delete stops looking exactly like Export.
+    s += QString("QPushButton[cta=\"primary\"]{background:%1;color:%2;border-color:%1;"
+                 "font-weight:bold;}").arg(c(t.accent), onAccent);
+    s += QString("QPushButton[cta=\"primary\"]:hover{background:%1;}")
+            .arg(c(bbcolor::hoverOf(t.accent)));
+    s += QString("QPushButton[cta=\"danger\"]{color:%1;border-color:%1;}")
+            .arg(c(bbcolor::ensureContrast(t.mute, t.panelAlt, bbcolor::kTextFloor)));
+    s += QString("QPushButton[cta=\"danger\"]:hover{background:%1;color:%2;border-color:%1;}")
+            .arg(c(t.mute), c(onFill(t.mute)));
+
+    // --- check boxes ------------------------------------------------------
+    //
+    // Qt draws ::indicator from QPalette::Base, which is panelAlt: measured
+    // 1.03:1 against a dialog. That is the EQ band table's entire ON column,
+    // the VBAN dialog and the AutoEq browser - the only on/off control in the
+    // app that is not a coloured chip, invisible in exactly the place it is the
+    // only mechanism. Styling the subcontrol means Qt stops drawing a tick, so
+    // a checked box becomes a filled accent swatch: correct here, it matches
+    // the app's own filled-chip vocabulary and needs no bundled asset.
+    s += QString("QCheckBox{color:%1;font-size:%2px;spacing:6px;}")
+            .arg(c(t.text)).arg(fsControl());
+    s += QString("QCheckBox::indicator{width:13px;height:13px;border:1px solid %1;"
+                 "border-radius:%2px;background:%3;}")
+            .arg(edge).arg(radWell()).arg(c(t.well));
+    s += QString("QCheckBox::indicator:hover{border-color:%1;}").arg(c(t.accent));
+    s += QString("QCheckBox::indicator:checked{background:%1;border-color:%1;}")
+            .arg(c(t.accent));
+    s += QString("QCheckBox::indicator:disabled{border-color:%1;background:%2;}")
+            .arg(off).arg(c(t.panel));
+    s += QString("QCheckBox:disabled{color:%1;}").arg(off);
+
+    // --- sliders (the plain Qt ones; Fader is custom-painted) --------------
+    s += QString("QSlider::groove:vertical{background:%1;width:5px;border-radius:%2px;}")
+            .arg(c(t.well)).arg(radWell());
+    s += QString("QSlider::sub-page:vertical,QSlider::add-page:vertical{background:%1;"
+                 "border-radius:%2px;}").arg(c(t.well)).arg(radWell());
+    s += QString("QSlider::handle:vertical{background:%1;border:1px solid %2;height:11px;"
+                 "margin:0 -7px;border-radius:%3px;}")
+            .arg(c(t.text), c(t.border)).arg(radWell());
+    s += QString("QSlider::handle:vertical:hover{background:%1;border-color:%1;}")
+            .arg(c(t.accent));
+
+    // --- menus ------------------------------------------------------------
+    //
+    // The menu bar is the app's entire navigation: the app router, both EQs,
+    // the voice changer, ducking, VBAN, the analyser and both autostart
+    // switches are reachable nowhere else.
+    s += QString("QMenuBar{background:%1;color:%2;border-bottom:1px solid %3;}")
+            .arg(c(t.bg), c(t.text), c(t.border));
+    s += QString("QMenuBar::item{padding:4px 9px;background:transparent;}");
+    s += QString("QMenuBar::item:selected{background:%1;color:%2;}").arg(c(t.accent), onAccent);
+    s += QString("QMenu{background:%1;color:%2;border:1px solid %3;padding:4px;}")
             .arg(c(t.panel), c(t.text), c(t.border));
-    s += QString("QMenu::item:selected{background:%1;color:%2;}").arg(c(t.accent), onText);
-    s += QString("QStatusBar{background:%1;color:%2;}").arg(c(t.bg), c(t.textDim));
-    s += QString("QScrollBar:horizontal,QScrollBar:vertical{background:%1;border:0;}").arg(c(t.panelAlt));
-    s += QString("QScrollBar::handle{background:%1;border-radius:3px;}").arg(c(t.border));
-    s += QString("QToolTip{background:%1;color:%2;border:1px solid %3;}")
+    s += QString("QMenu::item{padding:5px 26px;border-radius:%1px;font-size:%2px;}")
+            .arg(radCtl()).arg(fsBody());
+    s += QString("QMenu::item:selected{background:%1;color:%2;}").arg(c(t.accent), onAccent);
+    s += QString("QMenu::item:disabled{color:%1;}").arg(off);
+    // Fusion's own separator is a 3-D etched groove that reads as damage on a
+    // flat palette.
+    s += QString("QMenu::separator{height:1px;background:%1;margin:4px 8px;}").arg(c(t.border));
+    s += QString("QMenu::indicator{width:13px;height:13px;}");
+
+    // --- status bar -------------------------------------------------------
+    // Seventeen showMessage() calls carry the app's whole feedback vocabulary,
+    // and they used to land as dim text on the window colour.
+    s += QString("QStatusBar{background:%1;color:%2;border-top:1px solid %3;}")
             .arg(c(t.panel), c(t.text), c(t.border));
-    s += QString("QLineEdit{background:%1;color:%2;border:1px solid %3;border-radius:3px;"
-                 "padding:1px 3px;font-size:9px;}")
-            .arg(c(t.panelAlt), c(t.text), c(t.border));
+    s += QString("QStatusBar::item{border:0;}");
+    s += QString("QStatusBar QLabel{color:%1;font-size:%2px;}").arg(dim).arg(fsCaption());
+
+    // --- scroll bars ------------------------------------------------------
+    // Handles were t.border on panelAlt: 1.37:1 to 3.12:1, failing 3:1 in nine
+    // of ten themes, with no width, no minimum length, and the platform's
+    // stepper arrows still drawn at both ends.
+    s += QString("QScrollBar:vertical{background:%1;border:0;width:11px;margin:0;}")
+            .arg(c(t.well));
+    s += QString("QScrollBar:horizontal{background:%1;border:0;height:11px;margin:0;}")
+            .arg(c(t.well));
+    s += QString("QScrollBar::handle:vertical{background:%1;border-radius:3px;min-height:28px;"
+                 "margin:2px;}").arg(edge);
+    s += QString("QScrollBar::handle:horizontal{background:%1;border-radius:3px;min-width:28px;"
+                 "margin:2px;}").arg(edge);
+    s += QString("QScrollBar::handle:hover{background:%1;}").arg(c(t.accent));
+    s += QString("QScrollBar::add-line,QScrollBar::sub-line{width:0;height:0;border:0;"
+                 "background:none;}");
+    s += QString("QScrollBar::add-page,QScrollBar::sub-page{background:none;}");
+
+    // --- misc -------------------------------------------------------------
+    s += QString("QToolTip{background:%1;color:%2;border:1px solid %3;padding:3px 6px;"
+                 "font-size:%4px;}")
+            .arg(c(t.panel), c(t.text), c(t.border)).arg(fsBody());
+    s += QString("QLineEdit{background:%1;color:%2;border:1px solid %3;border-radius:%4px;"
+                 "padding:3px 5px;font-size:%5px;}")
+            .arg(c(t.well), c(t.text), c(t.border)).arg(radCtl()).arg(fsControl());
     s += QString("QLineEdit:focus{border-color:%1;}").arg(c(t.accent));
-    // Font only, deliberately. Giving a spin box a background or border here
-    // makes the stylesheet engine take the widget over, and it then draws no
-    // step arrows at all - and unlike a combo's, those cannot be handed back to
-    // the style. The palette above already colours it to match the theme.
-    s += "QAbstractSpinBox{font-size:9px;}";
-    s += QString("QCheckBox{color:%1;font-size:9px;}").arg(c(t.text));
+    s += QString("QLineEdit:disabled{color:%1;border-color:%1;}").arg(off);
+    // The field that could not be opened marks itself.
+    s += QString("QLineEdit[bad=\"true\"]{border-color:%1;color:%2;}")
+            .arg(c(t.mute), c(bbcolor::ensureContrast(t.mute, t.well, bbcolor::kTextFloor)));
+    // Font and colour only, deliberately. Giving a spin box a background or a
+    // border makes the stylesheet engine take the widget over, and it then
+    // draws no step arrows at all - and unlike a combo's, those cannot be
+    // handed back to the style. A colour-only rule is safe; verified.
+    s += QString("QAbstractSpinBox{font-size:%1px;}").arg(fsControl());
+    s += QString("QAbstractSpinBox:disabled{color:%1;}").arg(off);
     s += QString("QFrame[role=\"sep\"]{color:%1;}").arg(c(t.border));
+    s += QString("QSplitter::handle{background:%1;}").arg(c(t.bg));
+    s += QString("QSplitter::handle:hover{background:%1;}").arg(c(t.accent));
+    s += QString("QListWidget{background:%1;border:1px solid %2;border-radius:%3px;}")
+            .arg(c(t.well), c(t.border)).arg(radCtl());
+    s += QString("QListWidget::item{padding:4px 6px;border-radius:%1px;}").arg(radWell());
+    s += QString("QListWidget::item:selected{background:%1;color:%2;}").arg(c(t.accent), onAccent);
+    s += QString("QProgressBar{background:%1;border:0;border-radius:%2px;height:6px;"
+                 "text-align:center;}").arg(c(t.well)).arg(radWell());
+    s += QString("QProgressBar::chunk{background:%1;border-radius:%2px;}")
+            .arg(c(t.accent)).arg(radWell());
     return s;
 }
-
 // ---------------------------------------------------------------------------
 // Arrow painting.
 //
@@ -241,11 +467,11 @@ QStyle* createThemedStyle() { return new ThemedStyle; }
 // See the header: this covers everything the stylesheet cannot reach.
 QPalette themePalette(const Theme& t)
 {
-    const QColor onAccent = t.dark ? QColor("#12141a") : QColor("#ffffff");
+    const QColor onAccent = onFill(t.accent);
     QPalette p;
     p.setColor(QPalette::Window,          t.bg);
     p.setColor(QPalette::WindowText,      t.text);
-    p.setColor(QPalette::Base,            t.panelAlt);
+    p.setColor(QPalette::Base,            t.well);
     p.setColor(QPalette::AlternateBase,   t.panel);
     p.setColor(QPalette::Text,            t.text);
     p.setColor(QPalette::Button,          t.panelAlt);

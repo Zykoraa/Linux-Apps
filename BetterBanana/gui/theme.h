@@ -15,8 +15,9 @@ struct Theme {
     QString name;
 
     QColor bg;         // window background
-    QColor panel;      // strip / group background
-    QColor panelAlt;   // inset areas, meter troughs
+    QColor panel;      // strip / group background - the card plane
+    QColor panelAlt;   // raised control faces: buttons, combos, line edits
+    QColor well;       // recessed: troughs, knob tracks, grooves, plot grounds
     QColor header;     // strip title plate
     QColor border;
 
@@ -55,6 +56,11 @@ QStyle*               createThemedStyle();
 // the *desktop's* colours instead of the app's, which on a dark desktop leaves
 // the light theme showing dark-on-dark boxes.
 QPalette              themePalette(const Theme& t);
+
+// Ink for a fill, and dim text lifted to clear its floor. Both derived rather
+// than written, so a palette cannot ship an unreadable pair. See gui/color.h.
+QColor                onFill(const QColor& fill);
+QColor                dimOn(const Theme& t, const QColor& bg);
 
 const QVector<Theme>& builtinThemes();
 const Theme&          theme();                 // current

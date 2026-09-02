@@ -2,6 +2,8 @@
 #include "eqdialog.h"
 #include "fxdialog.h"
 #include "theme.h"
+#include "color.h"
+#include "metrics.h"
 #include "../common/preset.h"
 #include "../engine/dsp.h"
 
@@ -37,6 +39,12 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QPixmap>
+#include <QIcon>
+#include <QProgressBar>
+#include <QScreen>
+#include <QSpacerItem>
+#include <QCloseEvent>
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -51,11 +59,11 @@ static inline int   dbSlider(float d) { return int(std::lround(d * 10.0f)); }
 
 // Buttons carry a "role" property; the theme stylesheet colours the checked
 // state from it, so switching themes needs no per-widget work.
-static QPushButton* makeToggle(const QString& text, const char* role, int h = 20)
+static QPushButton* makeToggle(const QString& text, const char* role, int h = 0)
 {
     auto* b = new QPushButton(text);
     b->setCheckable(true);
-    b->setFixedHeight(h);
+    b->setFixedHeight(h > 0 ? h : bbui::rowH());
     b->setMinimumWidth(1);
     b->setProperty("role", role);
     return b;
@@ -64,6 +72,16 @@ static QPushButton* makeToggle(const QString& text, const char* role, int h = 20
 static QLabel* makeLabel(const QString& text, const char* role, Qt::Alignment a = Qt::AlignHCenter)
 {
     auto* l = new QLabel(text);
+    l->setProperty("role", role);
+    l->setAlignment(a);
+    return l;
+}
+
+// Card headers carry names the user chose, of any length.
+static QLabel* makeHeader(const QString& text, const char* role,
+                          Qt::Alignment a = Qt::AlignHCenter)
+{
+    auto* l = new ElidedLabel(text);
     l->setProperty("role", role);
     l->setAlignment(a);
     return l;
@@ -132,17 +150,25 @@ Knob* StripWidget::addKnob(QGridLayout* g, int col, const QString& name,
 StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& title, QWidget* parent)
     : QWidget(parent), m_shm(shm), m_index(index), m_hardware(hardware)
 {
-    setProperty("role", "card");
+    // Qt only honours a stylesheet background on a plain QWidget when
+    // WA_StyledBackground is set: QStyleSheetStyle::polish sets it
+    // automatically only when metaObject() *is* QWidget's, which a moc'd
+    // subclass never is. Without this the card rule paints nothing at all,
+    // which is how every strip, bus and the tape deck spent their whole life
+    // floating directly on the window colour.
+    setProperty("role", hardware ? "card" : "cardVirtual");
+    setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(5, 4, 5, 4);
-    root->setSpacing(4);
-    m_header = makeLabel(labelFor(shm, true, index, title), "header");
+    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setSpacing(bbui::gapS());
+    m_header = makeHeader(labelFor(shm, true, index, title), "header");
     installRename(m_header, shm, true, index, title, this);
     root->addWidget(m_header);
 
     if (m_hardware) {
-        m_device = new QComboBox;
+        m_device = new DeviceCombo;
         m_device->setMinimumWidth(90);
+        m_device->setFixedHeight(bbui::rowH());
         m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         m_device->addItem("- none -", QString());
         m_device->setToolTip("Right-click to remember this strip's settings for "
@@ -155,7 +181,12 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         });
         root->addWidget(m_device);
     } else {
-        root->addWidget(makeLabel(index == kHwStrips ? "bb_vaio" : "bb_aux", "caption"));
+        auto* vl = makeLabel(index == kHwStrips ? "bb_vaio" : "bb_aux", "caption");
+        vl->setFixedHeight(bbui::rowH());   // keeps every meter top on one line
+        vl->setToolTip(index == kHwStrips
+            ? "Virtual input: whatever plays into BetterBanana Cable 1"
+            : "Virtual input: whatever plays into BetterBanana Cable 2");
+        root->addWidget(vl);
     }
 
     StripParams& p = m_shm->strip[m_index];
@@ -175,20 +206,14 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         m_compGr = new ReductionBar(ReductionBar::Comp);
         m_gateGr->setToolTip("Gate attenuation");
         m_compGr->setToolTip("Compressor gain reduction");
-        g->addWidget(m_gateGr, 2, 0);
-        g->addWidget(m_compGr, 2, 1);
+        // Side by side across the full knob row: they used to sit under two of
+        // three columns, leaving a hairline that read as a rendering slip.
+        auto* grRow = new QHBoxLayout;
+        grRow->setSpacing(bbui::gapXS());
+        grRow->addWidget(m_gateGr, 1);
+        grRow->addWidget(m_compGr, 1);
+        g->addLayout(grRow, 2, 0, 1, 3);
         root->addLayout(g);
-    }
-
-    {   // Intellipan
-        root->addWidget(makeLabel("INTELLIPAN", "caption"));
-        m_pan = new XYPad;
-        m_pan->setFixedHeight(38);
-        connect(m_pan, &XYPad::valuesChanged, this, [&p](int x, int y) {
-            p.pan_x.store(x / 100.0f);
-            p.pan_y.store(y / 100.0f);
-        });
-        root->addWidget(m_pan);
     }
 
     {   // EQ
@@ -205,8 +230,8 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         // The three knobs are a fixed tone control; the twelve-band parametric
         // and the voice changer live behind these two, as the bus EQ does.
         auto* row = new QHBoxLayout;
-        row->setSpacing(2);
-        m_eqBtn = makeToggle("EQ", "eq", 19);
+        row->setSpacing(bbui::gapXS());
+        m_eqBtn = makeToggle("EQ", "eq");
         m_eqBtn->setToolTip("Twelve-band parametric EQ, after the tone knobs.\n"
                             "Left-click: enable/bypass.  Right-click: edit.");
         m_eqBtn->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -215,7 +240,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         connect(m_eqBtn, &QPushButton::toggled, this, [&p](bool b){ p.eq.on.store(b ? 1 : 0); });
         row->addWidget(m_eqBtn);
 
-        m_fxBtn = makeToggle("FX", "solo", 19);
+        m_fxBtn = makeToggle("FX", "solo");
         m_fxBtn->setToolTip("Voice changer: pitch, drive, ring mod, crush, "
                             "chorus, echo.\n"
                             "Left-click: enable/bypass.  Right-click: edit.");
@@ -229,7 +254,7 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
 
     {   // Mono / Solo / Mute
         auto* row = new QHBoxLayout;
-        row->setSpacing(2);
+        row->setSpacing(bbui::gapXS());
         m_mono = makeToggle("MONO", "mono");
         m_solo = makeToggle("SOLO", "solo");
         m_mute = makeToggle("MUTE", "mute");
@@ -242,22 +267,27 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
 
     {   // Fader + meter
         auto* row = new QHBoxLayout;
-        row->setSpacing(3);
+        row->setSpacing(0);          // the meter is the fader's companion
         m_fader = new Fader(-600, 120, 0);
-        m_fader->setMinimumHeight(120);
         m_meter = new LevelMeter(kChan);
-        m_meter->setMinimumHeight(120);
-        m_meter->setToolTip("Click to clear the clip indicator");
+        // One travel for every strip and bus in the window: the four different
+        // meter heights used to put the same dBFS 114px apart between columns,
+        // and a meter bridge whose scale moves per column is not a bridge.
+        for (QWidget* w : { (QWidget*)m_fader, (QWidget*)m_meter })
+            w->setFixedHeight(bbui::travel());
+        m_meter->setToolTip("Click to clear this strip's clip indicator");
         m_meter->setClickHandler([this] {
-            m_shm->cmd.store(kCmdClearClip);
-            m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+            // Was the global kCmdClearClip, which wiped every strip and every
+            // bus - dismissing one red bar destroyed the evidence that another
+            // clipped while you were looking away.
+            m_shm->meters.strip_clip[m_index].store(0, std::memory_order_relaxed);
         });
         connect(m_fader, &Fader::valueChanged, this, [this, &p](int v) {
             p.gain_db.store(sliderDb(v));
             m_gainLbl->setText(QString::asprintf("%+.1f dB", sliderDb(v)));
         });
         row->addStretch(); row->addWidget(m_fader); row->addWidget(m_meter); row->addStretch();
-        root->addLayout(row, 1);
+        root->addLayout(row, 0);
     }
 
     m_gainLbl = makeLabel("+0.0 dB", "gain");
@@ -266,11 +296,28 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
     m_duckGr->setToolTip("Ducker attenuation");
     root->addWidget(m_duckGr);
 
+    {   // Intellipan. Pan is the last thing the engine does to a strip, so it
+        // belongs after the fader rather than five blocks above it.
+        //
+        // Only the X axis does anything: `pan_y` was written by the GUI, saved
+        // into presets and read by no engine file, so the dot used to move
+        // vertically to no effect whatever. XYPad pins Y until that changes.
+        m_pan = new XYPad;
+        m_pan->setFixedHeight(bbui::px(34));
+        m_pan->setToolTip("Pan. Double-click to centre.");
+        connect(m_pan, &XYPad::valuesChanged, this, [&p](int x, int) {
+            p.pan_x.store(x / 100.0f);
+        });
+        root->addWidget(m_pan);
+    }
+
     {   // Bus assignment: one row of five, as in Banana.
         auto* row = new QHBoxLayout;
-        row->setSpacing(1);
+        row->setSpacing(bbui::gapXS());
         for (int b = 0; b < kBuses; ++b) {
-            auto* btn = makeToggle(kBusLabel[b], b < kPhysBuses ? "busA" : "busB", 19);
+            auto* btn = makeToggle(kBusLabel[b], b < kPhysBuses ? "busA" : "busB",
+                                   bbui::px(19));
+            btn->setProperty("bus", b);   // per-bus hue, see buildStyleSheet
             btn->setChecked(p.bus_on[b].load() != 0);
             connect(btn, &QPushButton::toggled, this, [&p, b](bool on){ p.bus_on[b].store(on ? 1 : 0); });
             m_busBtns.push_back(btn);
@@ -278,7 +325,55 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         }
         root->addLayout(row);
     }
-    setMinimumWidth(128);
+    setMinimumWidth(bbui::px(140));
+}
+
+// Re-apply a dynamic property so the stylesheet picks it up. Qt does not
+// re-evaluate selectors on a property change by itself.
+static void restyle(QWidget* w, const char* name, bool on)
+{
+    if (w->property(name).toBool() == on) return;
+    w->setProperty(name, on);
+    w->style()->unpolish(w);
+    w->style()->polish(w);
+    w->update();
+}
+
+void StripWidget::setDimmed(bool d)
+{
+    if (d == m_dimmed) return;
+    m_dimmed = d;
+    restyle(this, "dim", d);
+}
+
+void StripWidget::setLive(bool live)
+{
+    m_meter->setStale(!live);
+    if (live) return;
+    // Reduction bars read from the engine too; a frozen one is a lie.
+    for (ReductionBar* b : { m_gateGr, m_compGr, m_duckGr })
+        if (b) b->setAmount(0.0f);
+}
+
+void StripWidget::setAttached(bool a)
+{
+    if (a == m_attached) return;
+    m_attached = a;
+    restyle(m_header, "nodev", !a);
+    m_header->setToolTip(a ? QString()
+                           : "This strip has a device selected but nothing is "
+                             "attached to it right now.");
+}
+
+// A bus renamed to "headphones" left every strip carrying a button labelled A2
+// with nothing in the window to say what A2 was.
+void StripWidget::refreshBusTips(const QStringList& names)
+{
+    for (int b = 0; b < m_busBtns.size() && b < names.size(); ++b) {
+        const QString want = QString("Send this strip to %1  (%2)")
+                                 .arg(names.at(b), kBusLabel[b]);
+        if (m_busBtns[b]->toolTip() != want) m_busBtns[b]->setToolTip(want);
+    }
 }
 
 void StripWidget::setDeviceList(const QStringList& ids, const QStringList& labels)
@@ -403,17 +498,35 @@ void StripWidget::refreshMeters()
 BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title, QWidget* parent)
     : QWidget(parent), m_shm(shm), m_index(index), m_hardware(hardware)
 {
-    setProperty("role", "card");
+    setProperty("role", hardware ? "card" : "cardVirtual");
+    setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(5, 4, 5, 4);
-    root->setSpacing(4);
-    m_header = makeLabel(labelFor(shm, false, index, title), hardware ? "headerA" : "headerB");
-    installRename(m_header, shm, false, index, title, this);
-    root->addWidget(m_header);
+    m_root = root;
+    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setSpacing(bbui::gapS());
+
+    {   // Rename a bus to "headphones" and its A-number used to vanish from the
+        // window entirely, while every strip still carried a row of buttons
+        // labelled A1..B2 pointing at nothing nameable. The code travels with
+        // the card now.
+        auto* hrow = new QHBoxLayout;
+        hrow->setSpacing(bbui::gapXS());
+        auto* tag = makeLabel(kBusLabel[index], "tag");
+        tag->setFixedWidth(bbui::px(24));
+        tag->setToolTip(hardware ? "Physical output bus" : "Virtual output bus");
+        m_header = makeHeader(labelFor(shm, false, index, title),
+                              hardware ? "headerA" : "headerB",
+                              Qt::AlignLeft | Qt::AlignVCenter);
+        installRename(m_header, shm, false, index, title, this);
+        hrow->addWidget(tag);
+        hrow->addWidget(m_header, 1);
+        root->addLayout(hrow);
+    }
 
     if (m_hardware) {
-        m_device = new QComboBox;
+        m_device = new DeviceCombo;
         m_device->setMinimumWidth(90);
+        m_device->setFixedHeight(bbui::rowH());
         m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         m_device->addItem("- none -", QString());
         connect(m_device, &QComboBox::currentIndexChanged, this, [this](int) {
@@ -421,13 +534,16 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
         });
         root->addWidget(m_device);
     } else {
-        root->addWidget(makeLabel(index == kPhysBuses ? "bb_b1" : "bb_b2", "caption"));
+        auto* vl = makeLabel(index == kPhysBuses ? "bb_b1" : "bb_b2", "caption");
+        vl->setFixedHeight(bbui::rowH());
+        vl->setToolTip("Virtual output: applications can record from this");
+        root->addWidget(vl);
     }
 
     BusParams& p = m_shm->bus[m_index];
     {
         auto* row = new QHBoxLayout;
-        row->setSpacing(2);
+        row->setSpacing(bbui::gapXS());
         m_eq   = makeToggle("EQ",   "eq");
         m_eq->setToolTip("Left-click: enable/bypass.  Right-click: edit the 12 bands.");
         m_eq->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -443,26 +559,52 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
     }
     {
         auto* row = new QHBoxLayout;
-        row->setSpacing(3);
+        row->setSpacing(0);
         m_fader = new Fader(-600, 120, 0);
-        m_fader->setMinimumHeight(170);
         m_meter = new LevelMeter(kChan);
-        m_meter->setMinimumHeight(170);
-        m_meter->setToolTip("Click to clear the clip indicator");
+        for (QWidget* w : { (QWidget*)m_fader, (QWidget*)m_meter })
+            w->setFixedHeight(bbui::travel());
+        m_meter->setToolTip("Click to clear this bus's clip indicator");
         m_meter->setClickHandler([this] {
-            m_shm->cmd.store(kCmdClearClip);
-            m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+            m_shm->meters.bus_clip[m_index].store(0, std::memory_order_relaxed);
         });
         connect(m_fader, &Fader::valueChanged, this, [this, &p](int v) {
             p.gain_db.store(sliderDb(v));
             m_gainLbl->setText(QString::asprintf("%+.1f dB", sliderDb(v)));
         });
+        // The gap that alignment leaves above a bus's fader, given a tenant.
+        m_thumb = new EqThumb;
+        m_thumb->setClickHandler([this] { emit eqEditRequested(m_index); });
+        root->addWidget(m_thumb, 0);
+
+        // Padded, not floated: a stretch here would put the bus meters wherever
+        // the surplus happened to land. MainWindow measures a strip once and
+        // sets this so every meter in the window starts on the same line.
+        m_lead = new QSpacerItem(0, 0, QSizePolicy::Minimum, QSizePolicy::Fixed);
+        root->addItem(m_lead);
         row->addStretch(); row->addWidget(m_fader); row->addWidget(m_meter); row->addStretch();
-        root->addLayout(row, 1);
+        root->addLayout(row, 0);
     }
     m_gainLbl = makeLabel("+0.0 dB", "gain");
     root->addWidget(m_gainLbl);
-    setMinimumWidth(104);
+    // A strip carries pan and a bus-assign row under its gain readout. Matching
+    // that depth here lines every meter in the console up along one baseline.
+    root->addStretch(1);
+    setMinimumWidth(bbui::px(124));
+}
+
+void BusWidget::setLive(bool live) { m_meter->setStale(!live); }
+
+int  BusWidget::meterTop() const { return m_meter->mapTo(this, QPoint(0, 0)).y(); }
+int  BusWidget::leadPad() const  { return m_lead ? m_lead->geometry().height() : 0; }
+int  StripWidget::meterTop() const { return m_meter->mapTo(this, QPoint(0, 0)).y(); }
+
+void BusWidget::setLeadPad(int px)
+{
+    if (!m_lead || px < 0) return;
+    if (m_lead->sizeHint().height() == px) return;
+    m_lead->changeSize(0, px, QSizePolicy::Minimum, QSizePolicy::Fixed);
+    m_root->invalidate();
 }
 
 void BusWidget::setDeviceList(const QStringList& ids, const QStringList& labels)
@@ -508,6 +650,20 @@ void BusWidget::pullFromShm()
     m_mute->setChecked(p.mute.load());
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     m_header->setText(labelFor(m_shm, false, m_index, kBusLabel[m_index]));
+
+    if (m_thumb) {
+        // Log-spaced, 20 Hz .. 20 kHz, one sample per two pixels. Cheap enough
+        // at the 2 Hz sync rate that drives this, and it uses the engine's own
+        // response function so the thumbnail cannot drift from the sound.
+        const EqProfile prof = eq_capture(p.eq);
+        const int n = qMax(2, m_thumb->width() / 2);
+        QVector<float> curve(n);
+        for (int i = 0; i < n; ++i) {
+            const double f = 20.0 * std::pow(1000.0, double(i) / (n - 1));
+            curve[i] = eq_response_db(prof, float(f)) + prof.preamp;
+        }
+        m_thumb->setCurve(curve, p.eq.on.load() != 0);
+    }
 }
 
 void BusWidget::refreshMeters()
@@ -540,9 +696,16 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
     : QWidget(parent), m_shm(shm)
 {
     setProperty("role", "card");
+    setAttribute(Qt::WA_StyledBackground, true);
     auto* root = new QHBoxLayout(this);
-    root->setContentsMargins(6, 4, 6, 4);
-    root->setSpacing(8);
+    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setSpacing(bbui::gapM());
+
+    {   // The card names itself now that it is no longer inside a group box.
+        auto* title = makeLabel("RECORDER", "caption", Qt::AlignLeft | Qt::AlignVCenter);
+        title->setFixedWidth(bbui::px(76));
+        root->addWidget(title);
+    }
 
     // Record side
     auto* recCol = new QVBoxLayout;
@@ -552,11 +715,16 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         r->setSpacing(3);
         r->addWidget(makeLabel("REC FILE", "caption", Qt::AlignLeft));
         m_recPath = new QLineEdit(QDir::homePath() + "/betterbanana-take.wav");
-        m_recPath->setMinimumWidth(220);
+        m_recPath->setMinimumWidth(bbui::px(200));
+        m_recPath->setMaximumWidth(bbui::px(520));
+        m_recPath->setPlaceholderText("where to record to");
+        // Right-aligned: a 900px field showing 150px of "/home/eve" and hiding
+        // the filename is the wrong end of the path to keep.
+        m_recPath->setAlignment(Qt::AlignRight);
         connect(m_recPath, &QLineEdit::editingFinished, this, [this]{ writePaths(); });
         r->addWidget(m_recPath, 1);
         auto* browse = new QPushButton("...");
-        browse->setFixedWidth(26);
+        browse->setFixedWidth(bbui::px(28));
         connect(browse, &QPushButton::clicked, this, [this] {
             const QString f = QFileDialog::getSaveFileName(this, "Record to", m_recPath->text(),
                                                            "WAV audio (*.wav)");
@@ -570,7 +738,7 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         connect(m_srcBus, &QComboBox::currentIndexChanged, this,
                 [this](int i){ m_shm->rec.source_bus.store(i); });
         r->addWidget(m_srcBus);
-        m_rec = makeToggle("● REC", "rec", 22);
+        m_rec = makeToggle("● REC", "rec");
         connect(m_rec, &QPushButton::clicked, this, [this] {
             writePaths();
             sendCmd(m_shm->rec.state.load() == kRecRecording ? kCmdRecStop : kCmdRecStart);
@@ -584,24 +752,27 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         r->setSpacing(3);
         r->addWidget(makeLabel("PLAY FILE", "caption", Qt::AlignLeft));
         m_playPath = new QLineEdit;
-        m_playPath->setMinimumWidth(220);
+        m_playPath->setMinimumWidth(bbui::px(200));
+        m_playPath->setMaximumWidth(bbui::px(520));
+        m_playPath->setPlaceholderText("a file to play into the mixer");
+        m_playPath->setAlignment(Qt::AlignRight);
         connect(m_playPath, &QLineEdit::editingFinished, this, [this]{ writePaths(); });
         r->addWidget(m_playPath, 1);
         auto* browse = new QPushButton("...");
-        browse->setFixedWidth(26);
+        browse->setFixedWidth(bbui::px(28));
         connect(browse, &QPushButton::clicked, this, [this] {
             const QString f = QFileDialog::getOpenFileName(this, "Play file", QDir::homePath(),
                                         "Audio (*.wav *.flac *.ogg *.aiff);;All files (*)");
             if (!f.isEmpty()) { m_playPath->setText(f); writePaths(); }
         });
         r->addWidget(browse);
-        m_play = makeToggle("▶ PLAY", "accent", 22);
+        m_play = makeToggle("▶ PLAY", "accent");
         connect(m_play, &QPushButton::clicked, this, [this] {
             writePaths();
             sendCmd(m_shm->rec.state.load() == kRecPlaying ? kCmdPlayStop : kCmdPlayStart);
         });
         r->addWidget(m_play);
-        m_loop = makeToggle("LOOP", "accent", 22);
+        m_loop = makeToggle("LOOP", "accent");
         connect(m_loop, &QPushButton::toggled, this,
                 [this](bool b){ m_shm->rec.loop.store(b ? 1 : 0); });
         r->addWidget(m_loop);
@@ -617,7 +788,9 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         auto* r = new QHBoxLayout;
         r->setSpacing(1);
         for (int b = 0; b < kBuses; ++b) {
-            auto* btn = makeToggle(kBusLabel[b], b < kPhysBuses ? "busA" : "busB", 19);
+            auto* btn = makeToggle(kBusLabel[b], b < kPhysBuses ? "busA" : "busB",
+                                   bbui::px(19));
+            btn->setProperty("bus", b);
             btn->setChecked(m_shm->rec.bus_on[b].load() != 0);
             connect(btn, &QPushButton::toggled, this,
                     [this, b](bool on){ m_shm->rec.bus_on[b].store(on ? 1 : 0); });
@@ -627,20 +800,47 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         col->addLayout(r);
         root->addLayout(col);
     }
+    {   // The 180px void in the middle of the bar, given a tenant: a timecode
+        // the widget already formatted but only ever printed into a caption,
+        // a position bar, and a meter on what is actually being recorded.
+        auto* col = new QVBoxLayout;
+        col->setSpacing(bbui::gapXS());
+        m_time = makeLabel("--:--", "gain", Qt::AlignHCenter);
+        col->addWidget(m_time);
+        m_progress = new QProgressBar;
+        m_progress->setTextVisible(false);
+        m_progress->setFixedHeight(bbui::px(6));
+        m_progress->setRange(0, 1000);
+        m_progress->setValue(0);
+        col->addWidget(m_progress);
+        m_status = makeLabel("idle", "caption", Qt::AlignHCenter);
+        col->addWidget(m_status);
+        col->addStretch();
+        root->addLayout(col, 0);
+        m_time->setMinimumWidth(bbui::px(120));
+    }
+    {
+        m_meter = new LevelMeter(kChan);
+        m_meter->setFixedHeight(bbui::px(46));
+        m_meter->setToolTip("The bus being recorded");
+        root->addWidget(m_meter);
+    }
     {
         auto* col = new QVBoxLayout;
-        col->setSpacing(1);
-        col->addWidget(makeLabel("GAIN", "caption"));
+        col->setSpacing(bbui::gapXS());
+        auto* gr = new QHBoxLayout;
+        gr->setSpacing(bbui::gapXS());
+        // Caption beside the knob, not stacked above it: stacking is what
+        // inflated the whole bar by a row for one word.
+        gr->addWidget(makeLabel("GAIN", "caption", Qt::AlignRight | Qt::AlignVCenter));
         m_gain = new Knob(-600, 120, 0, true, " dB");
+        gr->addWidget(m_gain);
         connect(m_gain, &Knob::valueChanged, this,
                 [this](int v){ m_shm->rec.gain_db.store(v / 10.0f); });
-        col->addWidget(m_gain, 0, Qt::AlignHCenter);
+        col->addLayout(gr);
+        col->addStretch();
         root->addLayout(col);
     }
-
-    m_status = makeLabel("idle", "value", Qt::AlignRight | Qt::AlignVCenter);
-    m_status->setMinimumWidth(190);
-    root->addWidget(m_status);
 }
 
 void RecorderWidget::refresh()
@@ -659,12 +859,47 @@ void RecorderWidget::refresh()
         return QString::asprintf("%u:%02u", s / 60, s % 60);
     };
     const int err = m_shm->rec.err.load();
-    if (err == 1)      m_status->setText("cannot open record file");
-    else if (err == 2) m_status->setText("cannot open playback file");
-    else if (st == kRecRecording) m_status->setText("● recording  " + mmss(wr));
-    else if (st == kRecPlaying)   m_status->setText("▶ " + mmss(pl) + " / " + mmss(tot));
-    else if (wr) m_status->setText("stopped  " + mmss(wr) + " recorded");
+
+    // The offending field is marked, rather than an error printed 450px away.
+    m_recPath->setProperty("bad", err == 1);
+    m_playPath->setProperty("bad", err == 2);
+    for (QLineEdit* e : { m_recPath, m_playPath }) {
+        e->style()->unpolish(e);
+        e->style()->polish(e);
+    }
+
+    if (err == 1)      m_status->setText("cannot open the record file");
+    else if (err == 2) m_status->setText("cannot open the playback file");
+    else if (st == kRecRecording) m_status->setText("recording");
+    else if (st == kRecPlaying)   m_status->setText("playing");
+    else if (wr) m_status->setText("stopped");
     else m_status->setText("idle");
+
+    if (st == kRecRecording)   m_time->setText(mmss(wr));
+    else if (st == kRecPlaying) m_time->setText(mmss(pl) + " / " + mmss(tot));
+    else if (wr)                m_time->setText(mmss(wr));
+    else                        m_time->setText("--:--");
+
+    m_progress->setValue(st == kRecPlaying && tot > 0
+                             ? int(qBound<double>(0, 1000.0 * pl / tot, 1000))
+                             : 0);
+    m_progress->setVisible(st == kRecPlaying && tot > 0);
+
+    // Meter whatever is being recorded, so a take that is silent looks silent.
+    if (st == kRecRecording) {
+        const int b = qBound(0, m_shm->rec.source_bus.load(), kBuses - 1);
+        float v[kChan];
+        for (int c = 0; c < kChan; ++c)
+            v[c] = m_shm->meters.bus_out[b][c].load(std::memory_order_relaxed);
+        m_meter->setLevels(v, kChan);
+    } else {
+        m_meter->setStale(true);
+    }
+
+    // Nothing to record to, nothing to play: say so with the control's state.
+    m_rec->setEnabled(!m_recPath->text().trimmed().isEmpty());
+    m_play->setEnabled(!m_playPath->text().trimmed().isEmpty());
+    m_loop->setEnabled(m_play->isEnabled());
 
     for (int b = 0; b < m_busBtns.size(); ++b) {
         QSignalBlocker blk(m_busBtns[b]);
@@ -1254,22 +1489,32 @@ static void setGuiAutostart(bool on)
 MainWindow::MainWindow(Shared* shm, QWidget* parent)
     : QMainWindow(parent), m_shm(shm)
 {
-    setWindowTitle("BetterBanana (Linux)");
+    // Set from the loaded preset, see refreshTitle(). "(Linux)" was a port note.
+    refreshTitle();
 
     auto* central = new QWidget;
     auto* outer = new QVBoxLayout(central);
-    outer->setContentsMargins(6, 6, 6, 6);
-    outer->setSpacing(6);
+    outer->setContentsMargins(bbui::gapM(), bbui::gapM(), bbui::gapM(), bbui::gapM());
+    outer->setSpacing(bbui::gapM());
+
+    // A banner across the top for the one condition where every control in the
+    // window is writing into shared memory nobody is reading.
+    m_alert = new QLabel;
+    m_alert->setProperty("role", "alert");
+    m_alert->setWordWrap(true);
+    m_alert->setVisible(false);
+    outer->addWidget(m_alert);
 
     auto* row = new QHBoxLayout;
-    row->setSpacing(6);
+    row->setSpacing(bbui::gapM());
 
     auto* inBox = new QGroupBox("INPUTS");
     auto* inRow = new QHBoxLayout(inBox);
-    inRow->setSpacing(2);
+    inRow->setSpacing(bbui::gapS());
+    // Short enough to fit a card without eliding; the long form was clipped to
+    // "HARDWARE IN..." at every window size the app is actually used at.
     static const char* stripTitle[kStrips] = {
-        "HARDWARE INPUT 1", "HARDWARE INPUT 2", "HARDWARE INPUT 3",
-        "BETTERBANANA VAIO", "BETTERBANANA AUX"
+        "HW INPUT 1", "HW INPUT 2", "HW INPUT 3", "VAIO", "AUX"
     };
     for (int i = 0; i < kStrips; ++i) {
         auto* s = new StripWidget(m_shm, i, i < kHwStrips, stripTitle[i]);
@@ -1282,21 +1527,18 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
         connect(s, &StripWidget::eqEditRequested, this, &MainWindow::openStripEq);
         connect(s, &StripWidget::fxEditRequested, this, &MainWindow::openStripFx);
         connect(s, &StripWidget::statusMessage, this,
-                [this](const QString& t) { statusBar()->showMessage(t, 7000); });
+                [this](const QString& t) { say(t); });
         m_strips.push_back(s);
         inRow->addWidget(s);
-        if (i == kHwStrips - 1) {
-            auto* sep = new QFrame;
-            sep->setFrameShape(QFrame::VLine);
-            sep->setProperty("role", "sep");
-            inRow->addWidget(sep);
-        }
+        // Two classes of input, separated by a real gutter. A 1px bevel in 2px
+        // of space read as a rendering seam, not a boundary.
+        if (i == kHwStrips - 1) inRow->addSpacing(bbui::gapL());
     }
     row->addWidget(inBox, 5);
 
     auto* outBox = new QGroupBox("BUSES");
     auto* outRow = new QHBoxLayout(outBox);
-    outRow->setSpacing(2);
+    outRow->setSpacing(bbui::gapS());
     for (int b = 0; b < kBuses; ++b) {
         auto* w = new BusWidget(m_shm, b, b < kPhysBuses, kBusLabel[b]);
         connect(w, &BusWidget::routingChanged, this,
@@ -1308,22 +1550,19 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
         connect(w, &BusWidget::eqEditRequested, this, &MainWindow::openBusEq);
         m_buses.push_back(w);
         outRow->addWidget(w);
-        if (b == kPhysBuses - 1) {
-            auto* sep = new QFrame;
-            sep->setFrameShape(QFrame::VLine);
-            sep->setProperty("role", "sep");
-            outRow->addWidget(sep);
-        }
+        if (b == kPhysBuses - 1) outRow->addSpacing(bbui::gapL());
     }
     row->addWidget(outBox, 5);
-    outer->addLayout(row, 1);
+    outer->addLayout(row, 0);
 
-    auto* recBox = new QGroupBox("RECORDER");
-    auto* recLay = new QVBoxLayout(recBox);
-    recLay->setContentsMargins(4, 2, 4, 2);
+    // The height the console does not need goes here, above the tape deck,
+    // rather than into the faders. Tier 3 puts a dock in it.
+    outer->addStretch(1);
+
+    // The recorder is a card in its own right now that cards paint; a plate
+    // inside a group box would be framed twice.
     m_recorder = new RecorderWidget(m_shm);
-    recLay->addWidget(m_recorder);
-    outer->addWidget(recBox);
+    outer->addWidget(m_recorder);
 
     auto* scroll = new QScrollArea;
     scroll->setWidget(central);
@@ -1338,6 +1577,13 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
 
     QSettings st("betterbanana", "gui");
     applyTheme(st.value("theme", 0).toInt());
+    // Below this the bus section clips and the recorder collapses to a title
+    // with a scrollbar, which is what a 1366x768 laptop used to get.
+    setMinimumSize(bbui::px(1040), bbui::px(640));
+    // A screen-clamped restore, so the mixer cannot open wider than the display
+    // it is opening on. The hard-coded 1500x720 was nothing like the size this
+    // window actually gets dragged to.
+    restoreWindowGeometry();
 
     for (auto* s : m_strips) s->pullFromShm();
     for (auto* b : m_buses)  b->pullFromShm();
@@ -1351,6 +1597,114 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
     m_timer->start(33);
+}
+
+void MainWindow::refreshTitle()
+{
+    QString t = "BetterBanana";
+    if (!m_presetName.isEmpty()) t += "  -  " + m_presetName;
+    if (m_dirty) t += " *";
+    if (windowTitle() != t) setWindowTitle(t);
+}
+
+void MainWindow::say(const QString& text, int ms)
+{
+    statusBar()->showMessage(text, ms);
+}
+
+// A swatch painted from the palette itself, in the icon gutter Qt already
+// reserves for a menu item. Ten hand-transcribed palettes were being chosen
+// from ten lines of plain text.
+static QIcon themeSwatch(const Theme& t)
+{
+    QPixmap pm(bbui::px(44), bbui::px(12));
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing);
+    const QRectF r(0.5, 0.5, pm.width() - 1.0, pm.height() - 1.0);
+    p.setPen(Qt::NoPen);
+    p.setBrush(t.bg);
+    p.drawRoundedRect(r, 2, 2);
+    const QColor bars[] = { t.panel, t.accent, t.busA, t.busB, t.mute, t.solo };
+    const double bw = r.width() / 8.0;
+    for (int i = 0; i < 6; ++i) {
+        p.setBrush(bars[i]);
+        p.drawRect(QRectF(r.left() + bw * (i + 1), r.top() + 2, bw - 1, r.height() - 4));
+    }
+    p.setPen(QPen(t.border, 1.0));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(r, 2, 2);
+    return QIcon(pm);
+}
+
+void MainWindow::restoreWindowGeometry()
+{
+    const QByteArray g = QSettings("betterbanana", "gui").value("geometry/main").toByteArray();
+    if (!g.isEmpty() && restoreGeometry(g)) {
+        // A saved geometry from a bigger display must not open off-screen.
+        const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 720);
+        QRect r = frameGeometry();
+        r.setWidth(qMin(r.width(), avail.width()));
+        r.setHeight(qMin(r.height(), avail.height()));
+        if (!avail.intersects(r)) r.moveTo(avail.topLeft());
+        setGeometry(QRect(r.topLeft(), size().boundedTo(avail.size())));
+        return;
+    }
+    const QRect avail = screen() ? screen()->availableGeometry() : QRect(0, 0, 1280, 720);
+    resize(qMin(1500, avail.width() - 40), qMin(860, avail.height() - 60));
+}
+
+void MainWindow::saveWindowGeometry()
+{
+    QSettings("betterbanana", "gui").setValue("geometry/main", saveGeometry());
+}
+
+void MainWindow::closeEvent(QCloseEvent* e)
+{
+    saveWindowGeometry();
+    QMainWindow::closeEvent(e);
+}
+
+// Everything a card can say about itself that is not a level.
+void MainWindow::refreshCardStates()
+{
+    bool anySolo = false;
+    for (int i = 0; i < kStrips; ++i)
+        anySolo = anySolo || m_shm->strip[i].solo.load(std::memory_order_relaxed) != 0;
+
+    for (int i = 0; i < kStrips && i < m_strips.size(); ++i) {
+        auto* w = m_strips[i];
+        w->setLive(m_engineLive);
+        // Soloing one strip silences four others, and the only evidence used to
+        // be one small yellow button on the strip that caused it.
+        w->setDimmed(anySolo && m_shm->strip[i].solo.load(std::memory_order_relaxed) == 0);
+        // `present` is maintained by the engine at three call sites and was
+        // read by the GUI nowhere: an unplugged interface looked identical to a
+        // live one.
+        const bool named = w->isHardware() && !m_hwIn[qMin(i, kHwStrips - 1)].isEmpty();
+        w->setAttached(!named || m_shm->strip[i].present.load(std::memory_order_relaxed) != 0);
+    }
+    for (auto* b : m_buses) b->setLive(m_engineLive);
+
+    QStringList busNames;
+    for (int b = 0; b < kBuses; ++b) busNames << labelFor(m_shm, false, b, kBusLabel[b]);
+    for (auto* w : m_strips) w->refreshBusTips(busNames);
+}
+
+void MainWindow::showAbout()
+{
+    QMessageBox box(this);
+    box.setWindowTitle("About BetterBanana");
+    box.setTextFormat(Qt::RichText);
+    box.setText(QString("<b>BetterBanana %1</b><br>A Voicemeeter-Banana-style "
+                        "mixer for PipeWire.")
+                    .arg(QApplication::applicationVersion()));
+    box.setInformativeText(
+        QString("Engine protocol v%1  ·  %2 Hz  ·  %3 inputs, %4 buses<br><br>"
+                "MIT licensed. <a href=\"https://github.com/Zykoraa/Linux-Apps\">"
+                "github.com/Zykoraa/Linux-Apps</a>")
+            .arg(kVersion).arg(m_shm->samplerate.load()).arg(kStrips).arg(kBuses));
+    box.exec();
 }
 
 void MainWindow::openVbanDialog() { VbanDialog(m_shm, this).exec(); }
@@ -1464,7 +1818,7 @@ void MainWindow::openMicAnalyzer(const QString& source, const QString& label)
             err + "\n\nRun it yourself with:\n\n    " + cmd.join(" "));
         return;
     }
-    statusBar()->showMessage("Analysing " + label + " in a terminal", 5000);
+    say("Analysing " + label + " in a terminal");
 }
 
 // Rebuilt each time the menu opens, so it names whatever is assigned now.
@@ -1509,7 +1863,10 @@ void MainWindow::buildMenus()
             QMessageBox::warning(this, "BetterBanana", "Could not write " + f);
             return;
         }
-        statusBar()->showMessage("Saved " + f, 4000);
+        m_presetName = QFileInfo(f).completeBaseName();
+        m_dirty = false;
+        refreshTitle();
+        say("Saved " + f);
         // Asked once, and only while nothing is set: the engine starts with a
         // default mixer until something is chosen, which is worth saying out
         // loud the first time rather than leaving to be discovered.
@@ -1525,7 +1882,7 @@ void MainWindow::buildMenus()
                                 QString::fromStdString(preset_path_for(name.toStdString()))
                                 ? name.toStdString()
                                 : f.toStdString());
-        statusBar()->showMessage("\"" + name + "\" will load when the engine starts", 6000);
+        say("\"" + name + "\" will load when the engine starts", 6000);
     });
     file->addAction("&Load preset...", QKeySequence("Ctrl+O"), this, [this] {
         const QString f = QFileDialog::getOpenFileName(this, "Load preset",
@@ -1536,12 +1893,15 @@ void MainWindow::buildMenus()
             m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
             for (auto* s : m_strips) s->pullFromShm();
             for (auto* b : m_buses)  b->pullFromShm();
-            statusBar()->showMessage("Loaded " + f, 4000);
+            m_presetName = QFileInfo(f).completeBaseName();
+            m_dirty = false;
+            refreshTitle();
+            say("Loaded " + f);
             // The engine re-finds a device whose node name moved on its next
             // control poll, so give it one before reporting what is missing.
             QTimer::singleShot(800, this, &MainWindow::reportMissingDevices);
         } else {
-            statusBar()->showMessage("Could not read " + f, 6000);
+            say("Could not read " + f, 6000);
         }
     });
     file->addSeparator();
@@ -1619,15 +1979,15 @@ void MainWindow::buildMenus()
     m_autoEngine = boot->addAction("Audio engine", this, [this](bool on) {
         setEngineAutostart(on);
         refreshAutostart();
-        statusBar()->showMessage(on ? "Engine will start at login"
-                                    : "Engine will no longer start at login", 4000);
+        say(on ? "Engine will start at login"
+                                    : "Engine will no longer start at login");
     });
     m_autoEngine->setCheckable(true);
     m_autoGui = boot->addAction("Mixer window", this, [this](bool on) {
         setGuiAutostart(on);
         refreshAutostart();
-        statusBar()->showMessage(on ? "Mixer will open at login"
-                                    : "Mixer will no longer open at login", 4000);
+        say(on ? "Mixer will open at login"
+                                    : "Mixer will no longer open at login");
     });
     m_autoGui->setCheckable(true);
     // Reflect changes made outside the app (systemctl, another window).
@@ -1635,18 +1995,61 @@ void MainWindow::buildMenus()
     refreshAutostart();
 
     eng->addSeparator();
-    eng->addAction("&Quit GUI", QKeySequence("Ctrl+Q"), this, [] { QApplication::quit(); });
+    // close(), not quit(): QApplication::quit() delivers no close event, so
+    // the window geometry would never be saved.
+    eng->addAction("&Quit GUI", QKeySequence("Ctrl+Q"), this, [this] { close(); });
 
-    auto* view = menuBar()->addMenu("&Theme");
+    auto* view = menuBar()->addMenu("&View");
+    {   // A preference on top of the compositor's scale, not a HiDPI fix.
+        auto* zoom = view->addMenu("Interface &size");
+        auto* zg = new QActionGroup(this);
+        const int cur = QSettings("betterbanana", "gui").value("uiScale", 100).toInt();
+        for (int pct : { 100, 125, 150, 175 }) {
+            QAction* a = zoom->addAction(QString::number(pct) + "%", this, [this, pct] {
+                QSettings("betterbanana", "gui").setValue("uiScale", pct);
+                if (QMessageBox::question(this, "BetterBanana",
+                        "Restart the mixer window to apply the new size?\n\n"
+                        "The audio engine keeps running, so nothing you hear stops.")
+                    == QMessageBox::Yes) {
+                    saveWindowGeometry();
+                    QProcess::startDetached(QApplication::applicationFilePath(), {});
+                    close();
+                }
+            });
+            a->setCheckable(true);
+            a->setChecked(pct == cur);
+            zg->addAction(a);
+        }
+        view->addSeparator();
+    }
     auto* group = new QActionGroup(this);
     group->setExclusive(true);
     const auto& themes = builtinThemes();
     for (int i = 0; i < themes.size(); ++i) {
-        auto* a = view->addAction(themes[i].name, this, [this, i] { applyTheme(i); });
+        auto* a = view->addAction(themeSwatch(themes[i]), themes[i].name, this,
+                                  [this, i] { applyTheme(i); });
         a->setCheckable(true);
         group->addAction(a);
         m_themeActions.push_back(a);
     }
+
+    auto* help = menuBar()->addMenu("&Help");
+    help->addAction("&Keyboard and mouse...", this, [this] {
+        QMessageBox::information(this, "Keyboard and mouse",
+            "Faders and knobs\n"
+            "  drag            change the value\n"
+            "  Ctrl + drag     fine control\n"
+            "  double-click    back to the default\n"
+            "  wheel           step (fader must be clicked first)\n"
+            "  arrows          step, once focused\n"
+            "  middle-click    jump straight to a position (faders)\n\n"
+            "Strips and buses\n"
+            "  right-click EQ or FX    open its editor\n"
+            "  right-click a title     rename it\n"
+            "  right-click a device    remember settings for that device\n"
+            "  click a meter           clear that column's clip indicator");
+    });
+    help->addAction("&About BetterBanana", this, &MainWindow::showAbout);
 }
 
 // Lists the saved presets so one can be picked as what the engine restores at
@@ -1660,7 +2063,7 @@ void MainWindow::populateStartupMenu(QMenu* menu)
 
     QAction* none = menu->addAction("(none - start with a default mixer)", this, [this] {
         set_startup_preset_name(std::string());
-        statusBar()->showMessage("The engine will start with a default mixer", 5000);
+        say("The engine will start with a default mixer");
     });
     none->setCheckable(true);
     none->setChecked(cur.isEmpty());
@@ -1679,7 +2082,7 @@ void MainWindow::populateStartupMenu(QMenu* menu)
         const QString name = QFileInfo(f).completeBaseName();
         QAction* a = menu->addAction(name, this, [this, name] {
             set_startup_preset_name(name.toStdString());
-            statusBar()->showMessage("\"" + name + "\" will load when the engine starts", 6000);
+            say("\"" + name + "\" will load when the engine starts", 6000);
         });
         a->setCheckable(true);
         a->setChecked(name == cur);
@@ -1771,6 +2174,9 @@ void MainWindow::snapshotTick()
     m_redo.clear();
     m_committed = cur;
     refreshUndoActions();
+    // The mixer has moved since the preset was loaded or saved. Say so in the
+    // title, which on a tiling compositor may be the only chrome there is.
+    if (!m_dirty && !m_presetName.isEmpty()) { m_dirty = true; refreshTitle(); }
 }
 
 void MainWindow::applyState(const QByteArray& text)
@@ -1789,19 +2195,19 @@ void MainWindow::applyState(const QByteArray& text)
 
 void MainWindow::undo()
 {
-    if (m_undo.isEmpty()) { statusBar()->showMessage("Nothing to undo", 2500); return; }
+    if (m_undo.isEmpty()) { say("Nothing to undo"); return; }
     m_redo.append(m_committed);
     applyState(m_undo.takeLast());
-    statusBar()->showMessage(QString("Undone  (%1 step%2 left)")
-                             .arg(m_undo.size()).arg(m_undo.size() == 1 ? "" : "s"), 3000);
+    say(QString("Undone  (%1 step%2 left)")
+                             .arg(m_undo.size()).arg(m_undo.size() == 1 ? "" : "s"));
 }
 
 void MainWindow::redo()
 {
-    if (m_redo.isEmpty()) { statusBar()->showMessage("Nothing to redo", 2500); return; }
+    if (m_redo.isEmpty()) { say("Nothing to redo"); return; }
     m_undo.append(m_committed);
     applyState(m_redo.takeLast());
-    statusBar()->showMessage("Redone", 3000);
+    say("Redone");
 }
 
 void MainWindow::refreshUndoActions()
@@ -1819,8 +2225,8 @@ void MainWindow::applyDeviceStrip(int strip, const QString& device)
     if (!has_strip_for_device(device.toStdString())) return;
     if (!load_strip_for_device(m_shm, strip, device.toStdString())) return;
     m_strips[strip]->pullFromShm();
-    statusBar()->showMessage(
-        QString("Restored the settings remembered for %1").arg(device), 6000);
+    say(
+        QString("Restored the settings remembered for %1").arg(device));
 }
 
 // After loading a preset, say plainly which of the devices it names are not
@@ -1858,8 +2264,8 @@ void MainWindow::applyDeviceEq(int bus, const QString& device)
     const QString name = AutoEqDialog::applyRemembered(m_shm, bus, device);
     if (name.isEmpty()) return;
     m_buses[bus]->pullFromShm();
-    statusBar()->showMessage(QString("%1: applied EQ profile \"%2\"")
-                             .arg(kBusLabel[bus], name), 6000);
+    say(QString("%1: applied EQ profile \"%2\"")
+                             .arg(kBusLabel[bus], name));
 }
 
 void MainWindow::writeRouting()
@@ -1891,8 +2297,8 @@ void MainWindow::refreshDevices()
     for (int i = 0; i < kHwStrips; ++i) m_strips[i]->setDeviceList(srcIds, srcLabels);
     for (int b = 0; b < kPhysBuses; ++b) m_buses[b]->setDeviceList(sinkIds, sinkLabels);
     readRouting();
-    statusBar()->showMessage(QString("%1 capture / %2 playback devices")
-                             .arg(srcIds.size() - kCables).arg(sinkIds.size()), 4000);
+    say(QString("%1 capture / %2 playback devices")
+                             .arg(srcIds.size() - kCables).arg(sinkIds.size()));
 }
 
 // Re-route newly appeared streams according to the saved rules. Applied once
@@ -1927,8 +2333,10 @@ void MainWindow::tick()
 {
     if (++m_ruleTicks >= 30) { m_ruleTicks = 0; applyAppRules(); }
 
-    for (auto* s : m_strips) s->refreshMeters();
-    for (auto* b : m_buses)  b->refreshMeters();
+    if (m_engineLive) {
+        for (auto* s : m_strips) s->refreshMeters();
+        for (auto* b : m_buses)  b->refreshMeters();
+    }
     m_recorder->refresh();
 
     if (++m_syncTicks >= 15) {          // twice a second
@@ -1943,16 +2351,46 @@ void MainWindow::tick()
         snapshotTick();
     }
 
+    // Engine liveness first: the meters below have to know before they paint,
+    // or a dead engine leaves ten lit bars frozen exactly where they stopped.
     const uint32_t hb = m_shm->engine_heartbeat.load(std::memory_order_relaxed);
     if (hb == m_lastHeartbeat) ++m_stallTicks; else m_stallTicks = 0;
     m_lastHeartbeat = hb;
     const bool live = m_stallTicks < 30;
-    m_status->setText(live
-        ? QString("engine %1  ·  %2 Hz  ·  dsp %3%")
-              .arg(m_shm->engine_pid.load())
-              .arg(m_shm->samplerate.load())
+    if (live != m_engineLive) {
+        m_engineLive = live;
+        m_alert->setText(live ? QString()
+                              : "The audio engine has stopped responding. "
+                                "Nothing you change here is reaching it.");
+        m_alert->setVisible(!live);
+        refreshCardStates();
+    }
+
+    // dsp load leads: it is the one number here that predicts a glitch. The PID
+    // is diagnostics, so it goes last.
+    const QString txt = live
+        ? QString("dsp %1%   ·   %2 Hz   ·   engine %3")
               .arg(m_shm->dsp_load.load() / 10.0, 0, 'f', 1)
-        : QString("engine not responding"));
-    m_status->setStyleSheet(live ? QString("color:%1;").arg(theme().busA.name())
-                                 : QString("color:%1;").arg(theme().mute.name()));
+              .arg(m_shm->samplerate.load())
+              .arg(m_shm->engine_pid.load())
+        : QString("engine not responding");
+    // No unconditional setStyleSheet: this used to re-parse a sheet 30x a
+    // second for a string that had not changed.
+    if (m_status->text() != txt) {
+        m_status->setText(txt);
+        m_status->setStyleSheet(QString("color:%1;")
+            .arg(bbcolor::ensureContrast(live ? theme().busA : theme().mute,
+                                         theme().panel, bbcolor::kTextFloor)
+                     .name(QColor::HexRgb)));
+    }
+
+    if (++m_stateTicks >= 15) { m_stateTicks = 0; refreshCardStates(); }
+
+    // Bring every meter onto one baseline once the layout has settled. Cheap,
+    // idempotent, and it re-runs after a theme or interface-size change because
+    // the measured offsets move with them.
+    if (!m_strips.isEmpty()) {
+        const int want = m_strips.first()->meterTop();
+        for (auto* b : m_buses) b->setLeadPad(want - (b->meterTop() - b->leadPad()));
+    }
 }

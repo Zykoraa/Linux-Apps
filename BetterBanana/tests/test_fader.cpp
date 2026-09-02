@@ -69,13 +69,45 @@ int main(int argc, char** argv)
         std::printf("  skip  wheel-when-focused (offscreen platform grants no focus)\n");
     }
 
-    // A single press positions the fader; only the second click resets it.
+    // A left press away from the cap pages toward the click. It used to jump
+    // straight to it, which made a mis-click 2px from the bottom an instant
+    // -60 dB on a live mix - so this asserts the fader moves *toward* the
+    // click without landing on it.
     f.setValue(-300);
     QMouseEvent press(QEvent::MouseButtonPress, QPointF(12, 190),
                       f.mapToGlobal(QPointF(12, 190)),
                       Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
     QApplication::sendEvent(&f, &press);
-    chk(f.value() < -400, "single click near the bottom lowers the fader", f.value(), -400);
+    chk(f.value() < -300, "click below the cap pages down", f.value(), -300);
+    chk(f.value() > -400, "click below the cap does not jump to the click",
+        f.value(), -400);
+    {   // One page is (hi - lo) / 20 = 36 raw units, in either direction.
+        const int paged = f.value();
+        chk(paged == -336, "a page is 3.6 dB", paged, -336);
+    }
+
+    // Middle-click keeps the old absolute positioning, for anyone who wants it.
+    f.setValue(-300);
+    QMouseEvent mid(QEvent::MouseButtonPress, QPointF(12, 190),
+                    f.mapToGlobal(QPointF(12, 190)),
+                    Qt::MiddleButton, Qt::MiddleButton, Qt::NoModifier);
+    QApplication::sendEvent(&f, &mid);
+    chk(f.value() < -400, "middle-click jumps straight to the click", f.value(), -400);
+
+    // Ctrl-drag used to compute (target - value) / 4 in integers, so inside
+    // three raw units it moved by nothing at all. Anchored now.
+    f.setValue(0);
+    QMouseEvent finePress(QEvent::MouseButtonPress, QPointF(12, 100),
+                          f.mapToGlobal(QPointF(12, 100)),
+                          Qt::LeftButton, Qt::LeftButton, Qt::ControlModifier);
+    QApplication::sendEvent(&f, &finePress);
+    const int anchored = f.value();
+    QMouseEvent fineMove(QEvent::MouseMove, QPointF(12, 98),
+                         f.mapToGlobal(QPointF(12, 98)),
+                         Qt::NoButton, Qt::LeftButton, Qt::ControlModifier);
+    QApplication::sendEvent(&f, &fineMove);
+    chk(f.value() != anchored, "ctrl-drag still moves over two pixels",
+        f.value(), anchored);
 
     std::printf("\n%s (%d failure%s)\n\n", fails ? "FAILED" : "ALL PASSED",
                 fails, fails == 1 ? "" : "s");

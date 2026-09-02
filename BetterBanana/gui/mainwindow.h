@@ -38,6 +38,14 @@ public:
     void pullFromShm();
     // True when the assigned device is named by the state but not present.
     bool deviceMissing() const { return m_missing; }
+    // Card state: something else is soloed; the engine has stopped; the strip
+    // has a device named but nothing attached to it.
+    void setDimmed(bool d);
+    void setLive(bool live);
+    void setAttached(bool a);
+    bool isHardware() const { return m_hardware; }
+    int  meterTop() const;
+    void refreshBusTips(const QStringList& names);
 
 signals:
     void routingChanged(int hwIndex, const QString& nodeName);
@@ -55,6 +63,8 @@ private:
     bool  m_hardware;
 
     bool  m_missing = false;
+    bool  m_dimmed = false;
+    bool  m_attached = true;
 
     QComboBox*   m_device = nullptr;
     QPushButton* m_eqBtn  = nullptr;
@@ -92,6 +102,13 @@ public:
     QString deviceValue() const;
     void pullFromShm();
     bool deviceMissing() const { return m_missing; }
+    void setLive(bool live);
+    // Every meter in the console shares one baseline, so the same dBFS is at
+    // the same height whichever column you look at. A bus card carries fewer
+    // rows than a strip, so it is padded to match rather than floated.
+    int  meterTop() const;
+    int  leadPad() const;
+    void setLeadPad(int px);
 
 signals:
     void routingChanged(int busIndex, const QString& nodeName);
@@ -111,6 +128,9 @@ private:
     QLabel*      m_gainLbl = nullptr;
     LevelMeter*  m_meter  = nullptr;
     QLabel*      m_header = nullptr;
+    EqThumb*     m_thumb  = nullptr;
+    class QSpacerItem* m_lead = nullptr;
+    class QVBoxLayout* m_root = nullptr;
 };
 
 // The tape deck: records a bus to WAV and plays a WAV back into the matrix.
@@ -133,6 +153,9 @@ private:
     QPushButton* m_stop     = nullptr;
     QPushButton* m_loop     = nullptr;
     QLabel*      m_status   = nullptr;
+    QLabel*      m_time     = nullptr;
+    class QProgressBar* m_progress = nullptr;
+    LevelMeter*  m_meter    = nullptr;
     Knob*        m_gain     = nullptr;
     QVector<QPushButton*> m_busBtns;
 };
@@ -226,6 +249,9 @@ private slots:
     void undo();
     void redo();
 
+protected:
+    void closeEvent(class QCloseEvent* e) override;
+
 private:
     void writeRouting();
     void applyDeviceEq(int bus, const QString& device);
@@ -243,6 +269,14 @@ private:
     void readRouting();
     void applyAppRules();
     void buildMenus();
+    // The title carries the loaded preset and whether it has drifted, since on
+    // a tiling compositor the title bar may be the only place either shows.
+    void refreshTitle();
+    void restoreWindowGeometry();
+    void saveWindowGeometry();
+    void refreshCardStates();
+    void say(const QString& text, int ms = 4000);
+    void showAbout();
 
     bb::Shared* m_shm;
     QVector<StripWidget*> m_strips;
@@ -253,12 +287,18 @@ private:
     uint32_t m_lastHeartbeat = 0;
     int      m_stallTicks = 0;
     int      m_syncTicks = 0;
+    int      m_stateTicks = 0;
     QVector<QAction*> m_themeActions;
     QAction* m_autoEngine = nullptr;
     QAction* m_autoGui = nullptr;
     AppsDialog* m_apps = nullptr;
     QSet<int>   m_ruledStreams;
     int         m_ruleTicks = 0;
+
+    QString  m_presetName;        // "" until a preset is loaded or saved
+    bool     m_dirty = false;
+    bool     m_engineLive = true;
+    QLabel*  m_alert = nullptr;   // the banner across the top when it is not
 
     QVector<QByteArray> m_undo, m_redo;
     QByteArray  m_committed;      // the last settled state
