@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "theme.h"
 
 #include <QApplication>
 #include <QMessageBox>
@@ -38,6 +39,9 @@ int main(int argc, char** argv)
 {
     QApplication app(argc, argv);
     app.setApplicationName("betterbanana");
+    // Must precede any stylesheet: it is what draws the combo and spin arrows,
+    // which a stylesheet cannot colour per theme.
+    app.setStyle(createThemedStyle());
 
     int fd = shm_open(kShmName, O_RDWR, 0600);
     if (fd < 0) {

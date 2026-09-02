@@ -7,6 +7,7 @@
 #pragma once
 
 #include <QColor>
+#include <QPalette>
 #include <QString>
 #include <QVector>
 
@@ -39,6 +40,21 @@ struct Theme {
 
     bool dark = true;
 };
+
+class QStyle;
+
+// Combo boxes lose their arrow the moment a stylesheet touches ::drop-down, and
+// a stylesheet cannot colour one per theme anyway - `image:` wants a file, and
+// one baked colour cannot serve both the dark themes and Catppuccin Latte.
+// Painting it in the style instead keeps it in step with whatever theme is live.
+// Wraps the platform's own style, so a qt6ct/Breeze setup still looks native.
+QStyle*               createThemedStyle();
+
+// The widgets Qt paints itself - spin-box arrows, check-box indicators, plain
+// list views - read the palette, not the stylesheet. Without this they follow
+// the *desktop's* colours instead of the app's, which on a dark desktop leaves
+// the light theme showing dark-on-dark boxes.
+QPalette              themePalette(const Theme& t);
 
 const QVector<Theme>& builtinThemes();
 const Theme&          theme();                 // current

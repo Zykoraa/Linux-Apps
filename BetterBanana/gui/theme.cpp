@@ -1,4 +1,7 @@
 #include "theme.h"
+#include <QPainter>
+#include <QProxyStyle>
+#include <QStyleOption>
 
 static int g_index = 0;
 
@@ -126,7 +129,10 @@ QString buildStyleSheet(const Theme& t)
     s += QString("QComboBox QAbstractItemView{background:%1;color:%2;selection-background-color:%3;"
                  "selection-color:%4;border:1px solid %5;}")
             .arg(c(t.panelAlt), c(t.text), c(t.accent), onText, c(t.border));
-    s += "QComboBox::drop-down{border:0;width:14px;}";
+    // Deliberately no QComboBox::drop-down rule: styling that subcontrol makes
+    // the stylesheet engine own it, and it then never asks the style to draw an
+    // arrow - which is how the drop-downs ended up looking like flat text
+    // fields. createThemedStyle() paints the arrow instead.
 
     // Base toggle button, then one rule per role for the checked state.
     s += QString("QPushButton{background:%1;color:%2;border:1px solid %3;border-radius:3px;"
@@ -170,9 +176,95 @@ QString buildStyleSheet(const Theme& t)
                  "padding:1px 3px;font-size:9px;}")
             .arg(c(t.panelAlt), c(t.text), c(t.border));
     s += QString("QLineEdit:focus{border-color:%1;}").arg(c(t.accent));
-    s += QString("QSpinBox{background:%1;color:%2;border:1px solid %3;border-radius:3px;font-size:9px;}")
-            .arg(c(t.panelAlt), c(t.text), c(t.border));
+    // Font only, deliberately. Giving a spin box a background or border here
+    // makes the stylesheet engine take the widget over, and it then draws no
+    // step arrows at all - and unlike a combo's, those cannot be handed back to
+    // the style. The palette above already colours it to match the theme.
+    s += "QAbstractSpinBox{font-size:9px;}";
     s += QString("QCheckBox{color:%1;font-size:9px;}").arg(c(t.text));
     s += QString("QFrame[role=\"sep\"]{color:%1;}").arg(c(t.border));
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// Arrow painting.
+//
+// Qt gives no way to tint a stylesheet arrow per theme, and suppresses its own
+// arrow as soon as the subcontrol is styled. Drawing it here reads theme() at
+// paint time, so it follows a theme switch with no work and stays legible on
+// the light theme as well as the nine dark ones.
+// ---------------------------------------------------------------------------
+namespace {
+
+class ThemedStyle : public QProxyStyle {
+public:
+    void drawPrimitive(PrimitiveElement pe, const QStyleOption* opt,
+                       QPainter* p, const QWidget* w) const override
+    {
+        if (pe != PE_IndicatorArrowDown && pe != PE_IndicatorArrowUp) {
+            QProxyStyle::drawPrimitive(pe, opt, p, w);
+            return;
+        }
+        const Theme& t = theme();
+        const bool hot = opt->state & State_MouseOver;
+        const QRect r = opt->rect;
+
+        // A small, flat triangle - no button chrome, to match the rest of the UI.
+        const int width = qMin(9, qMax(6, qMin(r.width(), r.height()) - 2));
+        QRectF box(0, 0, width, width * 0.55);
+        box.moveCenter(QRectF(r).center());
+
+        QPolygonF tri;
+        if (pe == PE_IndicatorArrowDown)
+            tri << box.topLeft() << box.topRight()
+                << QPointF(box.center().x(), box.bottom());
+        else
+            tri << box.bottomLeft() << box.bottomRight()
+                << QPointF(box.center().x(), box.top());
+
+        p->save();
+        p->setRenderHint(QPainter::Antialiasing, true);
+        p->setPen(Qt::NoPen);
+        p->setBrush(hot ? t.accent : t.textDim);
+        p->drawPolygon(tri);
+        p->restore();
+    }
+};
+
+} // namespace
+
+// A null base style makes QProxyStyle defer to the application's default, so
+// whatever the desktop selected (Breeze, Fusion, qt6ct's pick) still shows
+// through everywhere except the arrows.
+QStyle* createThemedStyle() { return new ThemedStyle; }
+
+// See the header: this covers everything the stylesheet cannot reach.
+QPalette themePalette(const Theme& t)
+{
+    const QColor onAccent = t.dark ? QColor("#12141a") : QColor("#ffffff");
+    QPalette p;
+    p.setColor(QPalette::Window,          t.bg);
+    p.setColor(QPalette::WindowText,      t.text);
+    p.setColor(QPalette::Base,            t.panelAlt);
+    p.setColor(QPalette::AlternateBase,   t.panel);
+    p.setColor(QPalette::Text,            t.text);
+    p.setColor(QPalette::Button,          t.panelAlt);
+    p.setColor(QPalette::ButtonText,      t.text);
+    p.setColor(QPalette::BrightText,      t.rec);
+    p.setColor(QPalette::Highlight,       t.accent);
+    p.setColor(QPalette::HighlightedText, onAccent);
+    p.setColor(QPalette::ToolTipBase,     t.panel);
+    p.setColor(QPalette::ToolTipText,     t.text);
+    p.setColor(QPalette::PlaceholderText, t.textDim);
+    // Frame shading. Qt derives 3-D edges from these, so leaving them at the
+    // desktop's values outlines every native widget in the wrong colour.
+    p.setColor(QPalette::Light,           t.panel);
+    p.setColor(QPalette::Midlight,        t.header);
+    p.setColor(QPalette::Mid,             t.border);
+    p.setColor(QPalette::Dark,            t.header);
+    p.setColor(QPalette::Shadow,          t.bg);
+    p.setColor(QPalette::Disabled, QPalette::Text,       t.textDim);
+    p.setColor(QPalette::Disabled, QPalette::ButtonText, t.textDim);
+    p.setColor(QPalette::Disabled, QPalette::WindowText, t.textDim);
+    return p;
 }

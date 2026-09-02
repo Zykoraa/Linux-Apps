@@ -1386,6 +1386,9 @@ void MainWindow::refreshAutostart()
 void MainWindow::applyTheme(int index)
 {
     setThemeIndex(index);
+    // Palette first: it carries the theme into the widgets Qt paints natively,
+    // which the stylesheet never touches.
+    qApp->setPalette(themePalette(theme()));
     qApp->setStyleSheet(buildStyleSheet(theme()));
     if (index >= 0 && index < m_themeActions.size()) m_themeActions[index]->setChecked(true);
     QSettings("betterbanana", "gui").setValue("theme", index);
