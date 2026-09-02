@@ -81,7 +81,10 @@ static void usage()
       "  strip <i> key <0|1>         this strip triggers the ducker\n"
       "  strip <i> duck <dB>         how far this strip drops while ducking\n"
       "  strip <i> gate|comp|aud <0..10>\n"
-      "  strip <i> eq <low> <mid> <high>   dB, -12 .. +12\n"
+      "  strip <i> eq <low> <mid> <high>   dB, -12 .. +12 (the three tone knobs)\n"
+      "  strip <i> eqon <0|1>        the strip's parametric EQ\n"
+      "  strip <i> preamp <dB>       parametric preamp, -24 .. +12\n"
+      "  strip <i> band <0..11> <gain> <freq> <Q> [type] [on]\n"
       "  strip <i> pan <-1..1>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
@@ -89,11 +92,12 @@ static void usage()
       "  bus <b> band <0..11> <gain> <freq> <Q> [type] [on]\n"
       "                              type: pk ls hs hp lp notch bp\n"
       "  eq list                     list built-in and saved EQ profiles\n"
-      "  eq show <b>                 print a bus EQ as Equalizer APO text\n"
-      "  eq load <b> <name|file>     apply a built-in, saved or APO/AutoEq file\n"
-      "  eq save <b> <name>          save a bus EQ as a named profile\n"
-      "  eq flat <b>                 reset a bus EQ to flat\n"
-      "  eq preamp <b>               set the preamp so the curve cannot clip\n"
+      "  eq show <t>                 print an EQ as Equalizer APO text\n"
+      "  eq load <t> <name|file>     apply a built-in, saved or APO/AutoEq file\n"
+      "  eq save <t> <name>          save an EQ as a named profile\n"
+      "  eq flat <t>                 reset an EQ to flat\n"
+      "  eq preamp <t>               set the preamp so the curve cannot clip\n"
+      "     <t> is a bus (A1..B2) or an input strip (s0..s4)\n"
       "  route in <1..3> <source-node-name|cable:0..2|->\n"
       "  route out <A1|A2|A3> <sink-node-name|->\n"
       "  rec file <path> | bus <A1..B2> | start | stop\n"
@@ -107,6 +111,8 @@ static void usage()
       "  preset save <name|path>     save current state\n"
       "  preset load <name|path>     restore a saved state\n"
       "  preset list                 list saved presets\n"
+      "  preset startup              show which preset loads when the engine starts\n"
+      "  preset startup <name|none>  set it\n"
       "  duck on|off|toggle | threshold <dB> | attack <ms> | release <ms>\n"
       "  clearclip                   clear latched clip indicators\n"
       "  autostart                   show what starts at login\n"
@@ -121,6 +127,40 @@ static int bus_index(const char* s)
     for (int b = 0; b < kBuses; ++b) if (strcasecmp(s, kBusName[b]) == 0) return b;
     if (s[0] >= '0' && s[0] <= '4' && s[1] == 0) return s[0] - '0';
     return -1;
+}
+
+// "<band> <gain> <freq> <Q> [type] [on]" starting at argv[4]; shared by the
+// strip and bus forms so they cannot drift apart.
+static bool set_band(EqParams& p, int argc, char** argv)
+{
+    const int k = atoi(argv[4]);
+    if (k < 0 || k >= kEqBands) {
+        std::fprintf(stderr, "band must be 0..%d\n", kEqBands - 1);
+        return false;
+    }
+    p.gain[k].store(clampf(atof(argv[5]), -24.0f, 24.0f));
+    p.freq[k].store(clampf(atof(argv[6]), 10.0f, 24000.0f));
+    p.q[k].store(clampf(atof(argv[7]), 0.1f, 20.0f));
+    if (argc >= 9) {
+        const int t = eq_type_from_tag(argv[8]);
+        if (t < 0) { std::fprintf(stderr, "type: pk ls hs hp lp notch bp\n"); return false; }
+        p.type[k].store(t);
+    }
+    if (argc >= 10) p.band_on[k].store(atoi(argv[9]) ? 1 : 0);
+    return true;
+}
+
+// An EQ block belongs to a bus (A1..B2) or to an input strip (s0..s4). Both
+// are the same struct, so every eq subcommand works on either.
+static EqParams* eq_target(Shared* s, const char* name, std::string& label)
+{
+    const int b = bus_index(name);
+    if (b >= 0) { label = kBusName[b]; return &s->bus[b].eq; }
+    if ((name[0] == 's' || name[0] == 'S') && name[1] >= '0' && name[1] <= '9' && name[2] == 0) {
+        const int i = name[1] - '0';
+        if (i < kStrips) { label = kStripName[i]; return &s->strip[i].eq; }
+    }
+    return nullptr;
 }
 
 static void send_cmd(Shared* s, Command c)
@@ -207,13 +247,14 @@ int main(int argc, char** argv)
         char lstrip[kStrips][kLabelLen], lbus[kBuses][kLabelLen];
         bool lok = false;
         for (int t = 0; t < 16 && !lok; ++t) lok = labels_read(s->labels, lstrip, lbus);
-        std::printf("%-12s %7s %5s %5s %5s  %-5s %-5s %-5s   routing\n",
-                    "STRIP", "GAIN", "MUTE", "SOLO", "MONO", "GATE", "COMP", "AUD");
+        std::printf("%-12s %7s %5s %5s %5s  %-5s %-5s %-5s %-3s  routing\n",
+                    "STRIP", "GAIN", "MUTE", "SOLO", "MONO", "GATE", "COMP", "AUD", "EQ");
         for (int i = 0; i < kStrips; ++i) {
             StripParams& p = s->strip[i];
-            std::printf("%-12s %6.1f  %5d %5d %5d  %5.1f %5.1f %5.1f   ",
+            std::printf("%-12s %6.1f  %5d %5d %5d  %5.1f %5.1f %5.1f %-3s ",
                 (lok && lstrip[i][0]) ? lstrip[i] : kStripName[i], p.gain_db.load(), p.mute.load(), p.solo.load(), p.mono.load(),
-                p.gate.load(), p.comp.load(), p.audibility.load());
+                p.gate.load(), p.comp.load(), p.audibility.load(),
+                p.eq.on.load() ? "ON" : "-");
             for (int b = 0; b < kBuses; ++b)
                 std::printf("%s%s ", kBusName[b], p.bus_on[b].load() ? "*" : "-");
             if (i < kHwStrips) {
@@ -230,7 +271,7 @@ int main(int argc, char** argv)
             BusParams& p = s->bus[b];
             std::printf("%-12s %6.1f  %5d %5d %5d   %s\n",
                 (lok && lbus[b][0]) ? lbus[b] : kBusName[b], p.gain_db.load(),
-                p.mute.load(), p.mono.load(), p.eq_on.load(),
+                p.mute.load(), p.mono.load(), p.eq.on.load(),
                 b < kPhysBuses ? (out[b][0] ? out[b] : "(unassigned)") : "(virtual source)");
         }
         const char* st[] = { "idle", "RECORDING", "PLAYING" };
@@ -318,6 +359,11 @@ int main(int argc, char** argv)
             p.eq_mid.store (clampf(atof(argv[5]), -12.0f, 12.0f));
             p.eq_high.store(clampf(atof(argv[6]), -12.0f, 12.0f));
         }
+        else if (w == "eqon"   && argc >= 5) p.eq.on.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "preamp" && argc >= 5) p.eq.preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
+        else if (w == "band" && argc >= 8) {
+            if (!set_band(p.eq, argc, argv)) return 1;
+        }
         else if (w == "bus" && argc >= 6) {
             const int b = bus_index(argv[4]);
             if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
@@ -335,22 +381,10 @@ int main(int argc, char** argv)
         if      (w == "gain") p.gain_db.store(clampf(atof(argv[4]), -60.0f, 12.0f));
         else if (w == "mute") p.mute.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "mono") p.mono.store(atoi(argv[4]) ? 1 : 0);
-        else if (w == "eq")   p.eq_on.store(atoi(argv[4]) ? 1 : 0);
-        else if (w == "preamp") p.eq_preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
+        else if (w == "eq")   p.eq.on.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "preamp") p.eq.preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
         else if (w == "band" && argc >= 8) {
-            const int k = atoi(argv[4]);
-            if (k < 0 || k >= kBusEqBands) {
-                std::fprintf(stderr, "band must be 0..%d\n", kBusEqBands - 1); return 1;
-            }
-            p.eq_gain[k].store(clampf(atof(argv[5]), -24.0f, 24.0f));
-            p.eq_freq[k].store(clampf(atof(argv[6]), 10.0f, 24000.0f));
-            p.eq_q[k].store(clampf(atof(argv[7]), 0.1f, 20.0f));
-            if (argc >= 9) {
-                const int t = eq_type_from_tag(argv[8]);
-                if (t < 0) { std::fprintf(stderr, "type: pk ls hs hp lp notch bp\n"); return 1; }
-                p.eq_type[k].store(t);
-            }
-            if (argc >= 10) p.eq_band_on[k].store(atoi(argv[9]) ? 1 : 0);
+            if (!set_band(p.eq, argc, argv)) return 1;
         }
         else { usage(); return 1; }
         return 0;
@@ -387,26 +421,29 @@ int main(int argc, char** argv)
             return 0;
         }
 
-        // Everything past "list" names a bus first.
+        // Everything past "list" names a target first.
         if (argc < 4) { usage(); return 1; }
-        const int b = bus_index(argv[3]);
-        if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+        std::string label;
+        EqParams* eq = eq_target(s, argv[3], label);
+        if (!eq) {
+            std::fprintf(stderr, "target must be A1..A3, B1, B2, or s0..s%d\n", kStrips - 1);
+            return 1;
+        }
 
         if (w == "show") {
-            std::printf("%s", eq_format_apo(eq_capture_from_bus(s, b, kBusName[b])).c_str());
+            std::printf("%s", eq_format_apo(eq_capture(*eq, label)).c_str());
             return 0;
         }
         if (w == "flat") {
             EqProfile flat;
-            eq_apply_to_bus(s, b, flat);
-            std::printf("%s EQ reset to flat\n", kBusName[b]);
+            eq_apply(*eq, flat);
+            std::printf("%s EQ reset to flat\n", label.c_str());
             return 0;
         }
         if (w == "preamp") {
-            EqProfile cur = eq_capture_from_bus(s, b);
-            const float pa = eq_suggest_preamp(cur);
-            s->bus[b].eq_preamp_db.store(pa);
-            std::printf("%s preamp %.1f dB\n", kBusName[b], pa);
+            const float pa = eq_suggest_preamp(eq_capture(*eq));
+            eq->preamp_db.store(pa);
+            std::printf("%s preamp %.1f dB\n", label.c_str(), pa);
             return 0;
         }
         if (w == "load" && argc >= 5) {
@@ -415,9 +452,9 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "bb-ctl: no EQ profile '%s' (try: bb-ctl eq list)\n", argv[4]);
                 return 1;
             }
-            eq_apply_to_bus(s, b, prof);
-            s->bus[b].eq_on.store(1);
-            std::printf("%s <- %s (%zu bands, preamp %.1f dB)\n", kBusName[b],
+            eq_apply(*eq, prof);
+            eq->on.store(1);
+            std::printf("%s <- %s (%zu bands, preamp %.1f dB)\n", label.c_str(),
                         prof.name.empty() ? argv[4] : prof.name.c_str(),
                         prof.bands.size(), prof.preamp);
             return 0;
@@ -426,7 +463,7 @@ int main(int argc, char** argv)
             mkdir(preset_dir().c_str(), 0755);
             mkdir(eq_profile_dir().c_str(), 0755);
             const std::string path = eq_profile_dir() + "/" + argv[4] + ".txt";
-            if (!eq_write_file(eq_capture_from_bus(s, b, argv[4]), path.c_str())) {
+            if (!eq_write_file(eq_capture(*eq, argv[4]), path.c_str())) {
                 std::fprintf(stderr, "bb-ctl: cannot write %s\n", path.c_str());
                 return 1;
             }
@@ -552,6 +589,29 @@ int main(int argc, char** argv)
                     std::printf("  %s\n", n.substr(0, n.size() - 4).c_str());
             }
             closedir(d);
+            return 0;
+        }
+        if (w == "startup") {
+            if (argc < 4) {
+                const std::string name = startup_preset_name();
+                if (name.empty()) std::printf("no startup preset set\n");
+                else std::printf("%s  (%s)\n", name.c_str(), preset_path_for(name).c_str());
+                return 0;
+            }
+            const std::string want = std::string(argv[3]) == "none" ? std::string() : argv[3];
+            // Refuse to point at something that is not there: the error belongs
+            // here, not in the engine log at next login.
+            if (!want.empty() && access(preset_path_for(want).c_str(), R_OK) != 0) {
+                std::fprintf(stderr, "bb-ctl: no preset '%s' (%s)\n",
+                             want.c_str(), preset_path_for(want).c_str());
+                return 1;
+            }
+            if (!set_startup_preset_name(want)) {
+                std::fprintf(stderr, "bb-ctl: cannot write %s\n", startup_marker_path().c_str());
+                return 1;
+            }
+            std::printf(want.empty() ? "startup preset cleared\n" : "startup preset: %s\n",
+                        want.c_str());
             return 0;
         }
         if (argc < 4) { usage(); return 1; }

@@ -14,11 +14,11 @@ cause:
 
     nodes missing -> restart the engine -> restore the last known-good config
 
-The restore matters because a restarted engine loads autosave.bbp, which is only
-written when the GUI exits, and may be stale or hold a preset you loaded once and
-forgot. This keeps its own snapshot instead, taken via `bb-ctl preset save`
-whenever the mixer looks healthy, so a repair puts back what you were actually
-using rather than whatever autosave happened to contain.
+The restore matters because a restarted engine loads the startup preset, which
+is a deliberate choice you made once - not necessarily what you have been doing
+since. This keeps its own snapshot as well, taken via `bb-ctl preset save`
+whenever the mixer looks healthy, so a repair puts back the mix you were
+actually using rather than the one you told the engine to boot with.
 
 Default sink and source are snapshotted too. A PipeWire restart resets them, and
 because they are usually bb_vaio and bb_b1, losing them quietly sends every
@@ -118,7 +118,7 @@ def restore():
         log("restored last known-good config" if r and r.returncode == 0
             else "could not restore config snapshot")
     else:
-        log("no config snapshot yet; engine kept whatever autosave held")
+        log("no config snapshot yet; engine kept its startup preset")
 
     try:
         with open(DEFAULTS) as f:

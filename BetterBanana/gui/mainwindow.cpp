@@ -144,6 +144,11 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         m_device->setMinimumWidth(90);
         m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         m_device->addItem("- none -", QString());
+        m_device->setToolTip("Right-click to remember this strip's settings for "
+                             "whichever device is selected");
+        m_device->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_device, &QComboBox::customContextMenuRequested, this,
+                [this](const QPoint& pos) { deviceMenu(pos); });
         connect(m_device, &QComboBox::currentIndexChanged, this, [this](int) {
             emit routingChanged(m_index, m_device->currentData().toString());
         });
@@ -195,6 +200,17 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         connect(m_eqMid, &Knob::valueChanged, this, [&p](int v){ p.eq_mid.store(v / 10.0f); });
         connect(m_eqHi,  &Knob::valueChanged, this, [&p](int v){ p.eq_high.store(v / 10.0f); });
         root->addLayout(g);
+
+        // The three knobs are a fixed tone control; the twelve-band parametric
+        // lives behind this button, exactly as it does on a bus.
+        m_eqBtn = makeToggle("EQ", "eq", 19);
+        m_eqBtn->setToolTip("Twelve-band parametric EQ, after the tone knobs.\n"
+                            "Left-click: enable/bypass.  Right-click: edit.");
+        m_eqBtn->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(m_eqBtn, &QPushButton::customContextMenuRequested, this,
+                [this](const QPoint&) { emit eqEditRequested(m_index); });
+        connect(m_eqBtn, &QPushButton::toggled, this, [&p](bool b){ p.eq.on.store(b ? 1 : 0); });
+        root->addWidget(m_eqBtn);
     }
 
     {   // Mono / Solo / Mute
@@ -264,16 +280,56 @@ void StripWidget::setDeviceList(const QStringList& ids, const QStringList& label
 }
 
 
+// Right-click the device picker to tie this strip's processing to whatever is
+// plugged in. Nothing is stored unless you ask for it: the mixer no longer
+// saves your session behind your back, and it does not do it here either.
+void StripWidget::deviceMenu(const QPoint& pos)
+{
+    if (!m_device) return;
+    const QString dev = deviceValue();
+    QMenu m;
+    if (dev.isEmpty()) {
+        QAction* a = m.addAction("Assign a device first");
+        a->setEnabled(false);
+        m.exec(m_device->mapToGlobal(pos));
+        return;
+    }
+    const bool known = has_strip_for_device(dev.toStdString());
+    QAction* rem = m.addAction(known ? "Update the settings remembered for this device"
+                                     : "Remember these settings for this device");
+    rem->setToolTip("Gate, compressor, EQ, level and pan - but not the bus "
+                    "assignment, which belongs to the mix rather than to the device");
+    QAction* fgt = known ? m.addAction("Forget them") : nullptr;
+    m.addSeparator();
+    QAction* info = m.addAction(dev);
+    info->setEnabled(false);
+
+    QAction* got = m.exec(m_device->mapToGlobal(pos));
+    if (got == rem) {
+        if (save_strip_for_device(m_shm, m_index, dev.toStdString()))
+            emit statusMessage("Remembered these settings for " + dev +
+                               " - they come back whenever this strip is set to it");
+        else
+            emit statusMessage("Could not write " +
+                QString::fromStdString(device_strip_path(dev.toStdString())));
+    } else if (fgt && got == fgt) {
+        if (forget_strip_for_device(dev.toStdString()))
+            emit statusMessage("Forgot the settings remembered for " + dev);
+    }
+}
+
 // The engine owns routing; adopt it rather than assuming the GUI started first.
 void StripWidget::setDeviceValue(const QString& id)
 {
     if (!m_device) return;
     QSignalBlocker block(m_device);
     int idx = m_device->findData(id);
+    m_missing = false;
     if (idx < 0 && !id.isEmpty()) {          // assigned device is gone/unplugged
         m_device->addItem(id + "  (missing)", id);
         idx = m_device->count() - 1;
     }
+    if (idx > 0) m_missing = m_device->itemText(idx).endsWith("(missing)");
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -300,6 +356,7 @@ void StripWidget::pullFromShm()
     if (!m_fader->isDragging()) m_fader->setValue(dbSlider(p.gain_db.load()));
     m_mono->setChecked(p.mono.load()); m_solo->setChecked(p.solo.load());
     m_mute->setChecked(p.mute.load());
+    if (m_eqBtn) m_eqBtn->setChecked(p.eq.on.load() != 0);
     for (int b = 0; b < m_busBtns.size(); ++b) m_busBtns[b]->setChecked(p.bus_on[b].load() != 0);
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     static const char* kDefault[kStrips] = {
@@ -357,13 +414,13 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
         auto* row = new QHBoxLayout;
         row->setSpacing(2);
         m_eq   = makeToggle("EQ",   "eq");
-        m_eq->setToolTip("Left-click: enable/bypass.  Right-click: edit the 6 bands.");
+        m_eq->setToolTip("Left-click: enable/bypass.  Right-click: edit the 12 bands.");
         m_eq->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(m_eq, &QPushButton::customContextMenuRequested, this,
                 [this](const QPoint&) { emit eqEditRequested(m_index); });
         m_mono = makeToggle("MONO", "mono");
         m_mute = makeToggle("MUTE", "mute");
-        connect(m_eq,   &QPushButton::toggled, this, [&p](bool b){ p.eq_on.store(b ? 1 : 0); });
+        connect(m_eq,   &QPushButton::toggled, this, [&p](bool b){ p.eq.on.store(b ? 1 : 0); });
         connect(m_mono, &QPushButton::toggled, this, [&p](bool b){ p.mono.store(b ? 1 : 0); });
         connect(m_mute, &QPushButton::toggled, this, [&p](bool b){ p.mute.store(b ? 1 : 0); });
         row->addWidget(m_eq); row->addWidget(m_mono); row->addWidget(m_mute);
@@ -411,10 +468,12 @@ void BusWidget::setDeviceValue(const QString& id)
     if (!m_device) return;
     QSignalBlocker block(m_device);
     int idx = m_device->findData(id);
+    m_missing = false;
     if (idx < 0 && !id.isEmpty()) {
         m_device->addItem(id + "  (missing)", id);
         idx = m_device->count() - 1;
     }
+    if (idx > 0) m_missing = m_device->itemText(idx).endsWith("(missing)");
     m_device->setCurrentIndex(idx >= 0 ? idx : 0);
     m_device->setToolTip(m_device->currentIndex() > 0
         ? m_device->currentText() + "\n" + m_device->currentData().toString()
@@ -430,7 +489,7 @@ void BusWidget::pullFromShm()
 {
     BusParams& p = m_shm->bus[m_index];
     if (!m_fader->isDragging()) m_fader->setValue(dbSlider(p.gain_db.load()));
-    m_eq->setChecked(p.eq_on.load()); m_mono->setChecked(p.mono.load());
+    m_eq->setChecked(p.eq.on.load()); m_mono->setChecked(p.mono.load());
     m_mute->setChecked(p.mute.load());
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     m_header->setText(labelFor(m_shm, false, m_index, kBusLabel[m_index]));
@@ -1196,7 +1255,14 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     for (int i = 0; i < kStrips; ++i) {
         auto* s = new StripWidget(m_shm, i, i < kHwStrips, stripTitle[i]);
         connect(s, &StripWidget::routingChanged, this,
-                [this](int idx, const QString& n) { m_hwIn[idx] = n; writeRouting(); });
+                [this](int idx, const QString& n) {
+                    m_hwIn[idx] = n;
+                    writeRouting();
+                    applyDeviceStrip(idx, n);
+                });
+        connect(s, &StripWidget::eqEditRequested, this, &MainWindow::openStripEq);
+        connect(s, &StripWidget::statusMessage, this,
+                [this](const QString& t) { statusBar()->showMessage(t, 7000); });
         m_strips.push_back(s);
         inRow->addWidget(s);
         if (i == kHwStrips - 1) {
@@ -1257,6 +1323,11 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     for (auto* b : m_buses)  b->pullFromShm();
     refreshDevices();
 
+    // Whatever the mixer looks like when the window opens is undo's starting
+    // point, so the first Ctrl+Z comes back here rather than nowhere.
+    m_committed = m_seen = QByteArray::fromStdString(preset_serialize(m_shm));
+    refreshUndoActions();
+
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
     m_timer->start(33);
@@ -1266,7 +1337,23 @@ void MainWindow::openVbanDialog() { VbanDialog(m_shm, this).exec(); }
 
 void MainWindow::openBusEq(int bus)
 {
-    BusEqDialog(m_shm, bus, this).exec();
+    if (bus < 0 || bus >= kBuses) return;
+    EqEditorDialog(m_shm, &m_shm->bus[bus].eq, spec_bus_src(bus),
+                   labelFor(m_shm, false, bus, kBusLabel[bus]), bus, this).exec();
+    m_buses[bus]->pullFromShm();
+}
+
+void MainWindow::openStripEq(int strip)
+{
+    if (strip < 0 || strip >= kStrips) return;
+    static const char* kDefault[kStrips] = {
+        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
+        "BetterBanana VAIO", "BetterBanana AUX"
+    };
+    // -1: a microphone has no measured headphone correction to look up.
+    EqEditorDialog(m_shm, &m_shm->strip[strip].eq, spec_strip_src(strip),
+                   labelFor(m_shm, true, strip, kDefault[strip]), -1, this).exec();
+    m_strips[strip]->pullFromShm();
 }
 
 void MainWindow::openDuckDialog() { DuckDialog(m_shm, this).exec(); }
@@ -1387,8 +1474,27 @@ void MainWindow::buildMenus()
                         QString::fromStdString(presets_path()), "Presets (*.bbp)");
         if (f.isEmpty()) return;
         if (!f.endsWith(".bbp")) f += ".bbp";
-        if (save_preset(m_shm, f.toUtf8().constData()))
-            statusBar()->showMessage("Saved " + f, 4000);
+        if (!save_preset(m_shm, f.toUtf8().constData())) {
+            QMessageBox::warning(this, "BetterBanana", "Could not write " + f);
+            return;
+        }
+        statusBar()->showMessage("Saved " + f, 4000);
+        // Asked once, and only while nothing is set: the engine starts with a
+        // default mixer until something is chosen, which is worth saying out
+        // loud the first time rather than leaving to be discovered.
+        if (!startup_preset_name().empty()) return;
+        const QString name = QFileInfo(f).completeBaseName();
+        if (QMessageBox::question(this, "BetterBanana",
+                QString("Load \"%1\" whenever the audio engine starts?\n\n"
+                        "Nothing is set at the moment, so the engine currently "
+                        "comes up with a default mixer. You can change this "
+                        "later under Preset -> Load on startup.").arg(name))
+            != QMessageBox::Yes) return;
+        set_startup_preset_name(QFileInfo(f).absoluteFilePath() ==
+                                QString::fromStdString(preset_path_for(name.toStdString()))
+                                ? name.toStdString()
+                                : f.toStdString());
+        statusBar()->showMessage("\"" + name + "\" will load when the engine starts", 6000);
     });
     file->addAction("&Load preset...", QKeySequence("Ctrl+O"), this, [this] {
         const QString f = QFileDialog::getOpenFileName(this, "Load preset",
@@ -1400,16 +1506,25 @@ void MainWindow::buildMenus()
             for (auto* s : m_strips) s->pullFromShm();
             for (auto* b : m_buses)  b->pullFromShm();
             statusBar()->showMessage("Loaded " + f, 4000);
+            // The engine re-finds a device whose node name moved on its next
+            // control poll, so give it one before reporting what is missing.
+            QTimer::singleShot(800, this, &MainWindow::reportMissingDevices);
         } else {
             statusBar()->showMessage("Could not read " + f, 6000);
         }
     });
     file->addSeparator();
-    file->addAction("Save as &default (restored on engine start)", this, [this] {
-        QDir().mkpath(QString::fromStdString(preset_dir()));
-        if (save_preset(m_shm, autosave_path().c_str()))
-            statusBar()->showMessage("Saved as default", 4000);
-    });
+    auto* startup = file->addMenu("Load on &startup");
+    startup->setToolTip("Which saved preset the audio engine restores when it starts");
+    connect(startup, &QMenu::aboutToShow, this,
+            [this, startup] { populateStartupMenu(startup); });
+    populateStartupMenu(startup);
+
+    auto* edit = menuBar()->addMenu("&Edit");
+    m_undoAct = edit->addAction("&Undo", QKeySequence::Undo, this, &MainWindow::undo);
+    m_redoAct = edit->addAction("&Redo", QKeySequence::Redo, this, &MainWindow::redo);
+    m_undoAct->setToolTip("Step back through changes to the mixer, however they were made");
+    refreshUndoActions();
 
     auto* eng = menuBar()->addMenu("&Engine");
     eng->addAction("&Applications...", QKeySequence("Ctrl+A"), this, &MainWindow::openAppsDialog);
@@ -1424,9 +1539,31 @@ void MainWindow::buildMenus()
         m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
     });
     eng->addSeparator();
-    auto* eqMenu = eng->addMenu("Bus &EQ");
+    auto* inEq = eng->addMenu("&Input EQ");
+    static const char* kStripDefault[kStrips] = {
+        "Hardware Input 1", "Hardware Input 2", "Hardware Input 3",
+        "BetterBanana VAIO", "BetterBanana AUX"
+    };
+    connect(inEq, &QMenu::aboutToShow, this, [this, inEq] {
+        inEq->clear();
+        for (int i = 0; i < kStrips; ++i)
+            inEq->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+                            this, [this, i] { openStripEq(i); });
+    });
+    for (int i = 0; i < kStrips; ++i)
+        inEq->addAction(labelFor(m_shm, true, i, kStripDefault[i]) + "...",
+                        this, [this, i] { openStripEq(i); });
+
+    auto* eqMenu = eng->addMenu("&Bus EQ");
+    connect(eqMenu, &QMenu::aboutToShow, this, [this, eqMenu] {
+        eqMenu->clear();
+        for (int b = 0; b < kBuses; ++b)
+            eqMenu->addAction(labelFor(m_shm, false, b, kBusLabel[b]) + "...",
+                              this, [this, b] { openBusEq(b); });
+    });
     for (int b = 0; b < kBuses; ++b)
-        eqMenu->addAction(QString("Bus %1...").arg(kBusLabel[b]), this, [this, b] { openBusEq(b); });
+        eqMenu->addAction(labelFor(m_shm, false, b, kBusLabel[b]) + "...",
+                          this, [this, b] { openBusEq(b); });
     eng->addAction("Sidechain &ducking...", QKeySequence("Ctrl+D"), this, &MainWindow::openDuckDialog);
     eng->addAction("&VBAN streams...", QKeySequence("Ctrl+B"), this, &MainWindow::openVbanDialog);
 
@@ -1467,6 +1604,55 @@ void MainWindow::buildMenus()
         a->setCheckable(true);
         group->addAction(a);
         m_themeActions.push_back(a);
+    }
+}
+
+// Lists the saved presets so one can be picked as what the engine restores at
+// startup. Rebuilt each time it opens, so a preset saved a moment ago is there.
+void MainWindow::populateStartupMenu(QMenu* menu)
+{
+    menu->clear();
+    const QString cur = QString::fromStdString(startup_preset_name());
+    auto* group = new QActionGroup(menu);
+    group->setExclusive(true);
+
+    QAction* none = menu->addAction("(none - start with a default mixer)", this, [this] {
+        set_startup_preset_name(std::string());
+        statusBar()->showMessage("The engine will start with a default mixer", 5000);
+    });
+    none->setCheckable(true);
+    none->setChecked(cur.isEmpty());
+    group->addAction(none);
+
+    QDir dir(QString::fromStdString(presets_path()));
+    const QStringList files = dir.entryList({ "*.bbp" }, QDir::Files, QDir::Name);
+    if (files.isEmpty()) {
+        QAction* a = menu->addAction("no presets saved yet  (Preset -> Save preset...)");
+        a->setEnabled(false);
+        return;
+    }
+    menu->addSeparator();
+    bool matched = false;
+    for (const QString& f : files) {
+        const QString name = QFileInfo(f).completeBaseName();
+        QAction* a = menu->addAction(name, this, [this, name] {
+            set_startup_preset_name(name.toStdString());
+            statusBar()->showMessage("\"" + name + "\" will load when the engine starts", 6000);
+        });
+        a->setCheckable(true);
+        a->setChecked(name == cur);
+        if (name == cur) matched = true;
+        group->addAction(a);
+    }
+    // The marker can also hold an outright path, which no name in the list will
+    // match; show it rather than leaving nothing ticked and no explanation.
+    if (!cur.isEmpty() && !matched) {
+        menu->addSeparator();
+        QAction* a = menu->addAction(cur);
+        a->setCheckable(true);
+        a->setChecked(true);
+        a->setEnabled(false);
+        group->addAction(a);
     }
 }
 
@@ -1520,6 +1706,104 @@ void MainWindow::readRouting()
         m_busOut[b] = QString::fromUtf8(out[b]);
         m_buses[b]->setDeviceValue(m_busOut[b]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Undo.
+//
+// Every control here writes straight into shared memory, so rather than
+// instrument each one, watch the memory: serialise the whole mixer a couple of
+// times a second and commit an entry once it has stopped moving. A fader sweep
+// or an EQ drag therefore becomes one step rather than thirty, and a change
+// made by bb-ctl in another terminal is undoable too.
+// ---------------------------------------------------------------------------
+static constexpr int kUndoDepth = 64;
+
+void MainWindow::snapshotTick()
+{
+    const QByteArray cur = QByteArray::fromStdString(preset_serialize(m_shm));
+    if (cur != m_seen) { m_seen = cur; return; }     // still moving; wait for it to settle
+    if (cur == m_committed) return;                  // nothing new
+    m_undo.append(m_committed);
+    if (m_undo.size() > kUndoDepth) m_undo.removeFirst();
+    m_redo.clear();
+    m_committed = cur;
+    refreshUndoActions();
+}
+
+void MainWindow::applyState(const QByteArray& text)
+{
+    preset_deserialize(m_shm, text.toStdString());
+    m_shm->cmd.store(kCmdVbanReload);
+    m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+    for (auto* s : m_strips) s->pullFromShm();
+    for (auto* b : m_buses)  b->pullFromShm();
+    readRouting();
+    // Adopt it as the settled state, or the next tick would record the undo
+    // itself as a fresh change.
+    m_committed = m_seen = text;
+    refreshUndoActions();
+}
+
+void MainWindow::undo()
+{
+    if (m_undo.isEmpty()) { statusBar()->showMessage("Nothing to undo", 2500); return; }
+    m_redo.append(m_committed);
+    applyState(m_undo.takeLast());
+    statusBar()->showMessage(QString("Undone  (%1 step%2 left)")
+                             .arg(m_undo.size()).arg(m_undo.size() == 1 ? "" : "s"), 3000);
+}
+
+void MainWindow::redo()
+{
+    if (m_redo.isEmpty()) { statusBar()->showMessage("Nothing to redo", 2500); return; }
+    m_undo.append(m_committed);
+    applyState(m_redo.takeLast());
+    statusBar()->showMessage("Redone", 3000);
+}
+
+void MainWindow::refreshUndoActions()
+{
+    if (m_undoAct) m_undoAct->setEnabled(!m_undo.isEmpty());
+    if (m_redoAct) m_redoAct->setEnabled(!m_redo.isEmpty());
+}
+
+// Settings a strip is told to remember follow the microphone, not the slot:
+// plug the same interface into another strip and its gate, compressor and EQ
+// come with it. Only a real change of the combo reaches here.
+void MainWindow::applyDeviceStrip(int strip, const QString& device)
+{
+    if (device.isEmpty() || strip < 0 || strip >= kStrips) return;
+    if (!has_strip_for_device(device.toStdString())) return;
+    if (!load_strip_for_device(m_shm, strip, device.toStdString())) return;
+    m_strips[strip]->pullFromShm();
+    statusBar()->showMessage(
+        QString("Restored the settings remembered for %1").arg(device), 6000);
+}
+
+// After loading a preset, say plainly which of the devices it names are not
+// here. Deferred, because the engine re-finds a moved device by description on
+// its next control poll and we want to report what is left after that.
+void MainWindow::reportMissingDevices()
+{
+    readRouting();
+    QStringList missing;
+    for (int i = 0; i < kHwStrips; ++i)
+        if (m_strips[i]->deviceMissing())
+            missing << QString("Input %1  ->  %2").arg(i + 1).arg(m_hwIn[i]);
+    for (int b = 0; b < kPhysBuses; ++b)
+        if (m_buses[b]->deviceMissing())
+            missing << QString("Bus %1  ->  %2").arg(kBusLabel[b], m_busOut[b]);
+    if (missing.isEmpty()) return;
+    QMessageBox::information(this, "BetterBanana",
+        QString("The preset loaded, but %1 device%2 it names %3 not here, so "
+                "those are left unconnected:\n\n  %4\n\n"
+                "Plug it in and the engine will pick it up, or choose something "
+                "else from the drop-down.")
+            .arg(missing.size())
+            .arg(missing.size() == 1 ? "" : "s")
+            .arg(missing.size() == 1 ? "is" : "are")
+            .arg(missing.join("\n  ")));
 }
 
 // An EQ profile remembered through the headphone browser belongs to the device,
@@ -1610,6 +1894,11 @@ void MainWindow::tick()
         for (auto* s : m_strips) s->pullFromShm();
         for (auto* b : m_buses)  b->pullFromShm();
         readRouting();
+    }
+
+    if (++m_undoTicks >= 12) {          // about 2.5 times a second
+        m_undoTicks = 0;
+        snapshotTick();
     }
 
     const uint32_t hb = m_shm->engine_heartbeat.load(std::memory_order_relaxed);

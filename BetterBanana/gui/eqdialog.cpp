@@ -39,7 +39,6 @@
 
 using namespace bb;
 
-static const char* kBusLabel[kBuses] = { "A1", "A2", "A3", "B1", "B2" };
 
 static const char* kAutoEqBase =
     "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/";
@@ -91,8 +90,14 @@ private:
 // ---------------------------------------------------------------------------
 static constexpr double kFLo = 20.0, kFHi = 20000.0, kMaxDb = 18.0;
 
-EqCurve::EqCurve(Shared* shm, int bus, QWidget* parent)
-    : QWidget(parent), m_shm(shm), m_bus(bus)
+// The spectrum shares the plot area but not its scale: 90 dB of level across
+// the same height as 36 dB of EQ. That ratio is chosen so every EQ gridline
+// lands on a round level - +18 dB is 0 dBFS, 0 dB is -45, -18 dB is -90 - and
+// the two scales can share one set of horizontal lines.
+static constexpr double kSpecTop = 0.0, kSpecBot = -90.0;
+
+EqCurve::EqCurve(Shared* shm, EqParams* eq, int specSource, QWidget* parent)
+    : QWidget(parent), m_shm(shm), m_eq(eq), m_spec(specSource)
 {
     setMinimumHeight(200);
     setMouseTracking(true);
@@ -106,9 +111,18 @@ void EqCurve::setSelected(int band)
     update();
 }
 
+bool EqCurve::spectrumLive() const
+{
+    return m_spec != kSpecNone
+        && m_shm->spec.active.load(std::memory_order_relaxed) == m_spec
+        && m_shm->spec.seq.load(std::memory_order_relaxed) > 0;
+}
+
 QRectF EqCurve::plotRect() const
 {
-    return QRectF(rect()).adjusted(30, 5, -6, -16);
+    // The right margin holds the level scale. It is reserved whether or not the
+    // analyser is running, so the plot does not jump the moment it starts.
+    return QRectF(rect()).adjusted(30, 5, m_spec == kSpecNone ? -6 : -32, -16);
 }
 
 double EqCurve::xForFreq(double f) const
@@ -137,26 +151,70 @@ double EqCurve::dbForY(double y) const
     return std::clamp(-(y - r.center().y()) / (r.height() / 2) * kMaxDb, -kMaxDb, kMaxDb);
 }
 
+double EqCurve::yForSpec(double dbfs) const
+{
+    const QRectF r = plotRect();
+    const double t = (dbfs - kSpecBot) / (kSpecTop - kSpecBot);
+    return r.bottom() - std::clamp(t, 0.0, 1.0) * r.height();
+}
+
 QPointF EqCurve::handlePos(int band) const
 {
-    const BusParams& p = m_shm->bus[m_bus];
-    const int type = p.eq_type[band].load();
-    const double base = p.eq_preamp_db.load();
-    const double db = eq_type_uses_gain(type) ? base + p.eq_gain[band].load() : base;
-    return QPointF(xForFreq(p.eq_freq[band].load()), yForDb(db));
+    const int type = m_eq->type[band].load();
+    const double base = m_eq->preamp_db.load();
+    const double db = eq_type_uses_gain(type) ? base + m_eq->gain[band].load() : base;
+    return QPointF(xForFreq(m_eq->freq[band].load()), yForDb(db));
 }
 
 int EqCurve::bandAt(const QPoint& pt) const
 {
     int best = -1;
     double bestD = 11.0 * 11.0;
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         const QPointF h = handlePos(k);
         const double dx = h.x() - pt.x(), dy = h.y() - pt.y();
         const double d = dx * dx + dy * dy;
         if (d < bestD) { bestD = d; best = k; }
     }
     return best;
+}
+
+// The engine's own analysis of whatever this EQ sits in, drawn behind the
+// curve so a boom or a whistle can be seen rather than guessed at.
+void EqCurve::drawSpectrum(QPainter& p, const QRectF& r) const
+{
+    if (!spectrumLive()) return;
+    const Theme& t = theme();
+    const double lo = m_shm->spec.f_lo.load(std::memory_order_relaxed);
+    const double hi = m_shm->spec.f_hi.load(std::memory_order_relaxed);
+    if (!(hi > lo)) return;
+    const double ratio = std::pow(hi / lo, 1.0 / kSpecBins);
+
+    QPainterPath top;
+    for (int b = 0; b < kSpecBins; ++b) {
+        // A band's geometric centre is its midpoint on a log axis.
+        const double f = lo * std::pow(ratio, b + 0.5);
+        const double x = std::clamp(xForFreq(f), r.left(), r.right());
+        const QPointF pt(x, yForSpec(m_shm->spec.bin_db[b].load(std::memory_order_relaxed)));
+        if (b == 0) top.moveTo(r.left(), pt.y());
+        top.lineTo(pt);
+    }
+    top.lineTo(r.right(), top.currentPosition().y());
+
+    QPainterPath area = top;
+    area.lineTo(r.right(), r.bottom());
+    area.lineTo(r.left(), r.bottom());
+    area.closeSubpath();
+
+    QColor fill = t.meterLow; fill.setAlpha(56);
+    p.setPen(Qt::NoPen);
+    p.setBrush(fill);
+    p.drawPath(area);
+
+    QColor edge = t.meterLow; edge.setAlpha(160);
+    p.setPen(QPen(edge, 1.0));
+    p.setBrush(Qt::NoBrush);
+    p.drawPath(top);
 }
 
 void EqCurve::paintEvent(QPaintEvent*)
@@ -167,13 +225,18 @@ void EqCurve::paintEvent(QPaintEvent*)
     const QRectF r = plotRect();
     p.fillRect(rect(), t.panelAlt);
 
-    const BusParams& bp = m_shm->bus[m_bus];
     const float sr = m_shm->samplerate.load();
-    const bool on = bp.eq_on.load() != 0;
+    const bool on = m_eq->on.load() != 0;
 
     QFont small = p.font();
     small.setPointSizeF(std::max(6.5, small.pointSizeF() - 2.0));
     p.setFont(small);
+
+    // Spectrum first: it is the floor everything else is read against.
+    p.save();
+    p.setClipRect(r);
+    drawSpectrum(p, r);
+    p.restore();
 
     // Grid.
     p.setPen(QPen(t.border, 1.0, Qt::DotLine));
@@ -187,30 +250,43 @@ void EqCurve::paintEvent(QPaintEvent*)
     p.setPen(QPen(t.textDim, 1.0));
     p.drawLine(QPointF(r.left(), yForDb(0)), QPointF(r.right(), yForDb(0)));
 
-    // Scales.
+    // Scales. EQ gain on the left, and - when the analyser is running - the
+    // level the spectrum is drawn on, on the right.
     for (double db : { -12.0, -6.0, 0.0, 6.0, 12.0 }) {
         const QString s = db > 0 ? QString("+%1").arg(int(db)) : QString::number(int(db));
         p.drawText(QRectF(0, yForDb(db) - 7, 26, 14), Qt::AlignRight | Qt::AlignVCenter, s);
     }
+    if (spectrumLive()) {
+        QColor lab = t.meterLow; lab.setAlpha(190);
+        p.setPen(QPen(lab, 1.0));
+        for (double db : { 18.0, 12.0, 6.0, 0.0, -6.0, -12.0, -18.0 }) {
+            const double dbfs = kSpecBot + (db + kMaxDb) / (2 * kMaxDb) * (kSpecTop - kSpecBot);
+            p.drawText(QRectF(r.right() + 3, yForDb(db) - 7, 28, 14),
+                       Qt::AlignLeft | Qt::AlignVCenter, QString::number(int(dbfs)));
+        }
+        p.setPen(QPen(t.textDim, 1.0));
+    }
+    // The end labels sit on the plot's edges, so centring them on the tick would
+    // run half of each off the widget - and on the right, straight through the
+    // level scale, where "20k" and "-90" would print on top of each other.
+    const double xmax = m_spec == kSpecNone ? double(width()) : r.right();
     for (double f : { 20.0, 100.0, 1000.0, 10000.0, 20000.0 }) {
-        // The end labels sit on the plot's edges, so centring them on the tick
-        // would run half of each off the widget.
         QRectF box(xForFreq(f) - 24, r.bottom() + 1, 48, 14);
         int flags = Qt::AlignHCenter | Qt::AlignTop;
-        if (box.left() < 0)        { box.moveLeft(0);        flags = Qt::AlignLeft  | Qt::AlignTop; }
-        if (box.right() > width()) { box.moveRight(width()); flags = Qt::AlignRight | Qt::AlignTop; }
+        if (box.left() < 0)      { box.moveLeft(0);      flags = Qt::AlignLeft  | Qt::AlignTop; }
+        if (box.right() > xmax)  { box.moveRight(xmax);  flags = Qt::AlignRight | Qt::AlignTop; }
         p.drawText(box, flags, fmtHz(f));
     }
 
     // Per-band responses, faint, then the sum on top.
-    Biquad band[kBusEqBands];
-    bool live[kBusEqBands];
-    for (int k = 0; k < kBusEqBands; ++k) {
-        live[k] = bp.eq_band_on[k].load() != 0;
-        design_band(band[k], bp.eq_type[k].load(), sr,
-                    bp.eq_freq[k].load(), bp.eq_q[k].load(), bp.eq_gain[k].load());
+    Biquad band[kEqBands];
+    bool live[kEqBands];
+    for (int k = 0; k < kEqBands; ++k) {
+        live[k] = m_eq->band_on[k].load() != 0;
+        design_band(band[k], m_eq->type[k].load(), sr,
+                    m_eq->freq[k].load(), m_eq->q[k].load(), m_eq->gain[k].load());
     }
-    const double preamp = bp.eq_preamp_db.load();
+    const double preamp = m_eq->preamp_db.load();
     const int steps = std::max(2, int(r.width()));
 
     auto sweep = [&](int only) {
@@ -219,7 +295,7 @@ void EqCurve::paintEvent(QPaintEvent*)
             const double f = freqForX(r.left() + r.width() * i / steps);
             double db = only < 0 ? preamp : 0.0;
             if (only < 0) {
-                for (int k = 0; k < kBusEqBands; ++k)
+                for (int k = 0; k < kEqBands; ++k)
                     if (live[k]) db += band[k].magnitude_db(sr, float(f));
             } else {
                 db = preamp + band[only].magnitude_db(sr, float(f));
@@ -232,10 +308,10 @@ void EqCurve::paintEvent(QPaintEvent*)
 
     QColor faint = t.accent;
     faint.setAlpha(on ? 70 : 40);
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         if (!live[k]) continue;
-        const int type = bp.eq_type[k].load();
-        if (eq_type_uses_gain(type) && std::fabs(bp.eq_gain[k].load()) < 0.05f) continue;
+        const int type = m_eq->type[k].load();
+        if (eq_type_uses_gain(type) && std::fabs(m_eq->gain[k].load()) < 0.05f) continue;
         p.setPen(QPen(k == m_sel ? t.solo : faint, k == m_sel ? 1.4 : 1.0));
         p.drawPath(sweep(k));
     }
@@ -244,7 +320,7 @@ void EqCurve::paintEvent(QPaintEvent*)
     p.drawPath(sweep(-1));
 
     // Handles.
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         const QPointF h = handlePos(k);
         if (!r.adjusted(-6, -6, 6, 6).contains(h)) continue;
         const bool sel = k == m_sel;
@@ -262,15 +338,15 @@ void EqCurve::paintEvent(QPaintEvent*)
 
     // Read-out for whatever is under the pointer, or the selected band.
     const int show = m_drag >= 0 ? m_drag : (m_hover >= 0 ? m_hover : m_sel);
-    if (show >= 0 && show < kBusEqBands) {
-        const int type = bp.eq_type[show].load();
+    if (show >= 0 && show < kEqBands) {
+        const int type = m_eq->type[show].load();
         QString s = QString("%1  %2  %3")
                         .arg(show + 1)
                         .arg(eq_type_name(type))
-                        .arg(fmtHz(bp.eq_freq[show].load()) + " Hz");
+                        .arg(fmtHz(m_eq->freq[show].load()) + " Hz");
         if (eq_type_uses_gain(type))
-            s += QString("  %1 dB").arg(bp.eq_gain[show].load(), 0, 'f', 1);
-        s += QString("  Q %1").arg(bp.eq_q[show].load(), 0, 'f', 2);
+            s += QString("  %1 dB").arg(m_eq->gain[show].load(), 0, 'f', 1);
+        s += QString("  Q %1").arg(m_eq->q[show].load(), 0, 'f', 2);
         if (!live[show]) s += "  (bypassed)";
         p.setPen(QPen(t.text, 1.0));
         p.drawText(QRectF(r.left() + 4, r.top() + 2, r.width() - 8, 14),
@@ -293,14 +369,15 @@ void EqCurve::mousePressEvent(QMouseEvent* e)
     const int k = bandAt(e->pos());
     if (k < 0) return;
     if (e->button() == Qt::RightButton) {
-        BusParams& p = m_shm->bus[m_bus];
-        p.eq_band_on[k].store(p.eq_band_on[k].load() ? 0 : 1);
+        emit editStarted(k);
+        m_eq->band_on[k].store(m_eq->band_on[k].load() ? 0 : 1);
         setSelected(k);
         emit bandToggled(k);
         update();
         return;
     }
     if (e->button() != Qt::LeftButton) return;
+    emit editStarted(k);
     m_drag = k;
     setSelected(k);
     emit bandSelected(k);
@@ -314,11 +391,10 @@ void EqCurve::mouseMoveEvent(QMouseEvent* e)
         if (h != m_hover) { m_hover = h; update(); }
         return;
     }
-    BusParams& p = m_shm->bus[m_bus];
-    p.eq_freq[m_drag].store(float(std::clamp(freqForX(e->position().x()), 10.0, 24000.0)));
-    if (eq_type_uses_gain(p.eq_type[m_drag].load())) {
-        const double g = dbForY(e->position().y()) - p.eq_preamp_db.load();
-        p.eq_gain[m_drag].store(float(std::clamp(g, -24.0, 24.0)));
+    m_eq->freq[m_drag].store(float(std::clamp(freqForX(e->position().x()), 10.0, 24000.0)));
+    if (eq_type_uses_gain(m_eq->type[m_drag].load())) {
+        const double g = dbForY(e->position().y()) - m_eq->preamp_db.load();
+        m_eq->gain[m_drag].store(float(std::clamp(g, -24.0, 24.0)));
     }
     emit bandEdited(m_drag);
     update();
@@ -335,7 +411,8 @@ void EqCurve::mouseDoubleClickEvent(QMouseEvent* e)
 {
     const int k = bandAt(e->pos());
     if (k < 0) return;
-    m_shm->bus[m_bus].eq_gain[k].store(0.0f);
+    emit editStarted(k);
+    m_eq->gain[k].store(0.0f);
     setSelected(k);
     emit bandEdited(k);
     update();
@@ -344,12 +421,12 @@ void EqCurve::mouseDoubleClickEvent(QMouseEvent* e)
 void EqCurve::wheelEvent(QWheelEvent* e)
 {
     const int k = m_hover >= 0 ? m_hover : m_sel;
-    if (k < 0 || k >= kBusEqBands) { e->ignore(); return; }
+    if (k < 0 || k >= kEqBands) { e->ignore(); return; }
     const int notches = e->angleDelta().y() / 120;
     if (!notches) { e->ignore(); return; }
-    BusParams& p = m_shm->bus[m_bus];
-    const double q = p.eq_q[k].load() * std::pow(1.12, notches);
-    p.eq_q[k].store(float(std::clamp(q, 0.1, 20.0)));
+    emit editStarted(k);
+    const double q = m_eq->q[k].load() * std::pow(1.12, notches);
+    m_eq->q[k].store(float(std::clamp(q, 0.1, 20.0)));
     setSelected(k);
     emit bandEdited(k);
     update();
@@ -362,12 +439,18 @@ void EqCurve::leaveEvent(QEvent*)
 }
 
 // ---------------------------------------------------------------------------
-// BusEqDialog
+// EqEditorDialog
 // ---------------------------------------------------------------------------
-BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
-    : QDialog(parent), m_shm(shm), m_bus(bus)
+EqEditorDialog::EqEditorDialog(Shared* shm, EqParams* eq, int specSource,
+                               const QString& title, int bus, QWidget* parent)
+    : QDialog(parent), m_shm(shm), m_eq(eq), m_bus(bus), m_spec(specSource), m_title(title)
 {
-    setWindowTitle(QString("Bus %1 - parametric EQ").arg(kBusLabel[bus]));
+    setWindowTitle(title + " - parametric EQ");
+
+    // Ask the engine to analyse this signal for as long as the dialog is up.
+    // Only one analysis runs at a time, which is all anyone can look at.
+    if (m_spec != kSpecNone) m_shm->spec.source.store(m_spec);
+
     auto* root = new QVBoxLayout(this);
 
     // --- profile bar -------------------------------------------------------
@@ -381,23 +464,30 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
     m_delete   = new QPushButton("Delete");
     auto* imp  = new QPushButton("Import...");
     auto* exp  = new QPushButton("Export...");
-    auto* head = new QPushButton("Headphone EQ...");
-    head->setToolTip("Search the AutoEq measurement database and apply a "
-                     "correction for a specific pair of headphones.");
-    for (QPushButton* b : { save, m_delete, imp, exp, head }) bar->addWidget(b);
+    for (QPushButton* b : { save, m_delete, imp, exp }) bar->addWidget(b);
+    // A measured headphone correction belongs on the bus that drives the
+    // headphones; there is nothing to look up for a microphone.
+    if (m_bus >= 0) {
+        auto* head = new QPushButton("Headphone EQ...");
+        head->setToolTip("Search the AutoEq measurement database and apply a "
+                         "correction for a specific pair of headphones.");
+        connect(head, &QPushButton::clicked, this, &EqEditorDialog::openAutoEq);
+        bar->addWidget(head);
+    }
     root->addLayout(bar);
 
-    connect(save,     &QPushButton::clicked, this, &BusEqDialog::saveProfile);
-    connect(m_delete, &QPushButton::clicked, this, &BusEqDialog::deleteProfile);
-    connect(imp,      &QPushButton::clicked, this, &BusEqDialog::importProfile);
-    connect(exp,      &QPushButton::clicked, this, &BusEqDialog::exportProfile);
-    connect(head,     &QPushButton::clicked, this, &BusEqDialog::openAutoEq);
+    connect(save,     &QPushButton::clicked, this, &EqEditorDialog::saveProfile);
+    connect(m_delete, &QPushButton::clicked, this, &EqEditorDialog::deleteProfile);
+    connect(imp,      &QPushButton::clicked, this, &EqEditorDialog::importProfile);
+    connect(exp,      &QPushButton::clicked, this, &EqEditorDialog::exportProfile);
 
     // --- curve -------------------------------------------------------------
-    m_curve = new EqCurve(m_shm, m_bus);
+    m_curve = new EqCurve(m_shm, m_eq, m_spec);
     m_curve->setToolTip("Drag a numbered handle to set frequency and gain.\n"
                         "Wheel over it for Q, right-click to bypass that band,\n"
-                        "double-click to zero its gain.");
+                        "double-click to zero its gain.\n"
+                        "The shaded area behind is the live spectrum, on the\n"
+                        "dBFS scale down the right-hand edge.");
     root->addWidget(m_curve, 1);
 
     // --- band table --------------------------------------------------------
@@ -414,8 +504,8 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
     grid->addWidget(makeLabel("GAIN", "caption"),  0, 4);
     grid->addWidget(makeLabel("Q",    "caption"),  0, 5);
 
-    m_rows.resize(kBusEqBands);
-    for (int k = 0; k < kBusEqBands; ++k) {
+    m_rows.resize(kEqBands);
+    for (int k = 0; k < kEqBands; ++k) {
         BandRow& row = m_rows[k];
         row.num = makeLabel(QString::number(k + 1), "caption");
         row.on = new QCheckBox;
@@ -451,6 +541,7 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
 
         auto edited = [this, k] {
             if (m_updating) return;
+            snapshot(k);
             pushBand(k);
             refreshRowEnables(k);
             highlight(k);
@@ -478,9 +569,10 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
     // --- bottom bar --------------------------------------------------------
     auto* btns = new QHBoxLayout;
     m_eqOn = makeToggle("EQ ON", "eq", 24);
-    m_eqOn->setChecked(m_shm->bus[m_bus].eq_on.load() != 0);
+    m_eqOn->setChecked(m_eq->on.load() != 0);
     connect(m_eqOn, &QPushButton::toggled, this, [this](bool b) {
-        m_shm->bus[m_bus].eq_on.store(b ? 1 : 0);
+        if (m_updating) return;
+        m_eq->on.store(b ? 1 : 0);
         m_curve->update();
     });
     btns->addWidget(m_eqOn);
@@ -497,19 +589,27 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
                          "boosted curve does not clip.");
     connect(m_preamp, &QDoubleSpinBox::valueChanged, this, [this](double v) {
         if (m_updating) return;
-        m_shm->bus[m_bus].eq_preamp_db.store(float(v));
+        snapshot(-1);                       // one control, so one gesture
+        m_eq->preamp_db.store(float(v));
         highlight(-1);
         m_curve->update();
     });
     btns->addWidget(m_preamp);
     auto* autoPre = new QPushButton("Auto");
     autoPre->setToolTip("Set the preamp to just clear the curve's highest peak");
-    connect(autoPre, &QPushButton::clicked, this, &BusEqDialog::autoPreamp);
+    connect(autoPre, &QPushButton::clicked, this, &EqEditorDialog::autoPreamp);
     btns->addWidget(autoPre);
 
     btns->addSpacing(8);
+    m_undoBtn = new QPushButton("Undo");
+    m_undoBtn->setShortcut(QKeySequence::Undo);
+    m_undoBtn->setToolTip("Step back through the edits made in this dialog (Ctrl+Z)");
+    m_undoBtn->setEnabled(false);
+    connect(m_undoBtn, &QPushButton::clicked, this, &EqEditorDialog::undo);
+    btns->addWidget(m_undoBtn);
+
     auto* flat = new QPushButton("Flatten");
-    connect(flat, &QPushButton::clicked, this, &BusEqDialog::flatten);
+    connect(flat, &QPushButton::clicked, this, &EqEditorDialog::flatten);
     btns->addWidget(flat);
 
     m_note = makeLabel("", "caption", Qt::AlignLeft);
@@ -521,21 +621,69 @@ BusEqDialog::BusEqDialog(Shared* shm, int bus, QWidget* parent)
     btns->addWidget(close);
     root->addLayout(btns);
 
+    connect(m_curve, &EqCurve::editStarted,  this, [this](int k) { snapshot(k); });
     connect(m_curve, &EqCurve::bandEdited,   this, [this](int k) { pullFromShm(); highlight(k); });
     connect(m_curve, &EqCurve::bandToggled,  this, [this](int k) { pullFromShm(); highlight(k); });
     connect(m_curve, &EqCurve::bandSelected, this, [this](int k) { highlight(k); });
 
     buildProfileCombo();
-    connect(m_profile, &QComboBox::currentIndexChanged, this, &BusEqDialog::onProfileChosen);
+    connect(m_profile, &QComboBox::currentIndexChanged, this, &EqEditorDialog::onProfileChosen);
+
+    // The spectrum comes from the engine, so the curve has to be told to
+    // repaint; 20 fps matches the rate the engine publishes at.
+    if (m_spec != kSpecNone) {
+        m_repaint = new QTimer(this);
+        connect(m_repaint, &QTimer::timeout, this, [this] {
+            const uint32_t seq = m_shm->spec.seq.load(std::memory_order_relaxed);
+            if (seq != m_specSeen) { m_specSeen = seq; m_curve->update(); }
+        });
+        m_repaint->start(50);
+    }
 
     pullFromShm();
     highlight(0);
     resize(760, 700);
 }
 
+EqEditorDialog::~EqEditorDialog()
+{
+    // Stop the engine analysing the moment nobody is looking.
+    if (m_spec != kSpecNone && m_shm->spec.source.load() == m_spec)
+        m_shm->spec.source.store(kSpecNone);
+}
+
+void EqEditorDialog::snapshot(int tag)
+{
+    // A drag or a wheel spin arrives as dozens of tiny changes but is one
+    // gesture; successive touches of the same control inside half a second
+    // collapse into the single entry that started it.
+    if (tag >= -1 && tag == m_lastTag && m_since.isValid() && m_since.elapsed() < 500) {
+        m_since.restart();
+        return;
+    }
+    m_undo.push_back(eq_snapshot(*m_eq));
+    if (m_undo.size() > 64) m_undo.removeFirst();
+    m_lastTag = tag;
+    m_since.restart();
+    m_undoBtn->setEnabled(true);
+}
+
+void EqEditorDialog::undo()
+{
+    if (m_undo.isEmpty()) return;
+    eq_restore(*m_eq, m_undo.takeLast());
+    m_lastTag = -2;                 // the next edit always starts a new entry
+    m_undoBtn->setEnabled(!m_undo.isEmpty());
+    pullFromShm();
+    const QSignalBlocker block(m_profile);
+    m_profile->setCurrentIndex(0);
+    m_delete->setEnabled(false);
+    m_note->setText(m_undo.isEmpty() ? "undone (nothing further to undo)" : "undone");
+}
+
 // The combo lists the built-ins, then whatever is saved in the EQ directory.
-// Index 0 is a placeholder meaning "whatever is on the bus right now".
-void BusEqDialog::buildProfileCombo(const QString& select)
+// Index 0 is a placeholder meaning "whatever is on this EQ right now".
+void EqEditorDialog::buildProfileCombo(const QString& select)
 {
     const QSignalBlocker block(m_profile);
     m_profile->clear();
@@ -565,7 +713,7 @@ void BusEqDialog::buildProfileCombo(const QString& select)
     m_delete->setEnabled(cur.startsWith("user:"));
 }
 
-void BusEqDialog::onProfileChosen(int)
+void EqEditorDialog::onProfileChosen(int)
 {
     const QString key = m_profile->currentData().toString();
     m_delete->setEnabled(key.startsWith("user:"));
@@ -586,47 +734,46 @@ void BusEqDialog::onProfileChosen(int)
     applyProfile(prof, QString::fromStdString(prof.name));
 }
 
-void BusEqDialog::applyProfile(const EqProfile& prof, const QString& label)
+void EqEditorDialog::applyProfile(const EqProfile& prof, const QString& label)
 {
-    eq_apply_to_bus(m_shm, m_bus, prof);
-    m_shm->bus[m_bus].eq_on.store(1);
+    snapshot(-3);
+    eq_apply(*m_eq, prof);
+    m_eq->on.store(1);
     pullFromShm();
     if (!label.isEmpty())
         m_note->setText(QString("applied \"%1\"").arg(label));
 }
 
-void BusEqDialog::pullFromShm()
+void EqEditorDialog::pullFromShm()
 {
     m_updating = true;
-    const BusParams& p = m_shm->bus[m_bus];
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         BandRow& row = m_rows[k];
-        row.on->setChecked(p.eq_band_on[k].load() != 0);
-        row.type->setCurrentIndex(std::clamp<int>(p.eq_type[k].load(), 0, kEqTypeCount - 1));
-        row.freq->setValue(p.eq_freq[k].load());
-        row.gain->setValue(p.eq_gain[k].load());
-        row.q->setValue(p.eq_q[k].load());
+        row.on->setChecked(m_eq->band_on[k].load() != 0);
+        row.type->setCurrentIndex(std::clamp<int>(m_eq->type[k].load(), 0, kEqTypeCount - 1));
+        row.freq->setValue(m_eq->freq[k].load());
+        row.gain->setValue(m_eq->gain[k].load());
+        row.q->setValue(m_eq->q[k].load());
     }
-    m_preamp->setValue(p.eq_preamp_db.load());
-    m_eqOn->setChecked(p.eq_on.load() != 0);
+    m_preamp->setValue(m_eq->preamp_db.load());
+    m_eqOn->setChecked(m_eq->on.load() != 0);
     m_updating = false;
 
-    for (int k = 0; k < kBusEqBands; ++k) refreshRowEnables(k);
+    for (int k = 0; k < kEqBands; ++k) refreshRowEnables(k);
     m_curve->update();
 }
 
-void BusEqDialog::pushBand(int k)
+void EqEditorDialog::pushBand(int k)
 {
     const BandRow& row = m_rows[k];
-    BusParams& p = m_shm->bus[m_bus];
-    p.eq_band_on[k].store(row.on->isChecked() ? 1 : 0);
-    p.eq_type[k].store(row.type->currentIndex());
-    p.eq_freq[k].store(float(row.freq->value()));
-    p.eq_gain[k].store(float(row.gain->value()));
-    p.eq_q[k].store(float(row.q->value()));
+    m_eq->band_on[k].store(row.on->isChecked() ? 1 : 0);
+    m_eq->type[k].store(row.type->currentIndex());
+    m_eq->freq[k].store(float(row.freq->value()));
+    m_eq->gain[k].store(float(row.gain->value()));
+    m_eq->q[k].store(float(row.q->value()));
 }
 
-void BusEqDialog::refreshRowEnables(int k)
+void EqEditorDialog::refreshRowEnables(int k)
 {
     const BandRow& row = m_rows[k];
     const bool live = row.on->isChecked();
@@ -641,9 +788,9 @@ void BusEqDialog::refreshRowEnables(int k)
 
 // Marks the row matching the band selected on the curve, so the two halves of
 // the dialog stay visibly connected.
-void BusEqDialog::highlight(int band)
+void EqEditorDialog::highlight(int band)
 {
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         QFont f = m_rows[k].num->font();
         f.setBold(k == band);
         m_rows[k].num->setFont(f);
@@ -656,26 +803,27 @@ void BusEqDialog::highlight(int band)
     }
 }
 
-void BusEqDialog::autoPreamp()
+void EqEditorDialog::autoPreamp()
 {
-    EqProfile cur = eq_capture_from_bus(m_shm, m_bus);
-    const float pa = eq_suggest_preamp(cur);
-    m_shm->bus[m_bus].eq_preamp_db.store(pa);
+    snapshot(-4);
+    const float pa = eq_suggest_preamp(eq_capture(*m_eq));
+    m_eq->preamp_db.store(pa);
     pullFromShm();
     m_note->setText(QString("preamp set to %1 dB").arg(pa, 0, 'f', 1));
 }
 
-void BusEqDialog::flatten()
+void EqEditorDialog::flatten()
 {
+    snapshot(-5);
     EqProfile flat;
-    eq_apply_to_bus(m_shm, m_bus, flat);
+    eq_apply(*m_eq, flat);
     pullFromShm();
     const QSignalBlocker block(m_profile);
     m_profile->setCurrentIndex(0);
     m_note->setText("flattened");
 }
 
-void BusEqDialog::saveProfile()
+void EqEditorDialog::saveProfile()
 {
     bool ok = false;
     const QString name = QInputDialog::getText(
@@ -693,7 +841,7 @@ void BusEqDialog::saveProfile()
            != QMessageBox::Yes)
         return;
 
-    EqProfile prof = eq_capture_from_bus(m_shm, m_bus, name.toStdString());
+    EqProfile prof = eq_capture(*m_eq, name.toStdString());
     if (!eq_write_file(prof, path.toUtf8().constData())) {
         QMessageBox::warning(this, "BetterBanana", "Could not write " + path);
         return;
@@ -702,7 +850,7 @@ void BusEqDialog::saveProfile()
     m_note->setText(QString("saved \"%1\"").arg(name));
 }
 
-void BusEqDialog::deleteProfile()
+void EqEditorDialog::deleteProfile()
 {
     const QString key = m_profile->currentData().toString();
     if (!key.startsWith("user:")) return;
@@ -719,7 +867,7 @@ void BusEqDialog::deleteProfile()
     m_note->setText(QString("deleted \"%1\"").arg(name));
 }
 
-void BusEqDialog::importProfile()
+void EqEditorDialog::importProfile()
 {
     const QString path = QFileDialog::getOpenFileName(
         this, "Import an Equalizer APO / AutoEq profile",
@@ -736,22 +884,23 @@ void BusEqDialog::importProfile()
     }
     const QString label = QFileInfo(path).completeBaseName();
     applyProfile(prof, label);
-    if (int(prof.bands.size()) > kBusEqBands)
+    if (int(prof.bands.size()) > kEqBands)
         m_note->setText(QString("applied \"%1\" - %2 of its %3 filters "
                                 "(the strongest ones fit)")
-                            .arg(label).arg(kBusEqBands).arg(prof.bands.size()));
+                            .arg(label).arg(kEqBands).arg(prof.bands.size()));
 }
 
-void BusEqDialog::exportProfile()
+void EqEditorDialog::exportProfile()
 {
+    QString suggested = m_title;
+    suggested.replace('/', '-');
     QString path = QFileDialog::getSaveFileName(
         this, "Export as an Equalizer APO profile",
-        QDir::homePath() + "/" + QString("BetterBanana %1.txt").arg(kBusLabel[m_bus]),
+        QDir::homePath() + "/" + QString("BetterBanana %1.txt").arg(suggested),
         "EQ profiles (*.txt)");
     if (path.isEmpty()) return;
     if (!path.endsWith(".txt", Qt::CaseInsensitive)) path += ".txt";
-    EqProfile prof = eq_capture_from_bus(m_shm, m_bus,
-                                         QFileInfo(path).completeBaseName().toStdString());
+    EqProfile prof = eq_capture(*m_eq, QFileInfo(path).completeBaseName().toStdString());
     if (!eq_write_file(prof, path.toUtf8().constData())) {
         QMessageBox::warning(this, "BetterBanana", "Could not write " + path);
         return;
@@ -759,8 +908,10 @@ void BusEqDialog::exportProfile()
     m_note->setText("exported " + QFileInfo(path).fileName());
 }
 
-void BusEqDialog::openAutoEq()
+void EqEditorDialog::openAutoEq()
 {
+    if (m_bus < 0) return;
+    snapshot(-6);
     AutoEqDialog dlg(m_shm, m_bus, this);
     dlg.exec();
     pullFromShm();
@@ -1069,8 +1220,8 @@ void AutoEqDialog::applySelected()
         return;
     }
     prof.name = name.toStdString();
-    eq_apply_to_bus(m_shm, m_bus, prof);
-    m_shm->bus[m_bus].eq_on.store(1);
+    eq_apply(m_shm->bus[m_bus].eq, prof);
+    m_shm->bus[m_bus].eq.on.store(1);
 
     // Keep a copy locally: it makes the profile selectable offline afterwards,
     // and gives the remembered-device mapping something stable to point at.
@@ -1087,12 +1238,12 @@ void AutoEqDialog::applySelected()
         else if (!m_remember->isChecked())                   cfg.remove(key);
     }
 
-    const int fitted = std::min<int>(int(prof.bands.size()), kBusEqBands);
+    const int fitted = std::min<int>(int(prof.bands.size()), kEqBands);
     QString msg = QString("Applied %1 - %2 bands, preamp %3 dB.")
                       .arg(name).arg(fitted).arg(prof.preamp, 0, 'f', 1);
-    if (int(prof.bands.size()) > kBusEqBands)
+    if (int(prof.bands.size()) > kEqBands)
         msg += QString(" (%1 published; the strongest %2 fit)")
-                   .arg(prof.bands.size()).arg(kBusEqBands);
+                   .arg(prof.bands.size()).arg(kEqBands);
     setStatus(msg);
 }
 
@@ -1106,7 +1257,7 @@ QString AutoEqDialog::applyRemembered(Shared* shm, int bus, const QString& devic
     const QString path = QString::fromStdString(eq_profile_dir()) + "/" + name + ".txt";
     EqProfile prof;
     if (!eq_read_file(prof, path.toUtf8().constData()) || prof.bands.empty()) return QString();
-    eq_apply_to_bus(shm, bus, prof);
-    shm->bus[bus].eq_on.store(1);
+    eq_apply(shm->bus[bus].eq, prof);
+    shm->bus[bus].eq.on.store(1);
     return name;
 }

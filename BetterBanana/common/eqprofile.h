@@ -1,4 +1,4 @@
-// betterbanana - EQ profiles: the band list of one bus, on its own.
+// betterbanana - EQ profiles: the band list of one EQ block, on its own.
 //
 // A profile is what a preset file, an Equalizer APO / Peace export and an
 // AutoEq download all reduce to, so the GUI and bb-ctl share one parser and
@@ -233,16 +233,16 @@ inline float eq_suggest_preamp(const EqProfile& prof)
 }
 
 // ---------------------------------------------------------------------------
-// Moving a profile on and off a live bus.
+// Moving a profile on and off a live EQ block.
 // ---------------------------------------------------------------------------
 
-// Trims a profile to the bands the hardware has. Profiles with more bands than
-// kBusEqBands keep the ones that change the sound most, rather than whichever
+// Trims a profile to the bands the block has. Profiles with more bands than
+// kEqBands keep the ones that change the sound most, rather than whichever
 // happen to come first: shelves and pass filters shape the whole curve, so they
 // always survive, and the remaining slots go to the largest boosts and cuts.
 inline std::vector<EqBand> eq_fit_bands(const std::vector<EqBand>& in)
 {
-    if ((int)in.size() <= kBusEqBands) return in;
+    if ((int)in.size() <= kEqBands) return in;
     std::vector<int> idx(in.size());
     for (size_t i = 0; i < in.size(); ++i) idx[i] = (int)i;
     std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
@@ -250,7 +250,7 @@ inline std::vector<EqBand> eq_fit_bands(const std::vector<EqBand>& in)
         if (wa != wb) return wa;
         return std::fabs(in[a].gain) > std::fabs(in[b].gain);
     });
-    idx.resize(kBusEqBands);
+    idx.resize(kEqBands);
     std::sort(idx.begin(), idx.end());
     std::vector<EqBand> out;
     out.reserve(idx.size());
@@ -258,50 +258,80 @@ inline std::vector<EqBand> eq_fit_bands(const std::vector<EqBand>& in)
     return out;
 }
 
-// Writes a profile onto a bus. Unused bands are reset to flat peaks rather than
-// left holding whatever the previous profile put there.
-inline void eq_apply_to_bus(Shared* s, int bus, const EqProfile& prof)
+// Writes a profile into an EQ block. Unused bands are reset to flat peaks
+// rather than left holding whatever the previous profile put there. Works on a
+// bus block or a strip block alike - they are the same struct.
+inline void eq_apply(EqParams& p, const EqProfile& prof)
 {
-    if (!s || bus < 0 || bus >= kBuses) return;
-    BusParams& p = s->bus[bus];
     const std::vector<EqBand> bands = eq_fit_bands(prof.bands);
-
-    static const float kSpread[kBusEqBands] = {
-        31, 62, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 12000, 16000
-    };
-    for (int k = 0; k < kBusEqBands; ++k) {
+    for (int k = 0; k < kEqBands; ++k) {
         if (k < (int)bands.size()) {
             const EqBand& b = bands[k];
-            p.eq_freq[k].store(clampf(b.freq, 10.0f, 24000.0f));
-            p.eq_gain[k].store(clampf(b.gain, -24.0f, 24.0f));
-            p.eq_q[k].store(clampf(b.q, 0.1f, 20.0f));
-            p.eq_type[k].store(b.type);
-            p.eq_band_on[k].store(b.on ? 1 : 0);
+            p.freq[k].store(clampf(b.freq, 10.0f, 24000.0f));
+            p.gain[k].store(clampf(b.gain, -24.0f, 24.0f));
+            p.q[k].store(clampf(b.q, 0.1f, 20.0f));
+            p.type[k].store(b.type);
+            p.band_on[k].store(b.on ? 1 : 0);
         } else {
-            p.eq_freq[k].store(kSpread[k]);
-            p.eq_gain[k].store(0.0f);
-            p.eq_q[k].store(1.0f);
-            p.eq_type[k].store(kEqPeak);
-            p.eq_band_on[k].store(1);
+            p.freq[k].store(kEqDefaultFreq[k]);
+            p.gain[k].store(0.0f);
+            p.q[k].store(1.0f);
+            p.type[k].store(kEqPeak);
+            p.band_on[k].store(1);
         }
     }
-    p.eq_preamp_db.store(clampf(prof.preamp, -24.0f, 12.0f));
+    p.preamp_db.store(clampf(prof.preamp, -24.0f, 12.0f));
 }
 
-inline EqProfile eq_capture_from_bus(const Shared* s, int bus, const std::string& name = "")
+// An exact copy of an EQ block, for undo. The APO text form rounds, which is
+// right for a file and wrong for stepping backwards through your own edits.
+struct EqSnapshot {
+    int32_t on = 0;
+    float   preamp = 0.0f;
+    float   gain[kEqBands] = {}, freq[kEqBands] = {}, q[kEqBands] = {};
+    int32_t type[kEqBands] = {}, band_on[kEqBands] = {};
+};
+
+inline EqSnapshot eq_snapshot(const EqParams& p)
+{
+    EqSnapshot s;
+    s.on = p.on.load();
+    s.preamp = p.preamp_db.load();
+    for (int k = 0; k < kEqBands; ++k) {
+        s.gain[k] = p.gain[k].load();
+        s.freq[k] = p.freq[k].load();
+        s.q[k]    = p.q[k].load();
+        s.type[k] = p.type[k].load();
+        s.band_on[k] = p.band_on[k].load();
+    }
+    return s;
+}
+
+inline void eq_restore(EqParams& p, const EqSnapshot& s)
+{
+    for (int k = 0; k < kEqBands; ++k) {
+        p.gain[k].store(s.gain[k]);
+        p.freq[k].store(s.freq[k]);
+        p.q[k].store(s.q[k]);
+        p.type[k].store(s.type[k]);
+        p.band_on[k].store(s.band_on[k]);
+    }
+    p.preamp_db.store(s.preamp);
+    p.on.store(s.on);
+}
+
+inline EqProfile eq_capture(const EqParams& p, const std::string& name = "")
 {
     EqProfile prof;
     prof.name = name;
-    if (!s || bus < 0 || bus >= kBuses) return prof;
-    const BusParams& p = s->bus[bus];
-    prof.preamp = p.eq_preamp_db.load();
-    for (int k = 0; k < kBusEqBands; ++k) {
+    prof.preamp = p.preamp_db.load();
+    for (int k = 0; k < kEqBands; ++k) {
         EqBand b;
-        b.freq = p.eq_freq[k].load();
-        b.gain = p.eq_gain[k].load();
-        b.q    = p.eq_q[k].load();
-        b.type = p.eq_type[k].load();
-        b.on   = p.eq_band_on[k].load() != 0;
+        b.freq = p.freq[k].load();
+        b.gain = p.gain[k].load();
+        b.q    = p.q[k].load();
+        b.type = p.type[k].load();
+        b.on   = p.band_on[k].load() != 0;
         prof.bands.push_back(b);
     }
     return prof;

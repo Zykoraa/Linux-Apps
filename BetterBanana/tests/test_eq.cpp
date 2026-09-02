@@ -104,17 +104,17 @@ int main()
     {
         Shared* s = new Shared();
         set_defaults(s);
-        eq_apply_to_bus(s, 0, hd);
-        near(s->bus[0].eq_preamp_db.load(), -6.1, 1e-4, "preamp reaches the bus");
-        near(s->bus[0].eq_freq[1].load(), 8800.0, 1e-3, "band 2 frequency reaches the bus");
-        chk(s->bus[0].eq_type[0].load() == kEqLowShelf, "band 1 type reaches the bus",
-            s->bus[0].eq_type[0].load(), kEqLowShelf, 0);
+        eq_apply(s->bus[0].eq, hd);
+        near(s->bus[0].eq.preamp_db.load(), -6.1, 1e-4, "preamp reaches the bus");
+        near(s->bus[0].eq.freq[1].load(), 8800.0, 1e-3, "band 2 frequency reaches the bus");
+        chk(s->bus[0].eq.type[0].load() == kEqLowShelf, "band 1 type reaches the bus",
+            s->bus[0].eq.type[0].load(), kEqLowShelf, 0);
         // Ten filters into twelve slots: the spare two must come back flat, not
         // hold whatever the previous profile left there.
-        near(s->bus[0].eq_gain[10].load(), 0.0, 1e-6, "unused band 11 is flat");
-        near(s->bus[0].eq_gain[11].load(), 0.0, 1e-6, "unused band 12 is flat");
+        near(s->bus[0].eq.gain[10].load(), 0.0, 1e-6, "unused band 11 is flat");
+        near(s->bus[0].eq.gain[11].load(), 0.0, 1e-6, "unused band 12 is flat");
 
-        EqProfile round = eq_capture_from_bus(s, 0);
+        EqProfile round = eq_capture(s->bus[0].eq);
         double worst = 0.0;
         for (size_t i = 0; i < hd.bands.size(); ++i)
             worst = std::max(worst, (double)std::fabs(round.bands[i].gain - hd.bands[i].gain));
@@ -131,8 +131,8 @@ int main()
             big.bands.push_back(b);
         }
         const std::vector<EqBand> fitted = eq_fit_bands(big.bands);
-        chk(fitted.size() == kBusEqBands, "an oversized profile is trimmed to fit",
-            double(fitted.size()), kBusEqBands, 0);
+        chk(fitted.size() == kEqBands, "an oversized profile is trimmed to fit",
+            double(fitted.size()), kEqBands, 0);
         double smallest = 1e9;
         for (const EqBand& b : fitted) smallest = std::min(smallest, (double)std::fabs(b.gain));
         chk(smallest > 3.0, "the trimmed bands are the loudest ones", smallest, 3.0, 0);
@@ -182,7 +182,7 @@ int main()
         // profile's tail behind.
         Shared* s = new Shared();
         set_defaults(s);
-        eq_apply_to_bus(s, 0, hd);          // leaves band 8 at 2055 Hz / +1.2 dB
+        eq_apply(s->bus[0].eq, hd);          // leaves band 8 at 2055 Hz / +1.2 dB
 
         const char* path = "/tmp/bb-test-v1.bbp";
         FILE* f = fopen(path, "w");
@@ -193,27 +193,27 @@ int main()
                 fprintf(f, "bus.0.band.%d %.3f %.3f %.3f\n", k, 0.0, 100.0 * (k + 1), 1.0);
             fclose(f);
             yes(load_preset(s, path), "a version 1 preset still loads");
-            near(s->bus[0].eq_freq[0].load(), 100.0, 1e-3, "its six bands are applied");
-            near(s->bus[0].eq_gain[7].load(), 0.0, 1e-6, "band 8 is reset, not left stale");
-            near(s->bus[0].eq_preamp_db.load(), 0.0, 1e-6, "preamp resets when absent");
-            chk(s->bus[0].eq_type[7].load() == kEqPeak, "reset bands return to peaking",
-                s->bus[0].eq_type[7].load(), kEqPeak, 0);
+            near(s->bus[0].eq.freq[0].load(), 100.0, 1e-3, "its six bands are applied");
+            near(s->bus[0].eq.gain[7].load(), 0.0, 1e-6, "band 8 is reset, not left stale");
+            near(s->bus[0].eq.preamp_db.load(), 0.0, 1e-6, "preamp resets when absent");
+            chk(s->bus[0].eq.type[7].load() == kEqPeak, "reset bands return to peaking",
+                s->bus[0].eq.type[7].load(), kEqPeak, 0);
             remove(path);
         }
 
         // A version 2 round trip must preserve everything, types included.
         set_defaults(s);
-        eq_apply_to_bus(s, 1, hd);
-        s->bus[1].eq_band_on[3].store(0);
+        eq_apply(s->bus[1].eq, hd);
+        s->bus[1].eq.band_on[3].store(0);
         const char* p2 = "/tmp/bb-test-v2.bbp";
         yes(save_preset(s, p2), "current state saves");
         set_defaults(s);
         yes(load_preset(s, p2), "and loads back");
-        near(s->bus[1].eq_preamp_db.load(), -6.1, 1e-3, "preamp round trips");
-        chk(s->bus[1].eq_type[0].load() == kEqLowShelf, "band type round trips",
-            s->bus[1].eq_type[0].load(), kEqLowShelf, 0);
-        chk(s->bus[1].eq_band_on[3].load() == 0, "a bypassed band round trips",
-            s->bus[1].eq_band_on[3].load(), 0, 0);
+        near(s->bus[1].eq.preamp_db.load(), -6.1, 1e-3, "preamp round trips");
+        chk(s->bus[1].eq.type[0].load() == kEqLowShelf, "band type round trips",
+            s->bus[1].eq.type[0].load(), kEqLowShelf, 0);
+        chk(s->bus[1].eq.band_on[3].load() == 0, "a bypassed band round trips",
+            s->bus[1].eq.band_on[3].load(), 0, 0);
         remove(p2);
         delete s;
     }

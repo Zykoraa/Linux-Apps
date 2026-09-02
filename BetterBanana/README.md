@@ -15,10 +15,13 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 - 5×5 routing matrix, per-bus solo, per-strip gate / compressor / 3-band EQ
 - 3 virtual cables assignable to any hardware strip, plus VAIO and AUX
 - Sidechain ducking: music steps back while you talk
-- 12-band parametric EQ per bus: shelves, pass filters, preamp, draggable curve
+- 12-band parametric EQ on **every strip and every bus**: shelves, pass filters,
+  preamp, draggable curve over a live spectrum analyser
+- Undo and redo across the whole mixer, however a change was made
 - Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
 - Headphone corrections for ~8850 models from the AutoEq database, searchable
 - Per-application routing that survives the app restarting
+- Strip settings that follow a microphone from device to device, when you ask
 - Opens the mic-gain analyzer on any strip or bus, straight from the menu
 - Recorder, 8×8 VBAN network audio, presets, 10 colour themes
 
@@ -164,11 +167,17 @@ the rest of the configuration. From the shell:
     ./build/bb-ctl label strip 0 "MIC - SM7B"
     ./build/bb-ctl label bus A1 "SPEAKERS"
 
-## Bus EQ
+## Parametric EQ
 
-Each bus has a twelve-band parametric EQ. The **EQ** button bypasses the whole
-thing; **right-click the EQ button** (or use **Engine → Bus EQ**) to open the
-editor.
+Every input strip and every bus has its own twelve-band parametric EQ. The **EQ**
+button bypasses the whole block; **right-click the EQ button** (or use
+**Engine → Input EQ** / **Engine → Bus EQ**) to open the editor.
+
+The two are the same editor on the same kind of block, so a curve, a profile or
+an AutoEq import works identically wherever you use it. What differs is what
+they are *for*: a bus EQ corrects what you are listening on, and a strip EQ fixes
+what is coming in — a high pass under desk rumble, a narrow notch on a fan or a
+room mode, a dip where a microphone is harsh.
 
 Every band picks its own shape — **peak, low shelf, high shelf, high pass, low
 pass, notch, band pass** — and carries gain, frequency, Q and its own bypass.
@@ -186,11 +195,32 @@ Two ways to edit, on the same state:
 The curve is computed with the engine's own `Biquad`, so it shows what you
 actually hear, preamp included.
 
+**Undo** (or `Ctrl+Z`) steps back through the edits made in the dialog. A whole
+drag or wheel spin is one step, not thirty.
+
+### The spectrum
+
+Behind the curve is the engine's live analysis of the signal this EQ sits in —
+a strip's EQ shows the strip post-processing, a bus's shows the bus output — so
+a boom or a whistle can be seen rather than guessed at. The shaded area is read
+against the **dBFS scale down the right-hand edge**; the numbers on the left are
+EQ gain, as before.
+
+The two scales are deliberately aligned: 90 dB of level spans the same height as
+36 dB of EQ, which puts every gridline on a round level (+18 dB is 0 dBFS, 0 dB
+is −45 dBFS, −18 dB is −90 dBFS).
+
+Analysis runs on the engine's control thread, never on the audio thread, and
+only while an editor is open — the mixer does no FFT work when nobody is
+looking. One signal is analysed at a time, which is all anyone can read.
+
 Bands that are bypassed — or left as a flat peak — are dropped from the audio
 path entirely, so a twelve-band EQ using three bands costs three biquads.
 
-The per-strip **LOW / MID / HIGH** knobs are a separate, always-active 3-band EQ
-and need no enabling.
+The per-strip **LOW / MID / HIGH** knobs are a separate, always-active tone
+control at fixed frequencies (100 Hz shelf, 1 kHz peak, 8 kHz shelf). They sit
+*before* the parametric block and need no enabling; think of them as the quick
+shape and the parametric as the surgical one.
 
 ### EQ profiles
 
@@ -314,9 +344,9 @@ your configuration back.
     journalctl --user -u betterbanana-health -f
 
 It keeps its own config snapshot (`~/.config/betterbanana/lastgood.bbp`), taken
-whenever the mixer looks healthy, rather than trusting `autosave.bbp` — autosave
-is only written when the GUI exits, so it may be stale or hold a preset you
-loaded once and forgot. Your default sink and source are recorded alongside it,
+whenever the mixer looks healthy. That matters because a restarted engine loads
+your **startup preset** — a deliberate choice you made once, not necessarily what
+you have been doing since. Your default sink and source are recorded alongside it,
 because a PipeWire restart resets those and they are normally `bb_vaio` and
 `bb_b1`; losing them quietly sends every application to the wrong device.
 
@@ -426,14 +456,59 @@ deliberate controls and still take the wheel on hover (hold Ctrl for fine steps)
 State is saved as plain text (`common/preset.h`): every strip, bus, device
 assignment, recorder setting and VBAN stream.
 
-- **Preset menu** — Save (`Ctrl+S`), Load (`Ctrl+O`), or *Save as default*.
-- The engine **restores `~/.config/betterbanana/autosave.bbp` on start and rewrites
-  it on exit**, so it reopens where you left off.
+Presets are **explicit**. The mixer does not save your session when you quit and
+does not silently reload it — it loads exactly the one preset you nominate, and
+nothing else.
+
+- **Preset menu** — Save (`Ctrl+S`), Load (`Ctrl+O`), and **Load on startup**.
+- **Load on startup** lists your saved presets; the one you tick is what the
+  engine restores when it starts. `(none)` means it comes up with a default
+  mixer. The choice is recorded in `~/.config/betterbanana/startup`.
 - Named presets live in `~/.config/betterbanana/presets/`.
 
         ./build/bb-ctl preset save studio
         ./build/bb-ctl preset load studio
         ./build/bb-ctl preset list
+        ./build/bb-ctl preset startup studio    # load "studio" at engine start
+        ./build/bb-ctl preset startup           # show the current choice
+        ./build/bb-ctl preset startup none      # back to a default mixer
+
+Preset files are written through a temporary and renamed into place, so a crash
+or a full disk cannot leave a half-written preset that comes back as a
+half-configured mixer.
+
+Loading a preset whose devices are not plugged in says so, and names them,
+rather than leaving those strips quietly unconnected.
+
+**Upgrading from an older version:** the engine used to save your session to
+`autosave.bbp` on exit and reload it on start. The first time the new engine
+runs it turns that file into an ordinary preset called *Previous session* and
+makes it the startup choice, so nothing is lost and nothing changes underfoot.
+
+## Undo
+
+`Ctrl+Z` and `Ctrl+Shift+Z` (**Edit** menu) step the whole mixer backwards and
+forwards — faders, routing, EQ, ducking, everything a preset covers.
+
+It works by watching the shared state rather than by instrumenting each control,
+which has two consequences worth knowing. A change made from `bb-ctl` in another
+terminal is undoable too. And a change is recorded once it has *stopped* moving,
+so a fader sweep or an EQ drag is one step rather than thirty.
+
+## Settings that follow a microphone
+
+**Right-click a hardware strip's device picker** to remember that strip's
+processing for whatever is selected — gate, compressor, EQ, level and pan. Point
+any strip at that device later and the settings come back.
+
+Bus assignment is deliberately *not* included: which buses a strip feeds belongs
+to the mix, not to what is plugged in.
+
+Nothing is stored unless you ask for it, and *Forget them* removes it. Snapshots
+live in `~/.config/betterbanana/devices/`.
+
+This is the input-side twin of the AutoEq *"re-apply automatically for this
+device"* option, which does the same thing for headphone corrections on a bus.
 
 ## Virtual cables
 
@@ -636,11 +711,27 @@ freshly installed `99-bb-stream.conf` has no effect until you log out and back i
     ./build/bb-ctl eq preamp A1                 # set a clipping-safe preamp
     ./build/bb-ctl bus A1 band 0 6.0 105 0.7 ls # gain, freq, Q, shape
 
+Every `eq` subcommand takes a **bus** (`A1`–`A3`, `B1`, `B2`) or an **input
+strip** (`s0`–`s4`), because they are the same kind of block:
+
+    ./build/bb-ctl eq load s0 "Speech / Podcast"   # onto hardware input 1
+    ./build/bb-ctl eq show s0
+    ./build/bb-ctl strip 0 eqon 1                  # enable that strip's EQ
+    ./build/bb-ctl strip 0 band 0 -4.0 80 0.7 hp   # 80 Hz high pass on the mic
+
 ## Tests
 
     ./build/test_dsp          # 30 DSP assertions, no audio server needed
     ./build/test_eq           # 45 EQ profile / import / preset assertions
+    ./build/test_preset       # 44 preset, startup and per-device assertions
+    ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
+    ./build/test_fader        # fader ballistics
     ./tests/integration.sh    # drives real audio through a running engine
+
+`test_preset` checks that serialise → deserialise → serialise is byte-identical
+on a fully populated mixer. Undo is built out of those two functions, so a field
+the format quietly dropped would be a control `Ctrl+Z` silently failed to
+restore.
 
 ## Design
 
@@ -669,8 +760,9 @@ binaries refuse to talk instead of silently writing to the wrong offsets.
 ## Status
 
 Working and verified: virtual devices, routing matrix, per-strip gate /
-compressor / 3-band EQ / audibility / Intellipan / mono / solo / mute / fader,
-the 12-band per-bus EQ with profiles and AutoEq import, per-bus mono / mute /
+compressor / tone knobs / audibility / Intellipan / mono / solo / mute / fader,
+the 12-band parametric EQ on every strip and bus with profiles, AutoEq import
+and a live spectrum analyser, undo across the whole mixer, per-bus mono / mute /
 fader, metering, hardware assignment, the tape deck, and VBAN send/receive.
 
 Not implemented: the surround bus modes, which need buses wider than stereo.

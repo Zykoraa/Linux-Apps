@@ -36,19 +36,27 @@ public:
     void setDeviceValue(const QString& id);
     QString deviceValue() const;
     void pullFromShm();
+    // True when the assigned device is named by the state but not present.
+    bool deviceMissing() const { return m_missing; }
 
 signals:
     void routingChanged(int hwIndex, const QString& nodeName);
+    void eqEditRequested(int stripIndex);
+    void statusMessage(const QString& text);
 
 private:
     Knob* addKnob(QGridLayout* g, int col, const QString& name,
                   int lo, int hi, int def, bool bipolar);
+    void deviceMenu(const QPoint& pos);
 
     bb::Shared* m_shm;
     int   m_index;
     bool  m_hardware;
 
+    bool  m_missing = false;
+
     QComboBox*   m_device = nullptr;
+    QPushButton* m_eqBtn  = nullptr;
     Knob*        m_gate   = nullptr;
     Knob*        m_comp   = nullptr;
     Knob*        m_aud    = nullptr;
@@ -81,6 +89,7 @@ public:
     void setDeviceValue(const QString& id);
     QString deviceValue() const;
     void pullFromShm();
+    bool deviceMissing() const { return m_missing; }
 
 signals:
     void routingChanged(int busIndex, const QString& nodeName);
@@ -90,6 +99,7 @@ private:
     bb::Shared* m_shm;
     int   m_index;
     bool  m_hardware;
+    bool  m_missing = false;
 
     QComboBox*   m_device = nullptr;
     QPushButton* m_eq     = nullptr;
@@ -202,6 +212,7 @@ public:
     void openVbanDialog();
     void openAppsDialog();
     void openBusEq(int bus);
+    void openStripEq(int strip);
     void openDuckDialog();
 
 private slots:
@@ -209,10 +220,21 @@ private slots:
     void refreshDevices();
     void applyTheme(int index);
     void refreshAutostart();
+    void undo();
+    void redo();
 
 private:
     void writeRouting();
     void applyDeviceEq(int bus, const QString& device);
+    void applyDeviceStrip(int strip, const QString& device);
+    // Undo works by watching the shared state rather than by instrumenting
+    // every control, so anything that moves the mixer - including bb-ctl - is
+    // undoable, and one gesture is one step.
+    void snapshotTick();
+    void applyState(const QByteArray& text);
+    void refreshUndoActions();
+    void reportMissingDevices();
+    void populateStartupMenu(class QMenu* menu);
     void openMicAnalyzer(const QString& source, const QString& label);
     void populateAnalyzerMenu(class QMenu* menu);
     void readRouting();
@@ -234,6 +256,13 @@ private:
     AppsDialog* m_apps = nullptr;
     QSet<int>   m_ruledStreams;
     int         m_ruleTicks = 0;
+
+    QVector<QByteArray> m_undo, m_redo;
+    QByteArray  m_committed;      // the last settled state
+    QByteArray  m_seen;           // what the previous tick saw
+    int         m_undoTicks = 0;
+    QAction*    m_undoAct = nullptr;
+    QAction*    m_redoAct = nullptr;
 
     QString  m_hwIn[bb::kHwStrips];
     QString  m_busOut[bb::kPhysBuses];

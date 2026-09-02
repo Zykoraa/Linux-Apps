@@ -13,7 +13,7 @@ MOC ?= $(shell \
            /usr/lib64/qt6/libexec/moc /usr/bin/moc-qt6; do \
     [ -x "$$c" ] && echo "$$c" && exit 0; done; echo moc)
 BUILD    := build
-HDRS     := common/protocol.h common/preset.h common/eqprofile.h engine/dsp.h
+HDRS     := common/protocol.h common/preset.h common/eqprofile.h engine/dsp.h engine/spectrum.h
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)
@@ -61,7 +61,8 @@ dist:
 
 engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
-tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader
+tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
+        $(BUILD)/test_preset $(BUILD)/test_spectrum
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -81,6 +82,12 @@ $(BUILD)/test_dsp: tests/test_dsp.cpp engine/dsp.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_eq: tests/test_eq.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/test_preset: tests/test_preset.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/test_spectrum: tests/test_spectrum.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 # GUI: moc the header that declares QObject subclasses, compile alongside.

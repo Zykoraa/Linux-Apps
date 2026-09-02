@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 5;
+constexpr uint32_t kVersion    = 6;
 constexpr const char* kShmName = "/betterbanana.state";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
@@ -25,7 +25,7 @@ constexpr int kPhysBuses  = 3;                 // A1 A2 A3
 constexpr int kVirtBuses  = 2;                 // B1 B2
 constexpr int kBuses      = kPhysBuses + kVirtBuses;
 constexpr int kChan       = 2;
-constexpr int kBusEqBands = 12;
+constexpr int kEqBands    = 12;
 constexpr int kNameLen    = 192;
 constexpr int kLabelLen   = 28;                // user-supplied strip/bus names
 constexpr int kVbanStreams = 8;                // Banana offers 8 in and 8 out
@@ -39,9 +39,7 @@ using af = std::atomic<float>;
 using ai = std::atomic<int32_t>;
 using au = std::atomic<uint32_t>;
 
-// Bus modes. The surround variants of the original need >2 channel buses;
-// stereo-only modes are implemented, the rest are reserved.
-// Filter shapes a bus EQ band can take. The names match the Equalizer APO /
+// Filter shapes an EQ band can take. The names match the Equalizer APO /
 // Peace / AutoEq vocabulary so an imported profile maps across one-to-one:
 // PK, LSC/LS, HSC/HS, LPQ/LP, HPQ/HP, NO, BP.
 enum EqFilterType : int32_t {
@@ -49,11 +47,46 @@ enum EqFilterType : int32_t {
     kEqNotch, kEqBandPass, kEqTypeCount
 };
 
+// Bus modes. The surround variants of the original need >2 channel buses;
+// stereo-only modes are implemented, the rest are reserved.
 enum BusMode : int32_t {
     kBusNormal = 0, kBusAmix, kBusBmix, kBusRepeat, kBusComposite,
     kBusTvMix,  kBusUpMix21, kBusUpMix41, kBusUpMix61,
     kBusCenterOnly, kBusLfeOnly, kBusRearOnly, kBusModeCount
 };
+
+// A twelve-band parametric EQ. Buses have had one since v5; input strips gained
+// the same block in v6, so one editor, one profile format and one engine chain
+// serve both. `on` bypasses the whole block; `band_on` bypasses one band.
+struct EqParams {
+    ai  on;
+    af  preamp_db;                // applied before the band chain
+    af  gain[kEqBands];
+    af  freq[kEqBands];
+    af  q[kEqBands];
+    ai  type[kEqBands];           // EqFilterType
+    ai  band_on[kEqBands];
+};
+
+// Twelve bands spread over the audible range. Every band starts as a flat
+// peaking filter, which the engine bypasses, so a fresh block sounds exactly
+// like no EQ at all.
+constexpr float kEqDefaultFreq[kEqBands] = {
+    31, 62, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 12000, 16000
+};
+
+inline void eq_set_defaults(EqParams& p)
+{
+    p.on.store(0);
+    p.preamp_db.store(0.0f);
+    for (int k = 0; k < kEqBands; ++k) {
+        p.gain[k].store(0.0f);
+        p.freq[k].store(kEqDefaultFreq[k]);
+        p.q[k].store(1.0f);
+        p.type[k].store(kEqPeak);
+        p.band_on[k].store(1);
+    }
+}
 
 struct StripParams {
     ai  present;                  // strip has a live input attached
@@ -61,24 +94,20 @@ struct StripParams {
     af  gain_db;                  // -60 .. +12
     ai  mute, solo, mono;
     af  gate, comp, audibility;   // 0 .. 10 knobs
-    af  eq_low, eq_mid, eq_high;  // -12 .. +12 dB
+    af  eq_low, eq_mid, eq_high;  // -12 .. +12 dB, the three fixed tone knobs
     af  pan_x, pan_y;             // -1 .. +1
     ai  mono_source;              // fold a mono capture across both channels
     af  limit_db;                 // output limiter ceiling
     ai  duck_key;                 // this strip's level drives the ducker
     af  duck_depth_db;            // how far this strip drops while ducking (<= 0)
+    EqParams eq;                  // the parametric block, after the tone knobs
 };
 
 struct BusParams {
     af  gain_db;
-    ai  mute, mono, eq_on, sel;
+    ai  mute, mono, sel;
     ai  mode;                     // BusMode
-    af  eq_gain[kBusEqBands];
-    af  eq_freq[kBusEqBands];
-    af  eq_q[kBusEqBands];
-    ai  eq_type[kBusEqBands];     // EqFilterType
-    ai  eq_band_on[kBusEqBands];  // per-band bypass, independent of eq_on
-    af  eq_preamp_db;             // applied before the band chain
+    EqParams eq;
 };
 
 struct Meters {
@@ -91,6 +120,27 @@ struct Meters {
     ai strip_clip     [kStrips];     // latched; cleared by the GUI
     ai bus_clip       [kBuses];
     af duck_env;                     // 0..1, how open the ducker currently is
+};
+
+// ---------------------------------------------------------------------------
+// Spectrum analyser. One signal at a time: whichever EQ editor is open asks for
+// its own, and nothing is measured while none is. Analysis runs on the engine's
+// control thread, off the realtime path.
+// ---------------------------------------------------------------------------
+constexpr int kSpecBins = 64;
+constexpr int kSpecNone = -1;
+
+// Source encoding: buses occupy 0..kBuses-1, strips follow.
+inline constexpr int spec_bus_src(int b)   { return b; }
+inline constexpr int spec_strip_src(int i) { return kBuses + i; }
+constexpr int kSpecSourceCount = kBuses + kStrips;
+
+struct Spectrum {
+    ai  source;                   // what a GUI wants measured; kSpecNone = idle
+    ai  active;                   // what the engine is actually measuring
+    au  seq;                      // bumped after every refresh
+    af  f_lo, f_hi;               // frequency range the bins span
+    af  bin_db[kSpecBins];        // dBFS, log-spaced, already peak-decayed
 };
 
 // Seqlock: writer bumps to odd, writes, bumps to even. Reader retries while
@@ -178,6 +228,7 @@ struct Shared {
     StripParams strip[kStrips];
     BusParams   bus[kBuses];
     Meters      meters;
+    Spectrum    spec;
     Routing     routing;
     Recorder    rec;
     VbanConfig  vban;
@@ -261,26 +312,14 @@ inline void set_defaults(Shared* s)
         p.limit_db.store(12.0f);
         p.duck_key.store(0);
         p.duck_depth_db.store(0.0f);
+        eq_set_defaults(p.eq);
     }
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];
         p.gain_db.store(0.0f);
-        p.mute.store(0); p.mono.store(0); p.eq_on.store(0); p.sel.store(b == 0 ? 1 : 0);
+        p.mute.store(0); p.mono.store(0); p.sel.store(b == 0 ? 1 : 0);
         p.mode.store(kBusNormal);
-        // Twelve bands spread over the audible range. Every band starts as a
-        // flat peaking filter, which the engine bypasses, so a fresh state
-        // sounds exactly like no EQ at all.
-        static const float f[kBusEqBands] = {
-            31, 62, 125, 250, 500, 1000, 2000, 4000, 6000, 8000, 12000, 16000
-        };
-        p.eq_preamp_db.store(0.0f);
-        for (int k = 0; k < kBusEqBands; ++k) {
-            p.eq_gain[k].store(0.0f);
-            p.eq_freq[k].store(f[k]);
-            p.eq_q[k].store(1.0f);
-            p.eq_type[k].store(kEqPeak);
-            p.eq_band_on[k].store(1);
-        }
+        eq_set_defaults(p.eq);
     }
     routing_write_begin(s->routing);
     std::memset(s->routing.hw_in, 0, sizeof(s->routing.hw_in));
@@ -288,6 +327,13 @@ inline void set_defaults(Shared* s)
     std::memset(s->routing.hw_in_desc, 0, sizeof(s->routing.hw_in_desc));
     std::memset(s->routing.bus_out_desc, 0, sizeof(s->routing.bus_out_desc));
     routing_write_end(s->routing);
+
+    s->spec.source.store(kSpecNone);
+    s->spec.active.store(kSpecNone);
+    s->spec.seq.store(0);
+    s->spec.f_lo.store(20.0f);
+    s->spec.f_hi.store(20000.0f);
+    for (int k = 0; k < kSpecBins; ++k) s->spec.bin_db[k].store(-120.0f);
 
     s->rec.state.store(kRecIdle);
     s->rec.source_bus.store(0);

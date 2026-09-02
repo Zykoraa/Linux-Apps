@@ -1,14 +1,17 @@
-// betterbanana GUI - the bus EQ editor and the AutoEq headphone browser.
+// betterbanana GUI - the parametric EQ editor and the AutoEq headphone browser.
 //
 // Split out of mainwindow.h because it grew its own world: an interactive
-// curve, a numeric band table, named profiles on disk, and a search over the
-// AutoEq measurement database. Everything here edits one bus's BusParams
-// directly; the engine picks changes up on its next block.
+// curve over a live spectrum, a numeric band table, named profiles on disk,
+// undo, and a search over the AutoEq measurement database. Everything here
+// edits one EqParams block directly - a bus's or an input strip's, they are the
+// same struct - and the engine picks changes up on its next block.
 #pragma once
 
 #include "../common/protocol.h"
+#include "../common/eqprofile.h"
 
 #include <QDialog>
+#include <QElapsedTimer>
 #include <QString>
 #include <QVector>
 #include <QWidget>
@@ -21,22 +24,28 @@ class QLineEdit;
 class QListWidget;
 class QNetworkAccessManager;
 class QPushButton;
+class QTimer;
 
-namespace bb { struct EqProfile; }
-
-// Interactive magnitude plot of one bus's EQ. Each enabled band gets a numbered
-// handle: drag it to move frequency and gain, wheel over it to change Q, right
-// click to bypass it. The curve is drawn with the engine's own Biquad, so what
-// is on screen is what is being applied.
+// Interactive magnitude plot of one EQ block, drawn over the engine's live
+// spectrum of the signal it sits in. Each enabled band gets a numbered handle:
+// drag it to move frequency and gain, wheel over it to change Q, right click to
+// bypass it. The curve is drawn with the engine's own Biquad, so what is on
+// screen is what is being applied.
 class EqCurve : public QWidget {
     Q_OBJECT
 public:
-    EqCurve(bb::Shared* shm, int bus, QWidget* parent = nullptr);
+    // `specSource` is what the engine should analyse behind the curve, or
+    // bb::kSpecNone to draw no spectrum at all.
+    EqCurve(bb::Shared* shm, bb::EqParams* eq, int specSource, QWidget* parent = nullptr);
 
     void setSelected(int band);
     int  selected() const { return m_sel; }
 
+    // True once the engine has published bins for our source.
+    bool spectrumLive() const;
+
 signals:
+    void editStarted(int band);     // a gesture is about to change something
     void bandEdited(int band);      // dragged or wheeled: values already written
     void bandSelected(int band);
     void bandToggled(int band);     // right-clicked: on/off already written
@@ -56,21 +65,30 @@ private:
     double freqForX(double x) const;
     double yForDb(double db) const;
     double dbForY(double y) const;
+    double yForSpec(double dbfs) const;
+    void   drawSpectrum(class QPainter& p, const QRectF& r) const;
     QPointF handlePos(int band) const;
     int  bandAt(const QPoint& p) const;
 
-    bb::Shared* m_shm;
-    int m_bus;
+    bb::Shared*   m_shm;
+    bb::EqParams* m_eq;
+    int m_spec  = bb::kSpecNone;
     int m_sel   = 0;
     int m_drag  = -1;
     int m_hover = -1;
 };
 
-// The full editor for one bus: profile bar, curve, twelve band rows, preamp.
-class BusEqDialog : public QDialog {
+// The full editor for one EQ block: profile bar, curve, twelve band rows,
+// preamp, undo.
+class EqEditorDialog : public QDialog {
     Q_OBJECT
 public:
-    BusEqDialog(bb::Shared* shm, int bus, QWidget* parent = nullptr);
+    // `bus` is the bus index when this edits a bus, or -1 for an input strip.
+    // Only a bus gets the headphone-correction browser and the per-device
+    // memory that goes with it.
+    EqEditorDialog(bb::Shared* shm, bb::EqParams* eq, int specSource,
+                   const QString& title, int bus, QWidget* parent = nullptr);
+    ~EqEditorDialog() override;
 
 private slots:
     void onProfileChosen(int index);
@@ -81,6 +99,7 @@ private slots:
     void openAutoEq();
     void autoPreamp();
     void flatten();
+    void undo();
 
 private:
     struct BandRow {
@@ -93,6 +112,11 @@ private:
         QLabel*         num    = nullptr;
     };
 
+    // Records the state to come back to. `tag` is a band index, or -1 for a
+    // whole-block change; successive touches of the same band inside half a
+    // second are one gesture, not thirty edits.
+    void snapshot(int tag);
+
     void buildProfileCombo(const QString& select = QString());
     void applyProfile(const bb::EqProfile& prof, const QString& label);
     void pullFromShm();            // shm -> widgets, without re-entering them
@@ -100,16 +124,26 @@ private:
     void refreshRowEnables(int k);
     void highlight(int band);
 
-    bb::Shared* m_shm;
-    int         m_bus;
-    bool        m_updating = false;
+    bb::Shared*   m_shm;
+    bb::EqParams* m_eq;
+    int           m_bus;           // -1 when this edits a strip
+    int           m_spec;
+    QString       m_title;
+    bool          m_updating = false;
+
+    QVector<bb::EqSnapshot> m_undo;
+    uint32_t      m_specSeen = 0;
+    int           m_lastTag = -2;
+    QElapsedTimer m_since;
 
     EqCurve*     m_curve   = nullptr;
     QComboBox*   m_profile = nullptr;
     QPushButton* m_delete  = nullptr;
+    QPushButton* m_undoBtn = nullptr;
     QPushButton* m_eqOn    = nullptr;
     QDoubleSpinBox* m_preamp = nullptr;
     QLabel*      m_note     = nullptr;
+    QTimer*      m_repaint  = nullptr;
     QVector<BandRow> m_rows;
 };
 

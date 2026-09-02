@@ -14,6 +14,7 @@
 #include "../common/protocol.h"
 #include "../common/preset.h"
 #include "dsp.h"
+#include "spectrum.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -104,12 +105,81 @@ struct Ring {
 };
 
 // ---------------------------------------------------------------------------
+// A twelve-band parametric chain. Strips and buses each own one; the only
+// difference is which EqParams block feeds it. Engine-private, like the rest
+// of the DSP state - shm carries the settings, not the filter memory.
+// ---------------------------------------------------------------------------
+struct EqChain {
+    Biquad     bq[kChan][kEqBands];
+    SmoothGain pre[kChan];          // preamp, so a boosted curve can be pulled back
+    float c_g[kEqBands] = {}, c_f[kEqBands] = {}, c_q[kEqBands] = {};
+    int   c_t[kEqBands] = {}, c_on[kEqBands] = {};
+    // Compact list of the bands actually doing something. A twelve-band EQ with
+    // three real bands should cost three biquads per sample, not twelve.
+    int   active[kEqBands] = {};
+    int   n_active = 0;
+    bool  init = false;
+
+    void configure(float sr)
+    {
+        for (int c = 0; c < kChan; ++c) { pre[c].configure(sr, 15.0f); pre[c].snap(1.0f); }
+    }
+
+    void update(const EqParams& p, float sr)
+    {
+        bool rebuild = !init;
+        for (int k = 0; k < kEqBands; ++k) {
+            const float g  = p.gain[k].load(std::memory_order_relaxed);
+            const float f  = p.freq[k].load(std::memory_order_relaxed);
+            const float q  = p.q[k].load(std::memory_order_relaxed);
+            const int   t  = p.type[k].load(std::memory_order_relaxed);
+            const int   on = p.band_on[k].load(std::memory_order_relaxed) ? 1 : 0;
+            if (!init || g != c_g[k] || f != c_f[k] || q != c_q[k]
+                      || t != c_t[k] || on != c_on[k]) {
+                const bool enabling = init && on && !c_on[k];
+                for (int c = 0; c < kChan; ++c) {
+                    // A band that sat bypassed still holds stale samples in its
+                    // delay line; clear them or switching it back on clicks.
+                    if (enabling) bq[c][k].reset();
+                    design_band(bq[c][k], t, sr, f, q, g);
+                }
+                c_g[k] = g; c_f[k] = f; c_q[k] = q; c_t[k] = t; c_on[k] = on;
+                rebuild = true;
+            }
+        }
+        if (rebuild) {
+            n_active = 0;
+            for (int k = 0; k < kEqBands; ++k) {
+                if (!c_on[k]) continue;
+                // A flat peak or shelf designs to a pure bypass, so it can be
+                // dropped from the chain outright.
+                const bool shelf_or_peak = c_t[k] == kEqPeak || c_t[k] == kEqLowShelf
+                                                            || c_t[k] == kEqHighShelf;
+                if (shelf_or_peak && std::fabs(c_g[k]) < 1e-4f) continue;
+                active[n_active++] = k;
+            }
+        }
+        const float pa = db_to_lin(p.preamp_db.load(std::memory_order_relaxed));
+        for (int c = 0; c < kChan; ++c) pre[c].set_target(pa);
+        init = true;
+    }
+
+    inline float process(int c, float x)
+    {
+        x *= pre[c].next();
+        for (int k = 0; k < n_active; ++k) x = bq[c][active[k]].process(x);
+        return x;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Per-strip DSP state (not in shm - this is engine-private).
 // ---------------------------------------------------------------------------
 struct StripDsp {
     Gate       gate[kChan];
     Compressor comp[kChan];
     Biquad     eq_lo[kChan], eq_mid[kChan], eq_hi[kChan], aud[kChan];
+    EqChain    par;                 // the twelve-band block, after the tone knobs
     SmoothGain gain[kChan];
     PeakMeter  pre[kChan], post[kChan];
     float c_gate = -1, c_comp = -1, c_aud = -1;
@@ -122,6 +192,7 @@ struct StripDsp {
             gain[c].configure(sr, 15.0f); gain[c].snap(1.0f);
             pre[c].configure(sr); post[c].configure(sr);
         }
+        par.configure(sr);
     }
     void update(const StripParams& p, float sr)
     {
@@ -141,68 +212,24 @@ struct StripDsp {
             if (a != c_aud)  aud[c].set_peaking(sr, 2500.0f, 0.9f, a * 1.2f);
         }
         c_gate = g; c_comp = k; c_aud = a; c_lo = lo; c_mid = md; c_hi = hi;
+        par.update(p.eq, sr);
     }
 };
 
 struct BusDsp {
-    Biquad     eq[kChan][kBusEqBands];
+    EqChain    eq;
     SmoothGain gain[kChan];
-    SmoothGain pre[kChan];          // EQ preamp, so a boosted curve can be pulled back
     PeakMeter  meter[kChan];
-    float c_g[kBusEqBands] = {}, c_f[kBusEqBands] = {}, c_q[kBusEqBands] = {};
-    int   c_t[kBusEqBands] = {}, c_on[kBusEqBands] = {};
-    // Compact list of the bands actually doing something. A twelve-band EQ with
-    // three real bands should cost three biquads per sample, not twelve.
-    int   active[kBusEqBands] = {};
-    int   n_active = 0;
-    bool  init = false;
 
     void configure(float sr)
     {
         for (int c = 0; c < kChan; ++c) {
             gain[c].configure(sr, 15.0f); gain[c].snap(1.0f);
-            pre[c].configure(sr, 15.0f);  pre[c].snap(1.0f);
             meter[c].configure(sr);
         }
+        eq.configure(sr);
     }
-    void update(const BusParams& p, float sr)
-    {
-        bool rebuild = !init;
-        for (int k = 0; k < kBusEqBands; ++k) {
-            const float g  = p.eq_gain[k].load(std::memory_order_relaxed);
-            const float f  = p.eq_freq[k].load(std::memory_order_relaxed);
-            const float q  = p.eq_q[k].load(std::memory_order_relaxed);
-            const int   t  = p.eq_type[k].load(std::memory_order_relaxed);
-            const int   on = p.eq_band_on[k].load(std::memory_order_relaxed) ? 1 : 0;
-            if (!init || g != c_g[k] || f != c_f[k] || q != c_q[k]
-                      || t != c_t[k] || on != c_on[k]) {
-                const bool enabling = init && on && !c_on[k];
-                for (int c = 0; c < kChan; ++c) {
-                    // A band that sat bypassed still holds stale samples in its
-                    // delay line; clear them or switching it back on clicks.
-                    if (enabling) eq[c][k].reset();
-                    design_band(eq[c][k], t, sr, f, q, g);
-                }
-                c_g[k] = g; c_f[k] = f; c_q[k] = q; c_t[k] = t; c_on[k] = on;
-                rebuild = true;
-            }
-        }
-        if (rebuild) {
-            n_active = 0;
-            for (int k = 0; k < kBusEqBands; ++k) {
-                if (!c_on[k]) continue;
-                // A flat peak or shelf designs to a pure bypass, so it can be
-                // dropped from the chain outright.
-                const bool shelf_or_peak = c_t[k] == kEqPeak || c_t[k] == kEqLowShelf
-                                                            || c_t[k] == kEqHighShelf;
-                if (shelf_or_peak && std::fabs(c_g[k]) < 1e-4f) continue;
-                active[n_active++] = k;
-            }
-        }
-        const float pa = db_to_lin(p.eq_preamp_db.load(std::memory_order_relaxed));
-        for (int c = 0; c < kChan; ++c) pre[c].set_target(pa);
-        init = true;
-    }
+    void update(const BusParams& p, float sr) { eq.update(p.eq, sr); }
 };
 
 // ---------------------------------------------------------------------------
@@ -248,6 +275,15 @@ struct Engine {
 
     StripDsp sdsp[kStrips];
     BusDsp   bdsp[kBuses];
+
+    // Spectrum analyser: the mixer taps one signal into spec_tap, and the
+    // control thread transforms it. Only one at a time, because only one EQ
+    // editor is ever looking.
+    SpecTap          spec_tap;
+    SpectrumAnalyzer spec_an;
+    float            spec_win[kSpecFft] = {};
+    int              spec_src = kSpecNone;      // what the mixer is tapping now
+    spa_source*      spec_timer = nullptr;
 
     float sr = (float)kRate;
     uint32_t routing_seen = 0;
@@ -295,6 +331,7 @@ struct Engine {
     void mix_chunk(uint32_t n);
     void ensure_ring(Ring& r, uint32_t n);
     void poll_control();
+    void poll_spectrum();
 };
 
 static Engine g_eng;
@@ -375,6 +412,7 @@ void Engine::mix_chunk(uint32_t n)
         const float glin    = db_to_lin(p.gain_db.load(std::memory_order_relaxed));
         float pl, pr; pan_gains(p.pan_x.load(std::memory_order_relaxed), pl, pr);
 
+        const bool par_on   = p.eq.on.load(std::memory_order_relaxed) != 0;
         for (int c = 0; c < kChan; ++c) d.gain[c].set_target(muted ? 0.0f : glin);
 
         float pre_pk[kChan] = {0, 0}, post_pk[kChan] = {0, 0};
@@ -396,6 +434,10 @@ void Engine::mix_chunk(uint32_t n)
                 x = d.eq_mid[c].process(x);
                 x = d.eq_hi[c].process(x);
                 x = d.aud[c].process(x);
+                // The parametric block sits after the three tone knobs and
+                // before the fader, so its preamp trims the EQ rather than the
+                // level you set by hand.
+                if (par_on) x = d.par.process(c, x);
                 x *= d.gain[c].next();
                 x *= (c == 0 ? pl : pr) * 1.41421356f;   // pan law is unity at centre
 
@@ -488,7 +530,7 @@ void Engine::mix_chunk(uint32_t n)
         BusDsp& d = bdsp[b];
         d.update(p, sr);
 
-        const bool eq_on = p.eq_on.load(std::memory_order_relaxed) != 0;
+        const bool eq_on = p.eq.on.load(std::memory_order_relaxed) != 0;
         const bool mono  = p.mono.load(std::memory_order_relaxed) != 0;
         const bool muted = p.mute.load(std::memory_order_relaxed) != 0;
         const float glin = db_to_lin(p.gain_db.load(std::memory_order_relaxed));
@@ -501,10 +543,7 @@ void Engine::mix_chunk(uint32_t n)
             float ch[kChan] = { L, R };
             for (int c = 0; c < kChan; ++c) {
                 float x = ch[c];
-                if (eq_on) {
-                    x *= d.pre[c].next();
-                    for (int k = 0; k < d.n_active; ++k) x = d.eq[c][d.active[k]].process(x);
-                }
+                if (eq_on) x = d.eq.process(c, x);
                 x *= d.gain[c].next();
                 // Safety limiter: transparent below -3 dBFS, soft-knee above,
                 // asymptotic to full scale so a hot matrix can never wrap.
@@ -526,6 +565,20 @@ void Engine::mix_chunk(uint32_t n)
         }
         bus_ring[b].drop_to(kResyncQuanta * n);
         bus_ring[b].write(acc[b], n);
+    }
+
+    // Spectrum tap: whichever single signal an open EQ editor asked for. Buses
+    // are tapped post-EQ, strips post-processing, so what is drawn is what the
+    // meter next to it is showing.
+    {
+        const int src = s->spec.source.load(std::memory_order_relaxed);
+        if (src != spec_src) {          // switched editors: do not show the old signal
+            spec_tap.clear();
+            spec_src = src;
+        }
+        if (src >= 0 && src < kBuses)                 spec_tap.write_stereo(acc[src], n);
+        else if (src >= kBuses && src < kSpecSourceCount)
+            spec_tap.write_stereo(stripout[src - kBuses], n);
     }
 
     // VBAN senders each get their own ring so they never contend with the
@@ -1109,9 +1162,46 @@ void Engine::poll_control()
     if (shm->vban.seq.load(std::memory_order_acquire) != vban_seen) apply_vban();
 }
 
+// ---------------------------------------------------------------------------
+// Spectrum analysis. Runs on the control thread on its own faster timer, and
+// does nothing at all while no editor is asking for a signal.
+// ---------------------------------------------------------------------------
+void Engine::poll_spectrum()
+{
+    const int src = shm->spec.source.load(std::memory_order_relaxed);
+    if (src < 0 || src >= kSpecSourceCount) {
+        if (shm->spec.active.load(std::memory_order_relaxed) != kSpecNone) {
+            spec_an.reset();
+            for (int k = 0; k < kSpecBins; ++k)
+                shm->spec.bin_db[k].store(SpectrumAnalyzer::kFloorDb, std::memory_order_relaxed);
+            shm->spec.active.store(kSpecNone, std::memory_order_relaxed);
+            shm->spec.seq.fetch_add(1, std::memory_order_release);
+        }
+        return;
+    }
+    if (src != shm->spec.active.load(std::memory_order_relaxed)) {
+        spec_an.reset();
+        shm->spec.active.store(src, std::memory_order_relaxed);
+    }
+
+    spec_tap.snapshot(spec_win, kSpecFft);
+    // 1.5 dB per 50 ms tick is 30 dB/s: quick enough to follow music, slow
+    // enough to read.
+    spec_an.analyze(spec_win, sr, shm->spec.f_lo.load(std::memory_order_relaxed),
+                    shm->spec.f_hi.load(std::memory_order_relaxed), 1.5f);
+    for (int k = 0; k < kSpecBins; ++k)
+        shm->spec.bin_db[k].store(spec_an.disp[k], std::memory_order_relaxed);
+    shm->spec.seq.fetch_add(1, std::memory_order_release);
+}
+
 static void on_timer(void* data, uint64_t /*expirations*/)
 {
     static_cast<Engine*>(data)->poll_control();
+}
+
+static void on_spec_timer(void* data, uint64_t /*expirations*/)
+{
+    static_cast<Engine*>(data)->poll_spectrum();
 }
 
 static void on_sig(int) { g_run = 0; if (g_eng.loop) pw_main_loop_quit(g_eng.loop); }
@@ -1158,12 +1248,31 @@ int main(int argc, char** argv)
     set_defaults(g_eng.shm);
     g_eng.shm->engine_pid.store(getpid());
 
-    // Restore the previous session, the way BetterBanana reopens where you left
-    // off. Device assignment lands via the routing seqlock and is applied by
-    // the first control poll, once the endpoints exist.
-    if (load_preset(g_eng.shm, autosave_path().c_str()))
-        std::fprintf(stderr, "[bb] restored %s\n", autosave_path().c_str());
+    // Presets are explicit: exactly the one named by the startup marker is
+    // restored, and nothing is written back when the engine stops. Device
+    // assignment lands via the routing seqlock and is applied by the first
+    // control poll, once the endpoints exist.
+    {
+        std::string migrated;
+        if (migrate_autosave(&migrated))
+            std::fprintf(stderr,
+                "[bb] the old automatic session save is now the preset \"%s\", "
+                "and is what loads at startup\n", migrated.c_str());
+        const std::string want = startup_preset_name();
+        if (want.empty()) {
+            std::fprintf(stderr, "[bb] no startup preset set "
+                                 "(bb-ctl preset startup <name>)\n");
+        } else {
+            const std::string path = preset_path_for(want);
+            if (load_preset(g_eng.shm, path.c_str()))
+                std::fprintf(stderr, "[bb] loaded startup preset \"%s\"\n", want.c_str());
+            else
+                std::fprintf(stderr, "[bb] startup preset \"%s\" could not be read (%s)\n",
+                             want.c_str(), path.c_str());
+        }
+    }
 
+    g_eng.spec_an.configure();
     for (int i = 0; i < kStrips; ++i) {
         g_eng.sdsp[i].configure(g_eng.sr);
         g_eng.duck_gain[i].configure(g_eng.sr, 8.0f);
@@ -1229,16 +1338,17 @@ int main(int argc, char** argv)
     timespec val{0, 200 * 1000 * 1000}, itv{0, 200 * 1000 * 1000};
     pw_loop_update_timer(pw_main_loop_get_loop(g_eng.loop), g_eng.timer, &val, &itv, false);
 
+    // The analyser needs a faster tick than device polling does, and costs
+    // nothing while no editor is asking for a signal.
+    g_eng.spec_timer = pw_loop_add_timer(pw_main_loop_get_loop(g_eng.loop), on_spec_timer, &g_eng);
+    timespec sval{0, 50 * 1000 * 1000}, sitv{0, 50 * 1000 * 1000};
+    pw_loop_update_timer(pw_main_loop_get_loop(g_eng.loop), g_eng.spec_timer, &sval, &sitv, false);
+
     std::fprintf(stderr,
         "[bb] engine up: 2 virtual sinks (VAIO/AUX), 2 virtual sources (B1/B2),\n"
         "      3 hw inputs + 3 hw outputs idle until assigned. shm=%s\n", kShmName);
 
     pw_main_loop_run(g_eng.loop);
-
-    // Persist the session before tearing anything down.
-    mkdir(preset_dir().c_str(), 0755);
-    if (save_preset(g_eng.shm, autosave_path().c_str()))
-        std::fprintf(stderr, "[bb] saved %s\n", autosave_path().c_str());
 
     g_eng.stop_record();
     g_eng.stop_play();
