@@ -213,6 +213,8 @@ private slots:
 private:
     void writeRouting();
     void applyDeviceEq(int bus, const QString& device);
+    void openMicAnalyzer(const QString& source, const QString& label);
+    void populateAnalyzerMenu(class QMenu* menu);
     void readRouting();
     void applyAppRules();
     void buildMenus();

@@ -19,6 +19,7 @@ tape deck. It is an independent implementation, not affiliated with VB-Audio.
 - Named EQ profiles, 12 built-in presets, and Equalizer APO / Peace import
 - Headphone corrections for ~8850 models from the AutoEq database, searchable
 - Per-application routing that survives the app restarting
+- Opens the mic-gain analyzer on any strip or bus, straight from the menu
 - Recorder, 8×8 VBAN network audio, presets, 10 colour themes
 
 ## Install
@@ -238,6 +239,25 @@ From the shell, `bb-autoeq` does the same thing and is easy to bind to a key:
 
 It downloads the profile and hands it to `bb-ctl eq load`, so the parsing, the
 band fitting and the preamp are the mixer's own code.
+
+## Analysing a microphone
+
+**Engine → Analyse microphone** lists every hardware strip with a real capture
+device, plus the two virtual output buses, and opens
+[mic-gain](../mic-gain/) on the one you pick. That tool measures the signal and
+names the control to change — gain, high-pass, de-esser, compressor — rather
+than leaving you to guess by ear.
+
+Pointing it at **B1 or B2** rather than at the interface is usually the more
+useful measurement: those are what recording applications actually receive, so
+the reading includes this mixer's gate, compressor, EQ and fader.
+
+mic-gain is a separate tool on purpose — it is a terminal program, so it still
+works over SSH and when this GUI will not start, which is exactly when a
+microphone needs diagnosing. Install it once with `mic-gain/install.sh`; the
+menu says so if it cannot find it. Strips fed by a virtual cable, or with no
+device assigned, are listed but greyed out: there is no microphone there to
+measure.
 
 ## Sidechain ducking
 

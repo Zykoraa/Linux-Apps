@@ -28,12 +28,14 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -1278,6 +1280,104 @@ void MainWindow::openAppsDialog()
     m_apps->activateWindow();
 }
 
+// --- microphone analyzer ----------------------------------------------------
+// mic-gain is a separate terminal tool on purpose: it works over SSH and when
+// this GUI will not start, which is exactly when a microphone needs diagnosing.
+// The mixer's job is only to make it findable and point it at the right source.
+
+static QString findMicGain()
+{
+    // The graphical session's PATH usually lacks ~/.local/bin - uwsm rebuilds
+    // PATH from a POSIX login shell - so look there first rather than trusting
+    // the environment we happen to have been launched with.
+    const QStringList known = {
+        QDir::homePath() + "/.local/bin/mic-gain",
+        "/usr/local/bin/mic-gain",
+        "/usr/bin/mic-gain",
+    };
+    for (const QString& p : known)
+        if (QFileInfo(p).isExecutable()) return p;
+    return QStandardPaths::findExecutable("mic-gain");
+}
+
+// Terminals disagree about how to be handed a command. "-e" is the common
+// spelling; the ones that want something else are listed with what they want.
+static bool launchInTerminal(const QStringList& cmd, QString* err)
+{
+    QVector<QPair<QString, QStringList>> terms;
+    const QString pref = qEnvironmentVariable("TERMINAL");
+    if (!pref.isEmpty()) terms.push_back({ pref, { "-e" } });
+    terms.append({
+        { "kitty",          { "-e" } },
+        { "foot",           { "-e" } },
+        { "alacritty",      { "-e" } },
+        { "ghostty",        { "-e" } },
+        { "wezterm",        { "start", "--" } },
+        { "konsole",        { "-e" } },
+        { "gnome-terminal", { "--" } },
+        { "xfce4-terminal", { "-x" } },
+        { "xterm",          { "-e" } },
+    });
+    for (const auto& t : terms) {
+        const QString exe = QStandardPaths::findExecutable(t.first);
+        if (exe.isEmpty()) continue;
+        if (QProcess::startDetached(exe, t.second + cmd)) return true;
+    }
+    if (err) *err = "No terminal emulator found (tried kitty, foot, alacritty, "
+                    "ghostty, wezterm, konsole, gnome-terminal, xterm).";
+    return false;
+}
+
+void MainWindow::openMicAnalyzer(const QString& source, const QString& label)
+{
+    const QString tool = findMicGain();
+    if (tool.isEmpty()) {
+        QMessageBox::information(this, "BetterBanana",
+            "mic-gain is not installed.\n\n"
+            "It is a separate tool in the same repository - it measures a "
+            "microphone and names the control to change. Install it with:\n\n"
+            "    mic-gain/install.sh");
+        return;
+    }
+    const QStringList cmd{ tool, "-s", source };
+    QString err;
+    if (!launchInTerminal(cmd, &err)) {
+        QMessageBox::warning(this, "BetterBanana",
+            err + "\n\nRun it yourself with:\n\n    " + cmd.join(" "));
+        return;
+    }
+    statusBar()->showMessage("Analysing " + label + " in a terminal", 5000);
+}
+
+// Rebuilt each time the menu opens, so it names whatever is assigned now.
+void MainWindow::populateAnalyzerMenu(QMenu* menu)
+{
+    menu->clear();
+    for (int i = 0; i < kHwStrips; ++i) {
+        const QString dev = m_hwIn[i];
+        const QString name = labelFor(m_shm, true, i,
+                                      QString("HARDWARE INPUT %1").arg(i + 1));
+        // A cable carries application audio, not a microphone, and an
+        // unassigned strip has nothing to measure.
+        if (dev.isEmpty() || dev.startsWith(kCablePrefix)) {
+            QAction* a = menu->addAction(
+                name + (dev.isEmpty() ? "   (no device)" : "   (virtual cable)"));
+            a->setEnabled(false);
+            continue;
+        }
+        menu->addAction(name, this, [this, dev, name] { openMicAnalyzer(dev, name); });
+    }
+    menu->addSeparator();
+    // The B buses are what recording applications actually receive, which is
+    // usually the more useful measurement: it includes gate, comp and EQ.
+    for (int b = kPhysBuses; b < kBuses; ++b) {
+        const QString node = QString("bb_b%1").arg(b - kPhysBuses + 1);
+        const QString name = labelFor(m_shm, false, b, kBusLabel[b]);
+        menu->addAction(QString("%1   (%2 - what apps receive)").arg(name, node),
+                        this, [this, node, name] { openMicAnalyzer(node, name); });
+    }
+}
+
 void MainWindow::buildMenus()
 {
     auto* file = menuBar()->addMenu("&Preset");
@@ -1329,6 +1429,11 @@ void MainWindow::buildMenus()
         eqMenu->addAction(QString("Bus %1...").arg(kBusLabel[b]), this, [this, b] { openBusEq(b); });
     eng->addAction("Sidechain &ducking...", QKeySequence("Ctrl+D"), this, &MainWindow::openDuckDialog);
     eng->addAction("&VBAN streams...", QKeySequence("Ctrl+B"), this, &MainWindow::openVbanDialog);
+
+    auto* mic = eng->addMenu("Analy&se microphone");
+    mic->setToolTip("Measure a microphone and be told which control to change");
+    connect(mic, &QMenu::aboutToShow, this, [this, mic] { populateAnalyzerMenu(mic); });
+    populateAnalyzerMenu(mic);
     eng->addSeparator();
 
     auto* boot = eng->addMenu("Start at &login");
