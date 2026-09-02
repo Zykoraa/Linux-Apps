@@ -112,8 +112,12 @@ struct PeriodTracker {
             if (r > best) { best = r; bestLag = lag; }
         }
         // Below this the signal is a consonant or noise; there is no period to
-        // preserve, and forcing one would be worse than leaving it alone.
-        if (best <= 0.6 || bestLag == 0) { period = 0.0f; return; }
+        // preserve, and forcing one would be worse than leaving it alone. Two
+        // thresholds rather than one: a voice sitting right on a single
+        // threshold would gain and lose lock several times a second, and every
+        // one of those is a change the shifter has to absorb.
+        const double gate = period > 0.0f ? 0.45 : 0.60;
+        if (best <= gate || bestLag == 0) { period = 0.0f; return; }
 
         // The decimated search only resolves the period to four samples, and
         // four samples of error multiplied by however many periods make up a
@@ -151,9 +155,10 @@ struct PitchShifter {
     float phase = 0.0f;                 // current delay, in samples
     float ratio = 1.0f;
     float len = kPitchWindow;           // sweep length actually in use
-    float pending = kPitchWindow;       // applied at the next seam
+    float pending = kPitchWindow;       // adopted at the next seam
     bool  active = false;
     bool  coherent = false;             // is the sweep a whole number of periods?
+    bool  pending_coherent = false;
 
     float lo() const { return len * 0.5f; }
     float hi() const { return len * 1.5f; }
@@ -175,22 +180,42 @@ struct PitchShifter {
     {
         if (samples <= 1.0f) {
             pending = float(kPitchWindow);
-            coherent = false;
+            pending_coherent = false;
             return;
         }
         int k = std::max(1, (int)std::lround(double(kPitchWindow) / samples));
         float want = k * samples;
         while (want > kPitchMaxLen && k > 1) want = --k * samples;
         while (want < kPitchMinLen && (k + 1) * samples <= kPitchMaxLen) want = ++k * samples;
-        coherent = want >= kPitchMinLen && want <= kPitchMaxLen;
-        pending = coherent ? want : float(kPitchWindow);
+        // Recorded, not applied. Both of these change what the crossfade is
+        // doing, so changing them part-way through one splices two unrelated
+        // signals together; they are adopted at the seam instead, where a
+        // discontinuity is what the crossfade is already there to hide.
+        pending_coherent = want >= kPitchMinLen && want <= kPitchMaxLen;
+        pending = pending_coherent ? want : float(kPitchWindow);
     }
 
     void reset()
     {
         for (int i = 0; i < kPitchBuf; ++i) buf[i] = 0.0f;
         len = pending;
+        coherent = pending_coherent;
         phase = len;
+    }
+
+    // Changing the sweep length does not move the delay - it only moves where
+    // the next seam falls - so it is safe any time the head is inside the range
+    // the new length implies and no crossfade is part-way through. Doing it
+    // only at the seam would reject every shorter sweep, because the head sits
+    // at the top of the old range there.
+    inline void adopt()
+    {
+        // A deadband: the period estimate jitters by a fraction of a sample
+        // between updates, and re-adopting for that is pointless work. Half a
+        // sample in two thousand is far below what the alignment needs.
+        if (std::fabs(pending - len) < 0.5f) { coherent = pending_coherent; return; }
+        const float nlo = pending * 0.5f, nhi = pending * 1.5f;
+        if (phase >= nlo && phase < nhi) { len = pending; coherent = pending_coherent; }
     }
 
     inline float tap(float delay) const
@@ -214,18 +239,16 @@ struct PitchShifter {
         float dist, other;
         if (ratio > 1.0f) {
             if (phase < lo()) {
-                // A seam is the one moment the sweep length can change without
-                // the delay jumping audibly: the crossfade is already covering it.
-                if (pending != len) { len = pending; phase = std::clamp(phase, lo(), hi()); }
-                phase += len;
+                phase += len;               // finish the jump with the length the crossfade used
+                adopt();                    // only now is it safe to change it
                 if (phase >= hi()) phase = hi() - 1.0f;
             }
             dist  = phase - lo();
             other = phase + len;
         } else {
             if (phase >= hi()) {
-                if (pending != len) { len = pending; phase = std::clamp(phase, lo(), hi()); }
                 phase -= len;
+                adopt();
                 if (phase < lo()) phase = lo();
             }
             dist  = hi() - phase;
@@ -237,7 +260,7 @@ struct PitchShifter {
         // sit at a fixed delay apart and cancel each other wherever that offset
         // is a half period, which sounds hollow.
         const float zone = kPitchXfade * len;
-        if (dist >= zone) return tap(phase);
+        if (dist >= zone) { adopt(); return tap(phase); }
 
         const float b = 1.0f - dist / zone;
         // Which crossfade law depends on whether the two taps are reading the
@@ -465,6 +488,7 @@ struct VoiceFxChain {
     PitchShifter   pitch[kChan];
     FormantShifter formant[kChan];
     PeriodTracker  period;          // one voice, so one period for both channels
+    float          last_period = -1.0f;
     RingMod      ring[kChan];
     Crusher      crush[kChan];
     Chorus       chorus[kChan];
@@ -560,8 +584,10 @@ struct VoiceFxChain {
         // doing nothing but echo should not pay for an autocorrelation.
         if (c == 0 && pitch[0].active) {
             period.push(x);
-            const float p = period.period;
-            for (int i = 0; i < kChan; ++i) pitch[i].set_period(p);
+            if (period.period != last_period) {
+                last_period = period.period;
+                for (int i = 0; i < kChan; ++i) pitch[i].set_period(last_period);
+            }
         }
         x = pitch[c].process(x);
         x = formant[c].process(x);

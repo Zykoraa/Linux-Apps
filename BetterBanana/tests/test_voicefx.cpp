@@ -309,6 +309,76 @@ int main()
         }
     }
 
+    // --- a moving voice does not splice any worse than a steady one ---------
+    {
+        // A real voice drifts, and drifting moves the tracked period, which
+        // moves the sweep length and can flip the crossfade law. Applying
+        // either part-way through a crossfade splices two unrelated signals
+        // together; both are deferred until the head is somewhere safe.
+        //
+        // The control is the SAME chain on a steady voice. A crossfading pitch
+        // shifter always leaves some curvature at its seams; what matters is
+        // that drifting does not add more on top.
+        auto outliers = [](const std::vector<float>& y) {
+            std::vector<float> r;
+            r.reserve(y.size());
+            for (size_t i = 1; i + 1 < y.size(); ++i)
+                r.push_back(std::fabs(y[i] - 0.5f * (y[i - 1] + y[i + 1])));
+            std::vector<float> t = r;
+            std::nth_element(t.begin(), t.begin() + t.size() / 2, t.end());
+            const float med = std::max(t[t.size() / 2], 1e-9f);
+            int n = 0;
+            for (float v : r) if (v > med * 25.0f) ++n;
+            return n;
+        };
+        auto voice_of = [&](double wobble) {
+            std::vector<float> in;
+            double phase = 0.0;
+            for (int i = 0; i < int(SR * 4); ++i) {
+                const double t = i / SR;
+                const double f = 115.0 * (1.0 + wobble * std::sin(2.0 * M_PI * 3.0 * t));
+                phase += 2.0 * M_PI * f / SR;
+                double v = 0.0;
+                for (int h = 1; h * f <= 12000.0; ++h)
+                    v += vowel_envelope(h * f) * std::sin(h * phase);
+                in.push_back(float(v * 0.12));
+            }
+            return in;
+        };
+        auto run_chain = [&](const std::vector<float>& in, int* changes) {
+            VoiceFx p;
+            fx_set_defaults(p);
+            p.on.store(1);
+            p.pitch.store(6.0f);
+            p.formant_on.store(1);
+            p.formant.store(3.0f);
+            auto ch = std::make_unique<VoiceFxChain>();
+            ch->configure((float)SR);
+            ch->update(p, (float)SR);
+            std::vector<float> out;
+            out.reserve(in.size());
+            float last = ch->pitch[0].len;
+            *changes = 0;
+            for (float v : in) {
+                out.push_back(ch->process(0, v));
+                if (ch->pitch[0].len != last) { ++*changes; last = ch->pitch[0].len; }
+            }
+            return out;
+        };
+
+        int steady_changes = 0, drift_changes = 0;
+        const int steady = outliers(run_chain(voice_of(0.0), &steady_changes));
+        const int drift  = outliers(run_chain(voice_of(0.05), &drift_changes));
+        char msg[140];
+        std::snprintf(msg, sizeof(msg),
+                      "drifting splices no worse than steady (%d vs %d)", drift, steady);
+        chk(drift <= steady * 3 / 2 + 50, msg);
+        std::snprintf(msg, sizeof(msg),
+                      "and the sweep still follows the voice (%d adjustments while drifting)",
+                      drift_changes);
+        chk(drift_changes > 20, msg);
+    }
+
     // --- formant shifter ----------------------------------------------------
     {
         FormantShifter fs;
