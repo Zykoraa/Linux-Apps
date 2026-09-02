@@ -67,17 +67,16 @@ inline std::string startup_preset_name()
     return v;
 }
 
-// Empty clears the choice.
+// Empty clears the choice - but writes the marker anyway, empty. "Start with a
+// default mixer" is a deliberate answer and must not read as "never asked": the
+// one-off migration below keys off the marker existing, and deleting it would
+// let a stale autosave.bbp come back and re-set the very thing just cleared.
 inline bool set_startup_preset_name(const std::string& name)
 {
     mkdir(preset_dir().c_str(), 0755);
-    if (name.empty()) {
-        unlink(startup_marker_path().c_str());
-        return true;
-    }
     FILE* f = fopen(startup_marker_path().c_str(), "w");
     if (!f) return false;
-    fprintf(f, "%s\n", name.c_str());
+    if (!name.empty()) fprintf(f, "%s\n", name.c_str());
     fclose(f);
     return true;
 }

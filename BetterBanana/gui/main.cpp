@@ -62,6 +62,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // A mixer that was killed with an EQ editor open leaves the engine
+    // analysing a signal nobody is watching. Starting fresh means no editor is
+    // open yet, so say so and let it go idle.
+    shm->spec.source.store(kSpecNone);
+
     app.installEventFilter(new WheelGuard(&app));
 
     MainWindow w(shm);

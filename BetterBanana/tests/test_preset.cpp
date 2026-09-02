@@ -200,20 +200,11 @@ int main()
         chk(v2->strip[0].eq.on.load() == 0, "and that strip EQ ends up off");
     }
 
-    // --- the startup marker -------------------------------------------------
-    chk(startup_preset_name().empty(), "no startup preset to begin with");
-    chk(set_startup_preset_name("Live"), "a startup preset can be set");
-    chk(startup_preset_name() == "Live", "and read back");
-    chk(preset_path_for("Live") == presets_path() + "/Live.bbp",
-        "a bare name resolves into the preset directory");
-    chk(preset_path_for("/tmp/x.bbp") == "/tmp/x.bbp", "a path is left alone");
-    chk(set_startup_preset_name(""), "and cleared");
-    chk(startup_preset_name().empty(), "clearing removes it");
-
-    // --- migration off the old autosave --------------------------------------
+    // --- migration off the old autosave, before any choice has been made -----
     {
         const std::string old = preset_dir() + "/autosave.bbp";
         mkdir(preset_dir().c_str(), 0755);
+        chk(startup_preset_name().empty(), "no startup preset to begin with");
         chk(write_file_atomic(old.c_str(), first), "an old autosave exists");
         std::string as;
         chk(migrate_autosave(&as), "it migrates");
@@ -221,7 +212,25 @@ int main()
         chk(startup_preset_name() == "Previous session", "which becomes the startup choice");
         chk(access(old.c_str(), F_OK) != 0, "and the old file is moved aside");
         chk(!migrate_autosave(nullptr), "migration does not run a second time");
-        set_startup_preset_name("");
+    }
+
+    // --- the startup marker -------------------------------------------------
+    chk(set_startup_preset_name("Live"), "a startup preset can be set");
+    chk(startup_preset_name() == "Live", "and read back");
+    chk(preset_path_for("Live") == presets_path() + "/Live.bbp",
+        "a bare name resolves into the preset directory");
+    chk(preset_path_for("/tmp/x.bbp") == "/tmp/x.bbp", "a path is left alone");
+    chk(set_startup_preset_name(""), "and cleared");
+    chk(startup_preset_name().empty(), "clearing leaves no name");
+
+    // Choosing "start with a default mixer" is an answer, not the absence of
+    // one: a leftover autosave must not creep back in and undo it.
+    {
+        const std::string old = preset_dir() + "/autosave.bbp";
+        chk(write_file_atomic(old.c_str(), first), "a stale autosave reappears");
+        chk(!migrate_autosave(nullptr), "it does not migrate over a cleared choice");
+        chk(startup_preset_name().empty(), "which stays cleared");
+        unlink(old.c_str());
     }
 
     // --- per-device strip snapshots -------------------------------------------
