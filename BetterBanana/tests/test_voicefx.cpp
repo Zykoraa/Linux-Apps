@@ -247,6 +247,68 @@ int main()
              "the rack shifts pitch when the block asks for it");
     }
 
+    // --- the seam does not buzz ---------------------------------------------
+    {
+        // The pitch shifter splices its read head back by one sweep whenever it
+        // runs out of window. If that sweep is not a whole number of pitch
+        // periods the two sides do not line up, and the mismatch repeats at the
+        // sweep rate - 15 to 20 Hz for a large shift, which is exactly where the
+        // ear hears roughness. This is the check that it lands on periods.
+        auto env_mod = [&](const std::vector<float>& x) {
+            const int N = 16384;
+            const int off = int(x.size()) - N - 2000;
+            std::vector<float> e(N);
+            double run = 0.0;
+            const int W = 96;
+            for (int i = 0; i < N; ++i) {
+                run += std::fabs(x[off + i]);
+                if (i >= W) run -= std::fabs(x[off + i - W]);
+                e[i] = float(run / std::min(i + 1, W));
+            }
+            double mean = 0; for (float v : e) mean += v; mean /= N;
+            std::vector<float> re(N), im(N, 0.0f);
+            for (int i = 0; i < N; ++i)
+                re[i] = float((e[i] - mean) * 0.5 * (1 - std::cos(2 * M_PI * i / (N - 1))));
+            fft(re.data(), im.data(), N);
+            double best = 0.0;
+            for (int k = int(8.0 * N / SR); k <= int(90.0 * N / SR); ++k)
+                best = std::max(best, (double)std::hypot(re[k], im[k]));
+            return best / (mean * N / 4 + 1e-12);
+        };
+
+        const double f0 = 115.0;
+        std::vector<float> in;
+        for (int i = 0; i < int(SR * 3); ++i) {
+            double v = 0.0;
+            for (int h = 1; h * f0 <= 12000.0; ++h) v += vowel_envelope(h * f0)
+                                                      * std::sin(2.0 * M_PI * h * f0 * i / SR);
+            in.push_back(float(v * 0.12));
+        }
+        near(env_mod(in), 0.0, 0.01, "the test signal itself is not modulated");
+
+        for (float st : { 6.0f, 8.7f, 10.7f }) {
+            VoiceFx p;
+            fx_set_defaults(p);
+            p.on.store(1);
+            p.pitch.store(st);
+            auto ch = std::make_unique<VoiceFxChain>();
+            ch->configure((float)SR);
+            ch->update(p, (float)SR);
+            std::vector<float> out;
+            out.reserve(in.size());
+            for (float v : in) out.push_back(ch->process(0, v));
+            char msg[120];
+            std::snprintf(msg, sizeof(msg),
+                          "pitch %+.1f st adds under 1%% modulation (got %.1f%%)",
+                          st, 100.0 * env_mod(out));
+            chk(env_mod(out) < 0.01, msg);
+            std::snprintf(msg, sizeof(msg),
+                          "and locks the sweep to the period at %+.1f st", st);
+            chk(ch->pitch[0].coherent
+                && std::fabs(ch->period.period - SR / f0) < 2.0, msg);
+        }
+    }
+
     // --- formant shifter ----------------------------------------------------
     {
         FormantShifter fs;

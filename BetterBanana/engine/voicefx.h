@@ -31,35 +31,166 @@ namespace bb {
 // At zero semitones the heads sit at fixed offsets and their sum is a comb
 // filter, not a copy - so zero bypasses rather than running the maths.
 // ---------------------------------------------------------------------------
-constexpr int kPitchWindow = 2048;              // 43 ms at 48 kHz
-constexpr int kPitchBuf    = kPitchWindow * 2;  // max delay is 1.5 windows
-constexpr float kPitchXfade = 0.25f;            // fraction of the window spent blending
+constexpr int kPitchWindow = 2048;              // nominal sweep, 43 ms at 48 kHz
+constexpr int kPitchBuf    = kPitchWindow * 2;
+constexpr float kPitchXfade = 0.25f;            // fraction of the sweep spent blending
+
+// The largest sweep that keeps every tap inside the buffer: the partner tap
+// reaches 1.75 sweeps back at the seam.
+constexpr int kPitchMaxLen = int(kPitchBuf / 1.75f) - 8;
+constexpr int kPitchMinLen = 1024;
+
+// ---------------------------------------------------------------------------
+// Tracks the period of whatever is being sung or spoken, cheaply.
+//
+// The pitch shifter splices its read head back by one sweep every time it runs
+// out of window. If that sweep is an arbitrary length, the waveform either side
+// of the splice does not line up, and the mismatch repeats at the sweep rate -
+// which for a big shift lands between 15 and 20 Hz, exactly where the ear hears
+// roughness. Hence "robotic". Land the splice on a whole number of pitch
+// periods instead and the two sides match.
+//
+// Autocorrelation on a signal decimated by four: a quarter of the resolution
+// costs nothing here, because a period only has to be right to within a sample
+// or two of the original rate to kill the discontinuity.
+// ---------------------------------------------------------------------------
+struct PeriodTracker {
+    static constexpr int kDec    = 4;
+    static constexpr int kWin    = 512;                 // 43 ms of decimated audio
+    static constexpr int kUpdate = 256;                 // re-measure every ~21 ms
+    static constexpr int kLagLo  = 24;                  // 500 Hz at 12 kHz
+    static constexpr int kLagHi  = 200;                 // 60 Hz
+
+    static constexpr int kFine = 2048;                  // full-rate history
+
+    float ring[kWin] = {};
+    float lin[kWin] = {};
+    float fr[kFine] = {};                               // full rate, for refinement
+    float flin[kFine] = {};
+    int   wi = 0, fi = 0, dec_n = 0, since = 0;
+    float acc = 0.0f;
+    float period = 0.0f;                                // original samples, 0 = unknown
+
+    void reset()
+    {
+        for (float& v : ring) v = 0.0f;
+        for (float& v : fr) v = 0.0f;
+        wi = fi = dec_n = since = 0; acc = 0.0f; period = 0.0f;
+    }
+
+    inline void push(float x)
+    {
+        fr[fi] = x;
+        fi = (fi + 1) % kFine;
+        acc += x;
+        if (++dec_n < kDec) return;
+        ring[wi] = acc / kDec;
+        acc = 0.0f; dec_n = 0;
+        wi = (wi + 1) % kWin;
+        if (++since >= kUpdate) { since = 0; measure(); }
+    }
+
+    void measure()
+    {
+        for (int i = 0; i < kWin; ++i) lin[i] = ring[(wi + i) % kWin];
+        double e0 = 0.0;
+        for (int i = 0; i < kWin; ++i) e0 += double(lin[i]) * lin[i];
+        if (e0 < 1e-6) { period = 0; return; }           // silence: nothing to lock to
+
+        double best = 0.0;
+        int    bestLag = 0;
+        for (int lag = kLagLo; lag <= kLagHi; ++lag) {
+            const int m = kWin - lag;
+            double num = 0.0, ea = 0.0, eb = 0.0;
+            for (int i = 0; i < m; ++i) {
+                num += double(lin[i]) * lin[i + lag];
+                ea  += double(lin[i]) * lin[i];
+                eb  += double(lin[i + lag]) * lin[i + lag];
+            }
+            const double den = std::sqrt(ea * eb) + 1e-12;
+            const double r = num / den;
+            if (r > best) { best = r; bestLag = lag; }
+        }
+        // Below this the signal is a consonant or noise; there is no period to
+        // preserve, and forcing one would be worse than leaving it alone.
+        if (best <= 0.6 || bestLag == 0) { period = 0.0f; return; }
+
+        // The decimated search only resolves the period to four samples, and
+        // four samples of error multiplied by however many periods make up a
+        // sweep leaves the harmonics badly out of phase across the seam - which
+        // is the whole thing this is trying to avoid. Refine at full rate, then
+        // interpolate between samples.
+        for (int i = 0; i < kFine; ++i) flin[i] = fr[(fi + i) % kFine];
+        const int coarse = bestLag * kDec;
+        const int span = kDec + 2;
+        const int m = kFine / 2;
+        double fbest = -1e30, fm1 = 0.0, fp1 = 0.0;
+        int    flag = coarse;
+        for (int lag = coarse - span; lag <= coarse + span; ++lag) {
+            if (lag < kLagLo * kDec || lag + m >= kFine) continue;
+            double num = 0.0;
+            for (int i = 0; i < m; ++i) num += double(flin[i]) * flin[i + lag];
+            if (num > fbest) { fbest = num; flag = lag; }
+        }
+        auto corr = [&](int lag) {
+            if (lag < 1 || lag + m >= kFine) return 0.0;
+            double v = 0.0;
+            for (int i = 0; i < m; ++i) v += double(flin[i]) * flin[i + lag];
+            return v;
+        };
+        fm1 = corr(flag - 1); fp1 = corr(flag + 1);
+        const double den = fm1 - 2 * fbest + fp1;
+        const double off = std::fabs(den) < 1e-12 ? 0.0 : 0.5 * (fm1 - fp1) / den;
+        period = float(flag) + float(std::clamp(off, -1.0, 1.0));
+    }
+};
 
 struct PitchShifter {
     float buf[kPitchBuf] = {};
     int   wr = 0;
     float phase = 0.0f;                 // current delay, in samples
     float ratio = 1.0f;
+    float len = kPitchWindow;           // sweep length actually in use
+    float pending = kPitchWindow;       // applied at the next seam
     bool  active = false;
+    bool  coherent = false;             // is the sweep a whole number of periods?
 
-    // The head sweeps this range; both it and its crossfade partner (one whole
-    // window away) stay inside the buffer and never ask for a future sample.
-    static constexpr float kLo = kPitchWindow * 0.5f;
-    static constexpr float kHi = kPitchWindow * 1.5f;
+    float lo() const { return len * 0.5f; }
+    float hi() const { return len * 1.5f; }
 
     void set_semitones(float st)
     {
         const bool was = active;
         active = std::fabs(st) > 0.01f;
         ratio = std::pow(2.0f, clampf(st, -24.0f, 24.0f) / 12.0f);
-        // Coming back on with a buffer full of stale audio would splutter.
         if (active && !was) reset();
+    }
+
+    // Sweep an exact whole number of pitch periods, as near the nominal window
+    // as that allows. Zero period (unvoiced, silent) falls back to the nominal.
+    // The sweep is a whole number of periods, so it may be fractional in
+    // samples - the taps interpolate anyway, and rounding to whole samples is
+    // precisely the error this exists to remove.
+    void set_period(float samples)
+    {
+        if (samples <= 1.0f) {
+            pending = float(kPitchWindow);
+            coherent = false;
+            return;
+        }
+        int k = std::max(1, (int)std::lround(double(kPitchWindow) / samples));
+        float want = k * samples;
+        while (want > kPitchMaxLen && k > 1) want = --k * samples;
+        while (want < kPitchMinLen && (k + 1) * samples <= kPitchMaxLen) want = ++k * samples;
+        coherent = want >= kPitchMinLen && want <= kPitchMaxLen;
+        pending = coherent ? want : float(kPitchWindow);
     }
 
     void reset()
     {
         for (int i = 0; i < kPitchBuf; ++i) buf[i] = 0.0f;
-        phase = kPitchWindow;
+        len = pending;
+        phase = len;
     }
 
     inline float tap(float delay) const
@@ -80,35 +211,51 @@ struct PitchShifter {
 
         phase += 1.0f - ratio;              // ratio > 1: the head catches up
 
-        // How close the head is to the end of its travel, and where it will
-        // reappear. Pitching up runs the delay down to kLo and jumps it a whole
-        // window back; pitching down does the mirror image.
         float dist, other;
         if (ratio > 1.0f) {
-            if (phase < kLo) phase += float(kPitchWindow);
-            dist  = phase - kLo;
-            other = phase + float(kPitchWindow);
+            if (phase < lo()) {
+                // A seam is the one moment the sweep length can change without
+                // the delay jumping audibly: the crossfade is already covering it.
+                if (pending != len) { len = pending; phase = std::clamp(phase, lo(), hi()); }
+                phase += len;
+                if (phase >= hi()) phase = hi() - 1.0f;
+            }
+            dist  = phase - lo();
+            other = phase + len;
         } else {
-            if (phase >= kHi) phase -= float(kPitchWindow);
-            dist  = kHi - phase;
-            other = phase - float(kPitchWindow);
+            if (phase >= hi()) {
+                if (pending != len) { len = pending; phase = std::clamp(phase, lo(), hi()); }
+                phase -= len;
+                if (phase < lo()) phase = lo();
+            }
+            dist  = hi() - phase;
+            other = phase - len;
         }
 
-        // Only blend near the seam. Holding a single head for most of the
-        // window is what keeps the pitched tone intact: two heads summed the
-        // whole time sit at a fixed delay apart, so they cancel each other at
-        // whatever frequency that offset happens to be a half period of, and
-        // the result is audibly hollow.
-        // The partner tap is only ever read inside the seam, which bounds the
-        // largest delay at kHi - zone + kPitchWindow = 3584 samples - inside
-        // the 4096-sample buffer. Widening kPitchXfade past 0.5 would break
-        // that, so it stays a quarter.
-        const float zone = kPitchXfade * float(kPitchWindow);
+        // Only blend near the seam. Holding a single head for most of the sweep
+        // is what keeps the pitched tone intact: two heads summed the whole time
+        // sit at a fixed delay apart and cancel each other wherever that offset
+        // is a half period, which sounds hollow.
+        const float zone = kPitchXfade * len;
         if (dist >= zone) return tap(phase);
 
-        const float b = 1.0f - dist / zone;             // 0 .. 1 across the seam
-        const float a = b * kPi * 0.5f;
-        return tap(phase) * std::cos(a) + tap(other) * std::sin(a);
+        const float b = 1.0f - dist / zone;
+        // Which crossfade law depends on whether the two taps are reading the
+        // same thing. Once the sweep is a whole number of pitch periods they
+        // are near-identical, and summing identical signals with the
+        // constant-POWER law puts +3 dB in the middle of every seam - which is
+        // a worse buzz than the one the alignment just removed. Correlated
+        // wants constant amplitude; uncorrelated still wants constant power.
+        float g0, g1;
+        if (coherent) {
+            g0 = 0.5f * (1.0f + std::cos(kPi * b));
+            g1 = 1.0f - g0;
+        } else {
+            const float a = b * kPi * 0.5f;
+            g0 = std::cos(a);
+            g1 = std::sin(a);
+        }
+        return tap(phase) * g0 + tap(other) * g1;
     }
 };
 
@@ -240,6 +387,7 @@ inline float drive_shape(float x, float k)
 struct VoiceFxChain {
     PitchShifter   pitch[kChan];
     FormantShifter formant[kChan];
+    PeriodTracker  period;          // one voice, so one period for both channels
     RingMod      ring[kChan];
     Crusher      crush[kChan];
     Chorus       chorus[kChan];
@@ -264,6 +412,7 @@ struct VoiceFxChain {
             pitch[c].reset();
             formant[c].configure();
         }
+        period.reset();
     }
 
     void update(const VoiceFx& p, float sr)
@@ -317,6 +466,15 @@ struct VoiceFxChain {
 
     inline float process(int c, float x)
     {
+        // Track on the left channel only and share the answer: it is one voice,
+        // and both shifters must splice at the same length to stay coherent.
+        // Only worth tracking when the pitch stage is actually running; a rack
+        // doing nothing but echo should not pay for an autocorrelation.
+        if (c == 0 && pitch[0].active) {
+            period.push(x);
+            const float p = period.period;
+            for (int i = 0; i < kChan; ++i) pitch[i].set_period(p);
+        }
         x = pitch[c].process(x);
         x = formant[c].process(x);
         if (drive_on) x = drive_shape(x, drive_k);
