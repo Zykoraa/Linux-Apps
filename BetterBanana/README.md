@@ -566,7 +566,7 @@ Discord's own output back into it sends everyone their own voice as an echo.
 The same rule applies to any strip carrying an application's output that is
 also listening on B1.
 
-The resulting layout, which is what the shipped `spotify-to-mic` preset holds:
+The resulting layout:
 
 | Strip | Source | A1 (speakers) | B1 (to Discord) |
 |---|---|:--:|:--:|
