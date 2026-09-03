@@ -756,93 +756,114 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
     setProperty("role", "card");
     setAttribute(Qt::WA_StyledBackground, true);
     m_pulse.start();
+
+    // A grid, not two independent rows.
+    //
+    // The record and play rows used to be separate QHBoxLayouts inside a
+    // column, so nothing in one lined up with anything in the other: the two
+    // path fields began at different x because "REC FILE" and "PLAY FILE" are
+    // different widths, FROM floated in the gap between the rows attached to
+    // neither, and PLAYBACK TO sat at the far right of the bar with its own
+    // chips three hundred pixels away on the row below. One grid gives every
+    // column a single edge.
+    //
+    //   col:   0        1          2            3     4        5
+    //   row 0: RECORDER REC FILE   [path...]    [...] FROM/bus [REC]   ...
+    //   row 1:          PLAY FILE  [path...]    [...] [PLAY]   [LOOP]  ...
     auto* root = new QHBoxLayout(this);
-    root->setContentsMargins(bbui::gapM(), bbui::gapS() + 2, bbui::gapM(), bbui::gapS() + 2);
+    root->setContentsMargins(bbui::gapM(), bbui::gapS(), bbui::gapM(), bbui::gapS());
     root->setSpacing(bbui::gapM());
+
+    auto* g = new QGridLayout;
+    g->setHorizontalSpacing(bbui::gapS());
+    g->setVerticalSpacing(bbui::gapXS());
+    root->addLayout(g, 1);
 
     {   // The card names itself now that it is no longer inside a group box.
         auto* title = makeLabel("RECORDER", "caption", Qt::AlignLeft | Qt::AlignVCenter);
-        title->setFixedWidth(bbui::px(76));
-        root->addWidget(title);
+        g->addWidget(title, 0, 0, 2, 1);
     }
 
-    // Record side
-    auto* recCol = new QVBoxLayout;
-    recCol->setSpacing(bbui::gapS() - 1);
-    {
-        auto* r = new QHBoxLayout;
-        r->setSpacing(bbui::gapS() - 1);
-        r->addWidget(makeLabel("REC FILE", "caption", Qt::AlignLeft));
-        m_recPath = new QLineEdit(QDir::homePath() + "/betterbanana-take.wav");
-        m_recPath->setMinimumWidth(bbui::px(200));
-        m_recPath->setMaximumWidth(bbui::px(520));
-        m_recPath->setPlaceholderText("where to record to");
-        // Right-aligned: a 900px field showing 150px of "/home/eve" and hiding
-        // the filename is the wrong end of the path to keep.
-        m_recPath->setAlignment(Qt::AlignRight);
-        connect(m_recPath, &QLineEdit::editingFinished, this, [this]{ writePaths(); });
-        r->addWidget(m_recPath, 1);
-        auto* browse = new QPushButton("...");
-        browse->setFixedWidth(bbui::px(28));
-        connect(browse, &QPushButton::clicked, this, [this] {
-            const QString f = QFileDialog::getSaveFileName(this, "Record to", m_recPath->text(),
-                                                           "WAV audio (*.wav)");
-            if (!f.isEmpty()) { m_recPath->setText(f); writePaths(); }
-        });
-        r->addWidget(browse);
-        r->addWidget(makeLabel("FROM", "caption", Qt::AlignLeft));
+    // Both file rows are built the same way, so the columns cannot drift apart.
+    auto fileRow = [&](int row, const QString& caption, QLineEdit*& field,
+                       const QString& placeholder, std::function<void()> browse) {
+        g->addWidget(makeLabel(caption, "caption", Qt::AlignRight | Qt::AlignVCenter), row, 1);
+        field = new QLineEdit;
+        field->setMinimumWidth(bbui::px(180));
+        field->setPlaceholderText(placeholder);
+        // Right-aligned: a wide field showing "/home/eve" and hiding the
+        // filename is keeping the wrong end of the path.
+        field->setAlignment(Qt::AlignRight);
+        field->setFixedHeight(bbui::rowH());
+        connect(field, &QLineEdit::editingFinished, this, [this] { writePaths(); });
+        g->addWidget(field, row, 2);
+        auto* b = new QPushButton("...");
+        b->setFixedWidth(bbui::px(28));
+        b->setFixedHeight(bbui::rowH());
+        b->setToolTip("Browse");
+        connect(b, &QPushButton::clicked, this, browse);
+        g->addWidget(b, row, 3);
+    };
+
+    fileRow(0, "REC FILE", m_recPath, "where to record to", [this] {
+        const QString f = QFileDialog::getSaveFileName(this, "Record to", m_recPath->text(),
+                                                       "WAV audio (*.wav)");
+        if (!f.isEmpty()) { m_recPath->setText(f); writePaths(); }
+    });
+    m_recPath->setText(QDir::homePath() + "/betterbanana-take.wav");
+
+    fileRow(1, "PLAY FILE", m_playPath, "a file to play into the mixer", [this] {
+        const QString f = QFileDialog::getOpenFileName(this, "Play file", QDir::homePath(),
+                                    "Audio (*.wav *.flac *.ogg *.aiff);;All files (*)");
+        if (!f.isEmpty()) { m_playPath->setText(f); writePaths(); }
+    });
+
+    {   // Source bus, on the record row, with its label attached to it rather
+        // than floating between the two rows.
+        auto* from = new QHBoxLayout;
+        from->setSpacing(bbui::gapXS());
+        from->addWidget(makeLabel("FROM", "caption", Qt::AlignRight | Qt::AlignVCenter));
         m_srcBus = new QComboBox;
         for (int b = 0; b < kBuses; ++b) m_srcBus->addItem(kBusLabel[b]);
         m_srcBus->setCurrentIndex(m_shm->rec.source_bus.load());
+        m_srcBus->setFixedHeight(bbui::rowH());
+        m_srcBus->setToolTip("Which bus is recorded");
         connect(m_srcBus, &QComboBox::currentIndexChanged, this,
-                [this](int i){ m_shm->rec.source_bus.store(i); });
-        r->addWidget(m_srcBus);
-        m_rec = makeToggle("● REC", "rec");
-        connect(m_rec, &QPushButton::clicked, this, [this] {
-            writePaths();
-            sendCmd(m_shm->rec.state.load() == kRecRecording ? kCmdRecStop : kCmdRecStart);
-        });
-        r->addWidget(m_rec);
-        recCol->addLayout(r);
+                [this](int i) { m_shm->rec.source_bus.store(i); });
+        from->addWidget(m_srcBus, 1);
+        g->addLayout(from, 0, 4);
     }
-    // Play side
-    {
-        auto* r = new QHBoxLayout;
-        r->setSpacing(bbui::gapS() - 1);
-        r->addWidget(makeLabel("PLAY FILE", "caption", Qt::AlignLeft));
-        m_playPath = new QLineEdit;
-        m_playPath->setMinimumWidth(bbui::px(200));
-        m_playPath->setMaximumWidth(bbui::px(520));
-        m_playPath->setPlaceholderText("a file to play into the mixer");
-        m_playPath->setAlignment(Qt::AlignRight);
-        connect(m_playPath, &QLineEdit::editingFinished, this, [this]{ writePaths(); });
-        r->addWidget(m_playPath, 1);
-        auto* browse = new QPushButton("...");
-        browse->setFixedWidth(bbui::px(28));
-        connect(browse, &QPushButton::clicked, this, [this] {
-            const QString f = QFileDialog::getOpenFileName(this, "Play file", QDir::homePath(),
-                                        "Audio (*.wav *.flac *.ogg *.aiff);;All files (*)");
-            if (!f.isEmpty()) { m_playPath->setText(f); writePaths(); }
-        });
-        r->addWidget(browse);
-        m_play = makeToggle("▶ PLAY", "accent");
-        connect(m_play, &QPushButton::clicked, this, [this] {
-            writePaths();
-            sendCmd(m_shm->rec.state.load() == kRecPlaying ? kCmdPlayStop : kCmdPlayStart);
-        });
-        r->addWidget(m_play);
-        m_loop = makeToggle("LOOP", "accent");
-        connect(m_loop, &QPushButton::toggled, this,
-                [this](bool b){ m_shm->rec.loop.store(b ? 1 : 0); });
-        r->addWidget(m_loop);
-        recCol->addLayout(r);
-    }
-    root->addLayout(recCol, 1);
 
-    // Playback gain + routing
-    {
+    m_rec = makeToggle("● REC", "rec");
+    m_rec->setMinimumWidth(bbui::px(70));
+    connect(m_rec, &QPushButton::clicked, this, [this] {
+        writePaths();
+        sendCmd(m_shm->rec.state.load() == kRecRecording ? kCmdRecStop : kCmdRecStart);
+    });
+    g->addWidget(m_rec, 0, 5);
+
+    m_play = makeToggle("▶ PLAY", "accent");
+    connect(m_play, &QPushButton::clicked, this, [this] {
+        writePaths();
+        sendCmd(m_shm->rec.state.load() == kRecPlaying ? kCmdPlayStop : kCmdPlayStart);
+    });
+    g->addWidget(m_play, 1, 4);
+
+    m_loop = makeToggle("LOOP", "accent");
+    m_loop->setMinimumWidth(bbui::px(70));
+    connect(m_loop, &QPushButton::toggled, this,
+            [this](bool b) { m_shm->rec.loop.store(b ? 1 : 0); });
+    g->addWidget(m_loop, 1, 5);
+
+    // Only the path fields absorb a wider window.
+    g->setColumnStretch(2, 1);
+
+    // --- the right-hand block: where it is going, and what it is doing ------
+    {   // Caption over its own chips, in one column, so the two are read
+        // together instead of at opposite ends of the bar.
         auto* col = new QVBoxLayout;
         col->setSpacing(bbui::gapXS());
+        col->addStretch();
         col->addWidget(makeLabel("PLAYBACK TO", "caption"));
         auto* r = new QHBoxLayout;
         r->setSpacing(bbui::gapXS() - 1);
@@ -852,19 +873,25 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
             btn->setProperty("bus", b);
             btn->setChecked(m_shm->rec.bus_on[b].load() != 0);
             connect(btn, &QPushButton::toggled, this,
-                    [this, b](bool on){ m_shm->rec.bus_on[b].store(on ? 1 : 0); });
+                    [this, b](bool on) { m_shm->rec.bus_on[b].store(on ? 1 : 0); });
             m_busBtns.push_back(btn);
             r->addWidget(btn);
         }
         col->addLayout(r);
+        col->addStretch();
         root->addLayout(col);
     }
-    {   // The 180px void in the middle of the bar, given a tenant: a timecode
-        // the widget already formatted but only ever printed into a caption,
-        // a position bar, and a meter on what is actually being recorded.
+
+    {   // Transport readout: a timecode the widget already formatted but only
+        // ever printed into a caption, a position bar, and what it is doing.
         auto* col = new QVBoxLayout;
         col->setSpacing(bbui::gapXS());
+        // Centred, so the slack goes above and below rather than being shared
+        // out between the three items - which left a gap where the position
+        // bar sits when it is hidden.
+        col->addStretch();
         m_time = makeLabel("--:--", "gain", Qt::AlignHCenter);
+        m_time->setMinimumWidth(bbui::px(112));
         col->addWidget(m_time);
         m_progress = new QProgressBar;
         m_progress->setTextVisible(false);
@@ -875,30 +902,27 @@ RecorderWidget::RecorderWidget(Shared* shm, QWidget* parent)
         m_status = makeLabel("idle", "caption", Qt::AlignHCenter);
         col->addWidget(m_status);
         col->addStretch();
-        root->addLayout(col, 0);
-        m_time->setMinimumWidth(bbui::px(120));
+        root->addLayout(col);
     }
+
     {
         m_meter = new LevelMeter(kChan);
-        m_meter->setFixedHeight(bbui::px(46));
+        m_meter->setFixedHeight(bbui::px(48));
         m_meter->setToolTip("The bus being recorded");
-        root->addWidget(m_meter);
+        root->addWidget(m_meter, 0, Qt::AlignVCenter);
     }
-    {
-        auto* col = new QVBoxLayout;
-        col->setSpacing(bbui::gapXS());
+
+    {   // Caption beside the knob, not stacked above it: stacking is what
+        // inflated the whole bar by a row for one word.
         auto* gr = new QHBoxLayout;
         gr->setSpacing(bbui::gapXS());
-        // Caption beside the knob, not stacked above it: stacking is what
-        // inflated the whole bar by a row for one word.
         gr->addWidget(makeLabel("GAIN", "caption", Qt::AlignRight | Qt::AlignVCenter));
         m_gain = new Knob(-600, 120, 0, true, " dB");
-        gr->addWidget(m_gain);
+        m_gain->setToolTip("Level of the file played into the mixer");
         connect(m_gain, &Knob::valueChanged, this,
-                [this](int v){ m_shm->rec.gain_db.store(v / 10.0f); });
-        col->addLayout(gr);
-        col->addStretch();
-        root->addLayout(col);
+                [this](int v) { m_shm->rec.gain_db.store(v / 10.0f); });
+        gr->addWidget(m_gain);
+        root->addLayout(gr);
     }
 }
 
@@ -1717,18 +1741,35 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     // rather than into the faders. Tier 3 puts a dock in it.
     outer->addStretch(1);
 
-    // The recorder is a card in its own right now that cards paint; a plate
-    // inside a group box would be framed twice.
-    m_recorder = new RecorderWidget(m_shm);
-    outer->addWidget(m_recorder);
-
     auto* scroll = new QScrollArea;
     m_scroll = scroll;
     m_central = central;
     scroll->setWidget(central);
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
-    setCentralWidget(scroll);
+
+    // Only the console scrolls. The transport is a control you reach for while
+    // something is playing, so putting it inside the scroll area meant that at
+    // the window's own minimum height it was the part that fell below the fold.
+    // The engine-stopped banner is pinned for the same reason.
+    //
+    // The recorder is a card in its own right now that cards paint; a plate
+    // inside a group box would be framed twice.
+    m_recorder = new RecorderWidget(m_shm);
+
+    auto* frame = new QWidget;
+    auto* fl = new QVBoxLayout(frame);
+    fl->setContentsMargins(0, 0, 0, 0);
+    fl->setSpacing(0);
+    fl->addWidget(scroll, 1);
+    {   // The same gutter the console has, so the transport still reads as a
+        // card rather than a band clipped against the window edge.
+        auto* row = new QHBoxLayout;
+        row->setContentsMargins(bbui::gapM(), 0, bbui::gapM(), bbui::gapM());
+        row->addWidget(m_recorder);
+        fl->addLayout(row);
+    }
+    setCentralWidget(frame);
 
     buildMenus();
 
@@ -1742,7 +1783,10 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     // the floor travel. Hard-coding it got the app a horizontal scrollbar at
     // its own stated minimum.
     if (m_central) {
-        const QSize need = m_central->minimumSizeHint().expandedTo(m_central->sizeHint());
+        QSize need = m_central->minimumSizeHint().expandedTo(m_central->sizeHint());
+        // The transport sits outside the scroll area now, so its height is not
+        // in the measurement above.
+        if (m_recorder) need.rheight() += m_recorder->sizeHint().height();
         // Width is a hard floor - ten columns cannot overlap. Height is capped
         // well below what the content wants, because a 1366x768 laptop has
         // about 730 usable pixels and scrolling the console is a far better
