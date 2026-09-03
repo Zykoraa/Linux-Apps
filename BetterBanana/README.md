@@ -3,7 +3,7 @@
 A virtual audio mixer for Linux, built on PipeWire and modelled on
 [Voicemeeter Banana](https://vb-audio.com/Voicemeeter/banana.htm): 5 input
 strips (3 hardware + 2 virtual) feeding a 5×5 routing matrix into 5 buses
-(3 hardware + 2 virtual), with per-strip gate, compressor, EQ, Intellipan and
+(3 hardware + 2 virtual), with per-strip gate, compressor, EQ, pan and
 fader.
 
 Beyond the original it adds three standalone virtual cables, sidechain ducking,
@@ -153,13 +153,25 @@ Hardware inputs 1–3 and buses A1–A3 are idle until you assign a device.
 
 ## Themes
 
-**Theme** menu, remembered across runs: BetterBanana Dark, Catppuccin Mocha,
-Catppuccin Latte, Everforest Dark, Nord, Gruvbox Dark, Tokyo Night, Dracula,
-Rosé Pine and Solarized Dark.
+**View → Theme**, remembered across runs, with a swatch beside each name:
+BetterBanana Dark, Catppuccin Mocha, Catppuccin Latte, Everforest Dark, Nord,
+Gruvbox Dark, Tokyo Night, Dracula, Rosé Pine and Solarized Dark.
 
 Themes are data, not stylesheets — see `builtinThemes()` in `gui/theme.cpp`.
 Add one by appending a `mk(...)` row; every widget, including the custom-painted
-knobs, Intellipan pads and meters, follows automatically.
+knobs, pan controls and meters, follows automatically.
+
+You do not have to check the new palette by eye. Foreground colours are derived
+from the fill they land on rather than written down (`gui/color.h`), and
+`tests/test_contrast.cpp` asserts the result for every palette: text clears
+WCAG AA on every surface it appears on, a lit toggle and its label clear it
+together, hover always moves, and the five bus chips stay distinguishable from
+each other and from the mute/solo/mono/EQ colours beside them. `make check`
+runs it.
+
+**View → Interface size** scales the whole window — 100 % to 175 % — on top of
+whatever your compositor already does. It restarts the mixer window to apply;
+the engine keeps running, so nothing you hear stops.
 
 ## Tape deck
 
@@ -667,7 +679,15 @@ it:
 
 ## Keyboard shortcuts
 
-`packaging/betterbanana.lua.example` binds the mixer to Hyprland. It is *not*
+Inside the app, **Help → Keyboard and mouse** lists every gesture the faders,
+knobs, strips and buses respond to. The menus carry the usual accelerators, and
+`Ctrl+S` / `Ctrl+O` save and load a preset, the platform's undo and redo keys
+step the whole mixer backwards and forwards, `Ctrl+A` opens the application
+router, `Ctrl+D` the ducker, `Ctrl+B` the VBAN streams, `F5` re-reads the device
+list and `Ctrl+Q` closes the window (the engine keeps running).
+
+For system-wide binds, `packaging/betterbanana.lua.example` binds the mixer to
+Hyprland. It is *not*
 installed by `install.sh`; drop it in yourself:
 
     cp packaging/betterbanana.lua.example ~/.config/hypr/config/betterbanana.lua
@@ -698,29 +718,75 @@ roughly 2.5% on top, since that is the one part of the chain doing an FFT.
 
 ## Metering
 
-Each strip shows gain reduction the engine was already computing: a bar under
-**GATE** for gate attenuation, under **COMP** for compression, and one below the
-gain readout for the ducker. Meters latch a **clip indicator** across the top
-when a signal hits full scale — click any meter, or use **Engine → Clear clip
-indicators**, to reset them. Meters carry a faint dB ruler at -6, -12, -20, -30
-and -40, with unity marked more brightly.
+Every meter in the window is the same height and the same dB per pixel, so a
+level is the same distance up the column whichever channel you read it in. They
+are segmented every 1.5 dB — on dB, not on pixels, so a segment is worth the
+same everywhere — over a ghosted ladder that keeps an idle meter looking like an
+instrument rather than a hole.
+
+Two traces per channel: a slow bar with an instant attack and a 26 dB/s release
+for the eye, and the engine's own faster value drawn as a line over it. Peak
+hold sits for 1.4 s and then falls at 24 dB/s, and the held peak is printed at
+the top of the meter. All of it is paced in seconds, so the meter reads the same
+whether or not the window is keeping up.
+
+Meters latch a **clip indicator** across the top when a signal hits full scale,
+and it pulses so it catches the eye. **Clicking a meter clears that column
+only** — the evidence that another channel clipped while you were looking away
+is not something a click somewhere else should destroy. **Engine → Clear clip
+indicators** still clears all of them.
+
+If the engine stops writing, the meters empty and a banner says so, rather than
+freezing the last level on screen and looking like a steady signal.
+
+Each strip also shows gain reduction the engine was already computing: a bar
+under **GATE** for gate attenuation, under **COMP** for compression, and one
+below the gain readout for the ducker.
 
 **Solo is per bus.** A soloed strip silences the others only on the buses it
-actually feeds, so soloing something that feeds B1 leaves B2 alone.
+actually feeds, so soloing something that feeds B1 leaves B2 alone. While
+anything is soloed, the strips it silences are dimmed and edged in the solo
+colour, so the reason is visible on the strips it affects and not only on the
+one that caused it.
 
-## Faders
+## Faders, knobs and the pan control
 
-Custom-drawn, linear in dB, with a marked unity position and a dB scale.
-**Double-click a fader to snap it back to 0 dB.** Drag to set, hold Ctrl while
-dragging for fine control, and the wheel works once you have clicked the fader.
+Custom-drawn, linear in dB, with unity marked and the scale labelled at +12, 0,
+-12, -30 and -60. The travel is worked out from the window height and applied to
+every column at once, so a taller window buys resolution rather than a band of
+empty groove.
+
+| | |
+|---|---|
+| drag | set the value |
+| Ctrl + drag | fine control — and taking or releasing Ctrl part-way re-anchors, so it never jumps |
+| double-click | back to the default |
+| click away from the cap | page toward the click, rather than jumping to it |
+| middle-click | jump straight to that position |
+| wheel | step, once you have clicked the fader |
+| arrows / PageUp / PageDown / Home | step, once focused |
+
+Knobs take the same gestures and show their value as an arc, including at their
+default — a knob sitting at rest still reads as a knob. The pan control is
+horizontal only and says `L 40` / `C` / `R 25`: the engine has only ever read the
+X axis, so there is no vertical travel offering feedback for something that does
+not happen.
+
+**Help → Keyboard and mouse** lists all of this inside the app.
 
 ## A note on the mouse wheel
 
-Scrolling over a device dropdown or a fader does nothing. Qt normally lets the
-wheel change those without focus, which meant a stray scroll over the window
-could silently re-route an application or nudge a bus gain. Faders respond to
-the wheel only after you click them; device pickers never do. The knobs are
+Scrolling over a device dropdown or a fader does not change it. Qt normally lets
+the wheel change those without focus, which meant a stray scroll over the window
+could silently re-route an application or nudge a bus gain. Faders respond to the
+wheel only after you click them; device pickers never do. The knobs are
 deliberate controls and still take the wheel on hover (hold Ctrl for fine steps).
+
+The event is not simply dropped, though: it is handed to the scroll area under
+it, so the wheel still pans the window when the pointer happens to be over a
+picker. An earlier version of this guard swallowed the event outright, and since
+`QScrollBar` is itself a `QAbstractSlider`, that stopped the window, the EQ band
+table and the applications dialog from being scrolled with the wheel at all.
 
 ## Presets
 
@@ -790,7 +856,7 @@ strip's device dropdown.
 
 That gives a dedicated strip — its own fader, EQ, gate and bus routing — to
 whichever applications you point at that cable, separately from VAIO and AUX.
-For example, put *BetterBanana Cable 1* on **HARDWARE INPUT 2**, then send a game
+For example, put *BetterBanana Cable 1* on **HW INPUT 2**, then send a game
 or a browser to it while music keeps going through VAIO.
 
 Cables feed their strip inside the engine rather than through a monitor source,
@@ -818,10 +884,10 @@ respected.
 To send music into your microphone the way BetterBanana does:
 
 1. In **Applications**, set Spotify's target to **→ BetterBanana VAIO**.
-2. On the **BETTERBANANA VAIO** strip, enable **A1** (so you still hear it) and
+2. On the **VAIO** strip, enable **A1** (so you still hear it) and
    **B1** (so it reaches the virtual mic).
 3. Assign a real output device to bus **A1**.
-4. Put your microphone on **HARDWARE INPUT 1** and enable **B1** only — leaving
+4. Put your microphone on **HW INPUT 1** and enable **B1** only — leaving
    A1 off is what stops you hearing yourself and prevents a feedback loop.
 5. In Discord, choose **`bb_b1`** as the input device.
 
@@ -841,10 +907,10 @@ The resulting layout:
 
 | Strip | Source | A1 (speakers) | B1 (to Discord) |
 |---|---|:--:|:--:|
-| HARDWARE INPUT 1 | microphone | — | yes |
-| HARDWARE INPUT 2 | BetterBanana Cable 1 (game / apps) | yes | yes |
-| BETTERBANANA VAIO | Spotify | yes | yes |
-| BETTERBANANA AUX | Discord voice | yes | **no** |
+| HW INPUT 1 | microphone | — | yes |
+| HW INPUT 2 | BetterBanana Cable 1 (game / apps) | yes | yes |
+| VAIO | Spotify | yes | yes |
+| AUX | Discord voice | yes | **no** |
 
 Discord: output = *BetterBanana AUX*, input = *BetterBanana Out B1*.
 
@@ -1001,7 +1067,9 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_voicefx      # 54 voice changer assertions, measured by FFT
     ./build/test_autotune     # 20 note-snapping assertions
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
-    ./build/test_fader        # fader ballistics
+    ./build/test_fader        # fader value, clamping, paging and fine drag
+    ./build/test_contrast     # the colour contract, over all ten palettes
+    ./build/test_widgets      # the custom widgets, driven by real mouse events
     ./tests/integration.sh    # drives real audio through a running engine
 
 `tests/integration.sh` needs a running engine and drives real audio through it,
@@ -1013,6 +1081,24 @@ came from.
 on a fully populated mixer. Undo is built out of those two functions, so a field
 the format quietly dropped would be a control `Ctrl+Z` silently failed to
 restore.
+
+`test_contrast` is what makes ten themes maintainable. It walks every palette
+and asserts the properties the design depends on rather than any particular
+colour: body and dim text clear WCAG AA on every surface they appear on, a lit
+toggle and the label on top of it clear it together, a hover state always moves,
+a card is distinguishable from the window and a trough from its card, and the
+five bus chips stay clear of each other and of the mute/solo/mono/EQ colours
+sitting beside them. Adding an eleventh palette is then a question the test
+answers, not one you check by eye.
+
+`test_widgets` drives the custom controls with real mouse events. Every case in
+it is a defect that shipped once — a rename that came back on the next repaint,
+a fader that jumped when you took Ctrl part-way through a drag, a mis-click near
+the bottom of a groove that slammed a live channel to -60 dB.
+
+Both need no display: `make check` runs everything under the offscreen
+platform, so the Qt-linked tests never open a window on whatever session is
+running them.
 
 ## Design
 
@@ -1041,7 +1127,7 @@ binaries refuse to talk instead of silently writing to the wrong offsets.
 ## Status
 
 Working and verified: virtual devices, routing matrix, per-strip gate /
-compressor / tone knobs / audibility / Intellipan / mono / solo / mute / fader,
+compressor / tone knobs / audibility / pan / mono / solo / mute / fader,
 the 12-band parametric EQ on every strip and bus with profiles, AutoEq import
 and a live spectrum analyser, the per-strip voice changer with independent
 pitch and formant shifting, undo across the whole

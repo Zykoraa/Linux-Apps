@@ -19,9 +19,6 @@ public:
     // Overrides the printed value, for non-linear scales such as EQ frequency.
     void setFormatter(std::function<QString(int)> f) { m_fmt = std::move(f); update(); }
     void setScale(double s)     { m_scale = s;    update(); }
-    // A second arc outside the value arc, 0..1, for gain reduction the engine
-    // already measures. Drawn only when > 0.
-    void setReduction(float r);
     bool isDragging() const     { return m_dragging; }
 
     QSize sizeHint() const override;
@@ -51,7 +48,6 @@ private:
     QString m_suffix;
     int     m_decimals = 1;
     double  m_scale = 0.1;      // display value = raw * scale
-    float   m_reduction = 0.0f;
     std::function<QString(int)> m_fmt;
     bool    m_dragging = false;
     bool    m_hover = false;

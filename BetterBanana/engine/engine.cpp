@@ -907,7 +907,13 @@ void Engine::start_play()
     }
 
     play_ring.clear();
-    shm->rec.total_frames.store((uint32_t)info.frames);
+    // Converted to the engine's rate, because frames_played counts frames the
+    // resampler produced, and the GUI divides both by the same number. Stored
+    // at the file's own rate, a three-minute 44.1 kHz take opened reading
+    // "0:00 / 2:45" and then counted past its own total.
+    shm->rec.total_frames.store(info.samplerate > 0
+        ? (uint32_t)(info.frames * (sf_count_t)sr / info.samplerate)
+        : (uint32_t)info.frames);
     shm->rec.frames_played.store(0);
     shm->rec.err.store(0);
     shm->rec.state.store(kRecPlaying);

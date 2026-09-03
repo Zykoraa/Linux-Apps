@@ -300,8 +300,8 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         // One travel for every strip and bus in the window: the four different
         // meter heights used to put the same dBFS 114px apart between columns,
         // and a meter bridge whose scale moves per column is not a bridge.
-        for (QWidget* w : { (QWidget*)m_fader, (QWidget*)m_meter })
-            w->setFixedHeight(bbui::travel());
+        m_fader->setFixedHeight(bbui::travel());
+        m_meter->setFixedHeight(bbui::travel());
         m_meter->setToolTip("Click to clear this strip's clip indicator");
         m_meter->setClickHandler([this] {
             // Was the global kCmdClearClip, which wiped every strip and every
@@ -512,7 +512,9 @@ void StripWidget::pullFromShm()
     setK(m_comp,  m_comp ? int(p.comp.load() * 10) : 0);
     setK(m_aud,   m_aud  ? int(p.audibility.load() * 10) : 0);
     if (!m_pan->isDragging())
-        m_pan->setValues(int(p.pan_x.load() * 100), int(p.pan_y.load() * 100));
+        // Y is pinned: the engine has never read pan_y, so an old preset
+        // carrying one must not put it back on screen.
+        m_pan->setValues(int(p.pan_x.load() * 100), 0);
     if (!m_fader->isDragging()) m_fader->setValue(dbSlider(p.gain_db.load()));
     m_mono->setChecked(p.mono.load()); m_solo->setChecked(p.solo.load());
     m_mute->setChecked(p.mute.load());
@@ -610,8 +612,8 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
         row->setSpacing(0);
         m_fader = new Fader(-600, 120, 0);
         m_meter = new LevelMeter(kChan);
-        for (QWidget* w : { (QWidget*)m_fader, (QWidget*)m_meter })
-            w->setFixedHeight(bbui::travel());
+        m_fader->setFixedHeight(bbui::travel());
+        m_meter->setFixedHeight(bbui::travel());
         m_meter->setToolTip("Click to clear this bus's clip indicator");
         m_meter->setClickHandler([this] {
             m_shm->meters.bus_clip[m_index].store(0, std::memory_order_relaxed);
@@ -2177,10 +2179,10 @@ void MainWindow::buildMenus()
                                 "The audio engine keeps running, so nothing you "
                                 "hear stops.").arg(pct))
                     != QMessageBox::Yes) {
-                    const int cur = QSettings("betterbanana", "gui")
-                                        .value("uiScale", 100).toInt();
+                    const int keep = QSettings("betterbanana", "gui")
+                                         .value("uiScale", 100).toInt();
                     for (QAction* other : zg->actions())
-                        other->setChecked(other->text() == QString::number(cur) + "%");
+                        other->setChecked(other->text() == QString::number(keep) + "%");
                     return;
                 }
                 QSettings("betterbanana", "gui").setValue("uiScale", pct);
@@ -2494,9 +2496,19 @@ void MainWindow::applyAppRules()
         // moved on. Acting on it would re-route from a stale snapshot.
         if (round != m_ruleRound) return;
         m_ruleBusy = false;
-        if (acc->sinks.isEmpty() && acc->sinkIn.isEmpty()) return;   // pactl failed
+        // pactlAsync hands back an empty string for a failed or timed-out read;
+        // a genuinely empty list is "[]". Nothing at all means we cannot see the
+        // session, so there is nothing safe to conclude from it.
+        if (acc->sinks.isEmpty() || acc->sinkIn.isEmpty()) return;
+        // A partial read must not prune the set of streams already handled: the
+        // pruning is the only thing stopping a rule being re-applied, so
+        // dropping a key because one of five reads timed out is exactly how an
+        // app gets yanked off the sink the user just chose. Keep the stale keys
+        // and let the next complete round prune them.
+        const bool complete = !acc->sinkShort.isEmpty() && !acc->sourceIn.isEmpty()
+                           && !acc->srcShort.isEmpty();
         applyAppRulesWith(acc->sinks, acc->sinkIn, acc->sinkShort,
-                          acc->sourceIn, acc->srcShort);
+                          acc->sourceIn, acc->srcShort, complete);
     };
     pactlAsync({ "-f", "json", "list", "sinks" }, this,
                [acc, done](const QString& o) { acc->sinks = o; done(o); });
@@ -2512,7 +2524,8 @@ void MainWindow::applyAppRules()
 
 void MainWindow::applyAppRulesWith(const QString& sinksJson,
                                    const QString& sinkInputs, const QString& sinkShort,
-                                   const QString& sourceOutputs, const QString& sourceShort)
+                                   const QString& sourceOutputs, const QString& sourceShort,
+                                   bool complete)
 {
     // A rule saved before the stream bus was excluded from the target list can
     // still point at it, and re-applying that rule silences the app every time
@@ -2536,7 +2549,7 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
                        QString::number(s.index), want });
         }
     }
-    m_ruledStreams.intersect(seen);
+    if (complete) m_ruledStreams.intersect(seen);
 }
 
 void MainWindow::tick()

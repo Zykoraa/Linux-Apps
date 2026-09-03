@@ -75,7 +75,8 @@ engine: $(BUILD)/bb-engine
 gui:    $(BUILD)/bb-gui
 tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx \
-        $(BUILD)/test_pitch $(BUILD)/test_autotune $(BUILD)/test_contrast
+        $(BUILD)/test_pitch $(BUILD)/test_autotune $(BUILD)/test_contrast \
+        $(BUILD)/test_widgets
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -87,6 +88,14 @@ $(BUILD)/test_fader: tests/test_fader.cpp gui/knob.cpp gui/theme.cpp \
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  tests/test_fader.cpp gui/knob.cpp gui/theme.cpp $(BUILD)/moc_knob.cpp \
 	  -o $@ $(QT_LD)
+
+# Drives the custom widgets with real mouse events. Needs the offscreen
+# platform, which `check` selects.
+$(BUILD)/test_widgets: tests/test_widgets.cpp gui/knob.cpp gui/widgets.cpp gui/theme.cpp \
+                       $(BUILD)/moc_knob.cpp $(GUI_HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
+	  tests/test_widgets.cpp gui/knob.cpp gui/widgets.cpp gui/theme.cpp \
+	  $(BUILD)/moc_knob.cpp -o $@ $(QT_LD)
 
 # Needs Qt for QColor only; no display, no event loop.
 $(BUILD)/test_contrast: tests/test_contrast.cpp gui/theme.cpp $(GUI_HDRS) | $(BUILD)
@@ -232,13 +241,16 @@ install-system: engine gui ctl
 # is deliberately not part of this: it needs a running engine and it moves the
 # caller's applications around for half a minute.
 UNIT := test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
-        test_preset test_spectrum test_voicefx
+        test_preset test_spectrum test_voicefx test_widgets
 
+# QT_QPA_PLATFORM=offscreen for all of them: three of these link Qt and would
+# otherwise open real windows on whatever session happens to be running the
+# tests, and one of them then reports that it could not take focus.
 check: tests
 	@fail=0; \
 	for t in $(UNIT); do \
 	  printf '  %-14s ' "$$t"; \
-	  if ./$(BUILD)/$$t >/dev/null 2>&1; then echo ok; \
+	  if QT_QPA_PLATFORM=offscreen ./$(BUILD)/$$t >/dev/null 2>&1; then echo ok; \
 	  else echo FAILED; fail=1; fi; \
 	done; \
 	if [ $$fail != 0 ]; then \

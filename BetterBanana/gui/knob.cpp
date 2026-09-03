@@ -42,14 +42,6 @@ void Knob::setValue(int v)
     emit valueChanged(v);
 }
 
-void Knob::setReduction(float r)
-{
-    r = qBound(0.0f, r, 1.0f);
-    if (qAbs(r - m_reduction) < 0.01f) return;
-    m_reduction = r;
-    update();
-}
-
 QString Knob::shownText() const
 {
     return m_fmt ? m_fmt(m_value)
@@ -113,15 +105,6 @@ void Knob::paintEvent(QPaintEvent*)
     } else {
         const double span = -kSweep * qMax(frac, 0.008);
         p.drawArc(box, int(kStartAngle * 16), int(span * 16));
-    }
-
-    // Gain reduction, as an outer arc. Drawn after the body would hide it, so
-    // it goes here - before the body ellipse covers the middle.
-    if (m_reduction > 0.005f) {
-        QPen red(t.solo, qMax(2.0, arcW * 0.45), Qt::SolidLine, Qt::RoundCap);
-        p.setPen(red);
-        const QRectF outer = box.adjusted(-arcW * 0.75, -arcW * 0.75, arcW * 0.75, arcW * 0.75);
-        p.drawArc(outer, int(kStartAngle * 16), int(-kSweep * m_reduction * 16));
     }
 
     // --- body: shadow, bezel, face, specular ------------------------------

@@ -244,7 +244,9 @@ struct Recorder {
     ai   loop;
     au   frames_written;
     au   frames_played;
-    au   total_frames;            // length of the loaded file, 0 if none
+    au   total_frames;            // loaded file's length in ENGINE frames, 0 if
+                                  // none - the same unit as frames_played, so
+                                  // the two divide by one rate
     ai   err;                     // non-zero if the last operation failed
     au   cfg_seq;                 // seqlock guarding the two paths below
     char rec_path[kNameLen];

@@ -287,9 +287,11 @@ private:
     void populateAnalyzerMenu(class QMenu* menu);
     void readRouting();
     void applyAppRules();
+    // `complete` is false when any of the five reads failed: the set of
+    // already-handled streams is then left alone rather than pruned.
     void applyAppRulesWith(const QString& sinksJson, const QString& sinkInputs,
                            const QString& sinkShort, const QString& sourceOutputs,
-                           const QString& sourceShort);
+                           const QString& sourceShort, bool complete);
     void buildMenus();
     // The title carries the loaded preset and whether it has drifted, since on
     // a tiling compositor the title bar may be the only place either shows.

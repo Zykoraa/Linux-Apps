@@ -201,7 +201,6 @@ inline QColor mix(const QColor& a, const QColor& b, double t)
 // The floors themselves, so the stylesheet, the painters and the test all
 // quote the same numbers.
 constexpr double kTextFloor   = 4.5;   // anything below 14px
-constexpr double kLargeFloor  = 3.0;   // >=18px, or bold >=14px
 constexpr double kBoundFloor  = 3.0;   // borders, state fills, indicators
 
 } // namespace bbcolor
