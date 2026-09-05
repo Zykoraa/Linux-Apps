@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------- secrets
+# Never commit credentials. The Spotify client secret is a real secret and
+# this repository is public.
+.env
+*.env
+EvesGarden.env
+.spotify-token-cache
+.spotify-user-token
+
+# ------------------------------------------------------------- build output
+dist/
+build/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# A bundled ffmpeg, for anyone making a fully offline archive. Not committed:
+# on Linux the packaged ffmpeg is what should be used -- see ffmpeg_tools.py.
+bin/
+
+# ----------------------------------------------------------------- user data
+# Downloads, the index and per-machine state all live under ~/.config,
+# ~/.local/share and ~/.cache now (see xdg_paths.py), so nothing of the
+# user's should ever appear here. These are for a stray run from a checkout.
+library.db
+settings.json
+*.log
+
+# ------------------------------------------------------------------ editors
+.vscode/
+.idea/
+*.swp
+.DS_Store

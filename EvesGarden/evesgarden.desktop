@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Eve's Garden
+GenericName=Music Player
+Comment=Play the music you have and fetch the music you do not
+Exec=evesgarden %U
+Icon=evesgarden
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=music;player;audio;mp3;flac;opus;download;spotify;playlist;
+MimeType=audio/mpeg;audio/flac;audio/mp4;audio/ogg;audio/opus;audio/x-wav;audio/x-m4a;
+StartupNotify=true
+# Must match the WM_CLASS linux_window.py sets, or the taskbar shows a
+# generic icon and the window never links back to this entry.
+StartupWMClass=EvesGarden

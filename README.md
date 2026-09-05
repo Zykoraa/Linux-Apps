@@ -19,6 +19,31 @@ service. Works on Arch, Debian/Ubuntu, Fedora and openSUSE. Re-run it to update.
 
 Then run `bb-gui`.
 
+## Eve's Garden
+
+A music player and downloader. It plays what you already have -- MP3, FLAC,
+M4A, Opus, Ogg -- and fetches what you do not, tagging it properly and
+keeping the quality it was served at. Gapless playback, crossfade, a 10-band
+EQ, synced lyrics, 32 visualisers, volume levelling, and optional Spotify
+playlist import that notices when a playlist quietly loses a track.
+Ported from Windows. → [full documentation](EvesGarden/)
+
+It publishes itself over MPRIS, so the media keys, `playerctl` and the media
+widget in waybar, GNOME and KDE all work with no configuration, and files
+trashed from the Duplicates view go to the desktop trash rather than being
+deleted.
+
+**Any distro (user install, no root):**
+
+```sh
+git clone https://github.com/Zykoraa/Linux-Apps.git
+cd "Linux-Apps/EvesGarden" && ./install.sh
+```
+
+Needs `python3`, `tk`, `ffmpeg` and `portaudio` -- the installer names the
+package for your distribution if anything is missing. Then launch **Eve's
+Garden** from your app menu, or run `evesgarden`.
+
 ## Glory Injector
 
 A themed shared-object (`.so`) injector with a Tk GUI: pick a running process

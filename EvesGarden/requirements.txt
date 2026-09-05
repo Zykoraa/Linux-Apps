@@ -1,0 +1,42 @@
+# Spotify metadata + YouTube audio source
+spotipy>=2.23
+yt-dlp>=2024.1.0
+mutagen>=1.46
+requests>=2.31
+python-dotenv>=1.0
+
+# Playback engine.
+#   pyaudio has no Linux wheel: pip builds it against the system PortAudio,
+#   so portaudio and its headers must be installed first. install.sh checks.
+pyaudio>=0.2.14
+pydub>=0.25
+numpy>=1.24
+scipy>=1.10
+# pydub imports audioop, which PEP 594 removed from the standard library in
+# Python 3.13. Arch and Fedora already ship 3.13+, so without the backport
+# `from pydub import AudioSegment` is a ModuleNotFoundError and nothing plays.
+audioop-lts>=0.2; python_version >= "3.13"
+
+# GUI
+customtkinter>=5.2
+pillow>=10.0
+pystray>=0.19
+colorgram.py>=1.2
+# library index uses sqlite3 from the stdlib
+syncedlyrics>=0.7
+
+# Desktop integration.
+#   dbus-fast publishes the player over MPRIS, which is what makes the media
+#   keys, playerctl and the panel applets work -- see mpris.py. Pure Python
+#   with an optional Cython speedup; no D-Bus headers needed.
+#   python-xlib undecorates the window and hands drags to the window manager
+#   -- see linux_window.py. pystray pulls it in anyway; named here because
+#   this app imports it directly rather than by accident.
+dbus-fast>=2.21
+python-xlib>=0.33
+
+# Discord Rich Presence (optional; needs DISCORD_CLIENT_ID in the env file)
+pypresence>=4.3
+
+# Packaging (dev only)
+# pyinstaller>=6.0

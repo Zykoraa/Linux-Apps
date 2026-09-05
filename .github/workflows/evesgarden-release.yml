@@ -1,0 +1,146 @@
+# Eve's Garden — tests on every push, a release archive on every version tag.
+#
+#   git tag evesgarden-v1.0.0
+#   git push origin evesgarden-v1.0.0
+#
+# The tag is prefixed because this repository holds several apps and an
+# unprefixed v1.0.0 would be ambiguous about which one it released.
+#
+# The archive is a convenience, not the recommended install. A PyInstaller
+# build links against the glibc of the runner that made it, so it runs on
+# that distribution and newer and not on older; install.sh builds against
+# whatever the user actually has. The README leads with install.sh.
+
+name: Eve's Garden — Test & Release
+
+on:
+  push:
+    branches: [main]
+    paths: ['EvesGarden/**', '.github/workflows/evesgarden-release.yml']
+    tags: ['evesgarden-v*']
+  pull_request:
+    paths: ['EvesGarden/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_DIR: EvesGarden
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install system dependencies
+        # portaudio19-dev: pyaudio has no Linux wheel and is compiled here.
+        # python3-tk: the whole UI. ffmpeg: decoding.
+        # xvfb: the smoke test opens the real window, so it needs an X
+        # server -- without one it skips itself and the UI goes untested.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            portaudio19-dev python3-tk ffmpeg xvfb \
+            libxkbcommon-x11-0 dbus-x11
+
+      - name: Install Python dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Headless logic tests
+        working-directory: ${{ env.APP_DIR }}
+        run: python -m unittest discover -s tests -p 'test_core.py' -v
+
+      - name: Playback engine tests
+        working-directory: ${{ env.APP_DIR }}
+        run: python -m unittest discover -s tests -p 'test_gapless.py' -v
+
+      - name: Window and surface walk
+        working-directory: ${{ env.APP_DIR }}
+        # dbus-run-session gives the MPRIS service a bus to publish on, so
+        # that path is exercised rather than skipped.
+        run: |
+          xvfb-run -a --server-args='-screen 0 1600x1000x24' \
+            dbus-run-session -- \
+            python -m unittest discover -s tests -p 'test_smoke.py' -v
+
+      - name: Installer is valid shell
+        working-directory: ${{ env.APP_DIR }}
+        run: bash -n install.sh
+
+      - name: Desktop entry is valid
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          sudo apt-get install -y desktop-file-utils
+          desktop-file-validate evesgarden.desktop
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/evesgarden-v')
+    runs-on: ubuntu-22.04     # oldest supported glibc, so the build runs on more
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            portaudio19-dev python3-tk ffmpeg
+
+      - name: Build
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          python -m PyInstaller gui.spec --noconfirm
+
+      - name: Package
+        id: package
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          version="${GITHUB_REF_NAME#evesgarden-}"
+          name="evesgarden-${version}-x86_64"
+          mv dist/evesgarden "dist/${name}"
+          # The desktop entry and icons travel with it, so someone who
+          # unpacks the archive can still register it with their menu.
+          cp evesgarden.desktop "dist/${name}/"
+          cp -r assets/hicolor "dist/${name}/icons"
+          tar -czf "${name}.tar.gz" -C dist "${name}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "archive=${APP_DIR}/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${APP_DIR}/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          body: |
+            Eve's Garden ${{ github.ref_name }}
+
+            **Recommended install** — builds against your own system, and
+            keeps working across distribution upgrades:
+
+            ```sh
+            git clone https://github.com/Zykoraa/Linux-Apps.git
+            cd "Linux-Apps/EvesGarden" && ./install.sh
+            ```
+
+            The `.tar.gz` below is a self-contained alternative for x86_64.
+            It is built on Ubuntu 22.04, so it needs glibc 2.35 or newer, and
+            it expects `ffmpeg` on your PATH.
