@@ -177,6 +177,10 @@ int main(int argc, char** argv)
         QTimer::singleShot(0, &w, &MainWindow::openDuckDialog);
     if (app.arguments().contains("--apps"))
         QTimer::singleShot(0, &w, &MainWindow::openAppsDialog);
+    if (app.arguments().contains("--align"))
+        QTimer::singleShot(0, &w, &MainWindow::openAlignDialog);
+    if (app.arguments().contains("--check"))
+        QTimer::singleShot(0, &w, &MainWindow::openDiagnoseDialog);
     const int eqAt = app.arguments().indexOf("--eq");
     if (eqAt >= 0 && eqAt + 1 < app.arguments().size()) {
         const int bus = app.arguments().at(eqAt + 1).toInt();

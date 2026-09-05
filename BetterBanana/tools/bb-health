@@ -48,6 +48,10 @@ BBCTL = os.environ.get("BB_HEALTH_BBCTL", os.path.expanduser("~/.local/bin/bb-ct
 CONFIG_DIR = os.path.expanduser("~/.config/betterbanana")
 STATE = os.environ.get("BB_HEALTH_STATE", os.path.join(CONFIG_DIR, "lastgood.bbp"))
 DEFAULTS = os.path.join(CONFIG_DIR, "lastgood-defaults")
+# Written by the mixer while it restarts the engine on purpose; see inhibited().
+# The format - one bare unix deadline - is written by hold_health_watchdog() in
+# common/preset.h and asserted by tests/test_preset.cpp.
+INHIBIT = os.path.join(CONFIG_DIR, "health-inhibit")
 UNIT = "betterbanana-engine.service"
 
 # Virtual endpoints the engine always publishes, regardless of how the user has
@@ -132,6 +136,24 @@ def restore():
         pass
 
 
+def inhibited():
+    """True while someone is restarting the engine deliberately.
+
+    The mixer's Engine -> Restart takes the virtual nodes out of the graph for a
+    second or two, which is the exact symptom this watchdog repairs. Without
+    this it would race the restart: bring the engine up a second time, then put
+    its own last-known-good snapshot back over the mix that was just restored.
+
+    The file holds a unix deadline rather than a flag, so a mixer that is killed
+    mid-restart releases the watchdog by itself.
+    """
+    try:
+        with open(INHIBIT) as f:
+            return time.time() < float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+
+
 def repair(missing):
     log(f"engine nodes missing from the graph: {', '.join(missing)} - restarting engine")
     r = run("systemctl", "--user", "restart", UNIT, timeout=45)
@@ -158,7 +180,11 @@ def main():
 
     while True:
         try:
-            if engine_enabled() and graph_alive():
+            if inhibited():
+                # Someone is restarting the engine on purpose. Forget what the
+                # graph looked like: the nodes are meant to be missing.
+                missing_streak = 0
+            elif engine_enabled() and graph_alive():
                 missing = nodes_present()
 
                 if missing:

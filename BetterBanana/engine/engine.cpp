@@ -15,11 +15,15 @@
 #include "../common/preset.h"
 #include "dsp.h"
 #include "spectrum.h"
+#include "surround.h"
+#include "delay.h"
+#include "loudness.h"
 #include "voicefx.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
 #include <sndfile.h>
+#include <spa/param/latency-utils.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
@@ -184,6 +188,7 @@ struct StripDsp {
     VoiceFxChain fx;                // the voice changer, after the EQ
     SmoothGain gain[kChan];
     PeakMeter  pre[kChan], post[kChan];
+    Delay      delay;
     float c_gate = -1, c_comp = -1, c_aud = -1;
     float c_lo = 1e9f, c_mid = 1e9f, c_hi = 1e9f;
 
@@ -196,6 +201,7 @@ struct StripDsp {
         }
         par.configure(sr);
         fx.configure(sr);
+        delay.configure(sr);
     }
     void update(const StripParams& p, float sr)
     {
@@ -224,6 +230,8 @@ struct BusDsp {
     EqChain    eq;
     SmoothGain gain[kChan];
     PeakMeter  meter[kChan];
+    Delay      delay;
+    Loudness   loud;
 
     void configure(float sr)
     {
@@ -232,6 +240,8 @@ struct BusDsp {
             meter[c].configure(sr);
         }
         eq.configure(sr);
+        delay.configure(sr);
+        loud.configure(sr);
     }
     void update(const BusParams& p, float sr) { eq.update(p.eq, sr); }
 };
@@ -253,6 +263,11 @@ struct Endpoint {
     int         vban_bus = 0;      // kEpVbanOut: which bus feeds this sender
     uint32_t    nchan = kChan;    // negotiated channel count
     uint32_t    nrate = kRate;
+    // kEpHwOut only: the bus mode this stream was connected for, and the state
+    // the wider modes need. A change of mode changes the channel count, so it
+    // is a reconnect rather than a parameter.
+    int         mode = kBusNormal;
+    Upmix       upmix;
 };
 
 struct Engine {
@@ -394,6 +409,11 @@ void Engine::mix_chunk(uint32_t n)
 {
     if (n > kMaxChunk) n = kMaxChunk;
     Shared* s = shm;
+    // The quantum was stored once as 1024 at startup and never touched again -
+    // a gauge that reported a constant, which is worse than no gauge. It is the
+    // real block size now, and the latency arithmetic below depends on it.
+    if (n && s->quantum.load(std::memory_order_relaxed) != n)
+        s->quantum.store(n, std::memory_order_relaxed);
     // clock_gettime is a vDSO read, tens of nanoseconds, and this is per block
     // rather than per sample - cheap enough to leave on always.
     timespec t0;
@@ -463,9 +483,18 @@ void Engine::mix_chunk(uint32_t n)
         }
 
         // A key strip drives the ducker from its post-processing level, so the
-        // gate and compressor decide what counts as speech.
+        // gate and compressor decide what counts as speech. Read BEFORE the
+        // delay below: a strip held back for lip-sync must not duck late too.
         if (p.duck_key.load(std::memory_order_relaxed))
             key_peak = std::max(key_peak, std::max(post_pk[0], post_pk[1]));
+
+        // Time alignment, last of all, so every bus this strip feeds gets the
+        // same held-back signal. The meters above are deliberately pre-delay:
+        // they report what the strip produced, and a delay is transport, not
+        // level - a meter that lagged the fader by a quarter of a second would
+        // read as the mixer being broken.
+        d.delay.set_ms(p.delay_ms.load(std::memory_order_relaxed));
+        if (d.delay.active()) d.delay.process(stripout[i], (int)n);
 
         for (int c = 0; c < kChan; ++c) {
             d.pre[c].feed_peak(pre_pk[c], n);
@@ -576,6 +605,22 @@ void Engine::mix_chunk(uint32_t n)
             s->meters.bus_out[b][c].store(d.meter[c].peak, std::memory_order_relaxed);
             if (pk[c] >= 0.999f) s->meters.bus_clip[b].store(1, std::memory_order_relaxed);
         }
+
+        // Alignment goes last, after the limiter, so the delay carries exactly
+        // what the device will receive. This is the one that matters for
+        // listening: two outputs almost never have the same latency, and only a
+        // delay here can line them up - a strip feeds both, so delaying a strip
+        // moves both together.
+        d.delay.set_ms(p.delay_ms.load(std::memory_order_relaxed));
+        if (d.delay.active()) d.delay.process(acc[b], (int)n);
+
+        // Loudness measured on what actually leaves the bus. Peak says whether
+        // it will clip; this says how loud it will sound, which is the number
+        // every streaming platform measures.
+        d.loud.process(acc[b], (int)n);
+        s->meters.bus_lufs_s[b].store(d.loud.short_term(), std::memory_order_relaxed);
+        s->meters.bus_lufs_i[b].store(d.loud.integrated(), std::memory_order_relaxed);
+
         bus_ring[b].drop_to(kResyncQuanta * n);
         bus_ring[b].write(acc[b], n);
     }
@@ -703,7 +748,18 @@ static void on_process(void* data)
         Ring& ring = (e->kind == kEpVbanOut) ? E->vban_ring[e->index] : E->bus_ring[e->index];
         if (out) {
             E->ensure_ring(ring, n);
-            if (nc == kChan) {
+            const int mode = (e->kind == kEpHwOut) ? e->mode : kBusNormal;
+            const uint32_t want = (uint32_t)bus_layout(mode).channels;
+            if (mode != kBusNormal && nc == want) {
+                // The bus itself is stereo whatever the mode; the mode is what
+                // makes it wider, and it happens here at the very last moment.
+                static thread_local float tmp[kMaxChunk * kChan];
+                for (uint32_t off = 0; off < n; off += kMaxChunk) {
+                    const uint32_t m = (n - off) > kMaxChunk ? kMaxChunk : (n - off);
+                    ring.read_padded(tmp, m);
+                    e->upmix.process(mode, tmp, out + (size_t)off * nc, (int)m);
+                }
+            } else if (nc == kChan) {
                 ring.read_padded(out, n);
             } else {
                 static thread_local float tmp[kMaxChunk * kChan];
@@ -733,10 +789,43 @@ static void on_state(void* data, pw_stream_state old, pw_stream_state st, const 
         if (e->kind == kEpHwIn) e->eng->shm->strip[e->index].present.store(0, std::memory_order_relaxed);
 }
 
+// How far behind a device is, in milliseconds, from what PipeWire reports for
+// it. Three parts, any of which may be zero: a share of the graph quantum, a
+// number of frames, and a flat time. For a Bluetooth sink the last one carries
+// the codec and link delay, which is the part nothing else can see and the
+// whole reason this is read rather than guessed at.
+static float latency_ms_of(const spa_latency_info& in, uint32_t quantum, uint32_t rate)
+{
+    if (!rate) return -1.0f;
+    const double frames = (double)in.min_quantum * (double)quantum + (double)in.min_rate;
+    return (float)(frames * 1000.0 / (double)rate + (double)in.min_ns / 1e6);
+}
+
 static void on_param_changed(void* data, uint32_t id, const spa_pod* param)
 {
-    if (!param || id != SPA_PARAM_Format) return;
     Endpoint* e = static_cast<Endpoint*>(data);
+    if (param && id == SPA_PARAM_Latency) {
+        spa_latency_info info = {};
+        if (spa_latency_parse(param, &info) < 0) return;
+        Engine* E = e->eng;
+        if (!E || !E->shm) return;
+        const uint32_t q = E->shm->quantum.load(std::memory_order_relaxed);
+        const float ms = latency_ms_of(info, q ? q : 1024, e->nrate ? e->nrate : kRate);
+        if (ms < 0.0f) return;
+        // Both directions are reported and only one of them carries the figure
+        // that matters, which differs between a capture stream and a playback
+        // one. Keeping the larger of the two is what makes this work for both
+        // without having to know which is which.
+        if (e->kind == kEpHwOut && e->index >= 0 && e->index < kPhysBuses) {
+            const float was = E->shm->out_latency_ms[e->index].load(std::memory_order_relaxed);
+            if (ms > was) E->shm->out_latency_ms[e->index].store(ms, std::memory_order_relaxed);
+        } else if (e->kind == kEpHwIn && e->index >= 0 && e->index < kHwStrips) {
+            const float was = E->shm->in_latency_ms[e->index].load(std::memory_order_relaxed);
+            if (ms > was) E->shm->in_latency_ms[e->index].store(ms, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (!param || id != SPA_PARAM_Format) return;
     uint32_t mtype = 0, mstype = 0;
     if (spa_format_parse(param, &mtype, &mstype) < 0) return;
     if (mtype != SPA_MEDIA_TYPE_audio || mstype != SPA_MEDIA_SUBTYPE_raw) return;
@@ -754,6 +843,23 @@ static const pw_stream_events kStreamEvents = {
     .param_changed = on_param_changed,
     .process = on_process,
 };
+
+// Our channel ids are PipeWire-free so the DSP can be tested on its own; this
+// is the only place that has to know about SPA.
+static uint32_t spa_position_for(int id)
+{
+    switch (id) {
+    case kChFL:  return SPA_AUDIO_CHANNEL_FL;
+    case kChFR:  return SPA_AUDIO_CHANNEL_FR;
+    case kChFC:  return SPA_AUDIO_CHANNEL_FC;
+    case kChLFE: return SPA_AUDIO_CHANNEL_LFE;
+    case kChBL:  return SPA_AUDIO_CHANNEL_RL;
+    case kChBR:  return SPA_AUDIO_CHANNEL_RR;
+    case kChSL:  return SPA_AUDIO_CHANNEL_SL;
+    case kChSR:  return SPA_AUDIO_CHANNEL_SR;
+    }
+    return SPA_AUDIO_CHANNEL_UNKNOWN;
+}
 
 static bool connect_endpoint(Engine* E, Endpoint* e)
 {
@@ -797,9 +903,13 @@ static bool connect_endpoint(Engine* E, Endpoint* e)
     spa_audio_info_raw info = {};
     info.format = SPA_AUDIO_FORMAT_F32;
     info.rate = kRate;
-    info.channels = kChan;
-    info.position[0] = SPA_AUDIO_CHANNEL_FL;
-    info.position[1] = SPA_AUDIO_CHANNEL_FR;
+    // Everything is stereo except a hardware bus in a surround mode, which asks
+    // for the layout that mode publishes. The positions matter as much as the
+    // count: without them PipeWire has no idea which speaker is which and puts
+    // the whole thing through its own downmix.
+    const BusLayout& L = bus_layout(e->kind == kEpHwOut ? e->mode : kBusNormal);
+    info.channels = (uint32_t)L.channels;
+    for (int c = 0; c < L.channels; ++c) info.position[c] = spa_position_for(L.chan[c]);
     const spa_pod* params[1] = { spa_format_audio_raw_build(&pb, SPA_PARAM_EnumFormat, &info) };
 
     uint32_t flags = PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS;
@@ -1130,7 +1240,9 @@ void Engine::poll_control()
                 if (t.empty() || is_cable) {
                     shm->strip[i].present.store(is_cable ? 1 : 0, std::memory_order_relaxed);
                     if (!is_cable) strip_ring[i].clear();
+                    shm->in_latency_ms[i].store(-1.0f, std::memory_order_relaxed);
                 } else {
+                    shm->in_latency_ms[i].store(-1.0f, std::memory_order_relaxed);
                     connect_endpoint(this, &ep_in[i]);
                     auto it = node_desc.find(t);
                     if (it != node_desc.end() && it->second != hwd[i]) {
@@ -1150,7 +1262,11 @@ void Engine::poll_control()
                 std::fprintf(stderr, "[bb] BUS A%d -> %s\n", b + 1, t.empty() ? "(none)" : t.c_str());
                 if (t.empty()) {
                     if (ep_out[b].stream) { pw_stream_destroy(ep_out[b].stream); ep_out[b].stream = nullptr; }
+                    shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
                 } else {
+                    // Re-read for the new device rather than carrying the old
+                    // one's figure across; the two are rarely the same.
+                    shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
                     connect_endpoint(this, &ep_out[b]);
                     auto it = node_desc.find(t);
                     if (it != node_desc.end() && it->second != outd[b]) {
@@ -1165,6 +1281,21 @@ void Engine::poll_control()
         }
     }
 
+    // A bus mode changes how many channels the stream carries, so it cannot be
+    // applied to a live stream - the node has to be republished with the new
+    // layout. Only the A buses: B1 and B2 are what other applications record
+    // from, and those are stereo by definition.
+    for (int b = 0; b < kPhysBuses; ++b) {
+        int want = shm->bus[b].mode.load(std::memory_order_relaxed);
+        if (want < 0 || want >= kBusModeCount) want = kBusNormal;
+        if (want == ep_out[b].mode) continue;
+        ep_out[b].mode = want;
+        ep_out[b].upmix.configure(sr);
+        std::fprintf(stderr, "[bb] BUS A%d mode -> %s (%d ch)\n",
+                     b + 1, bus_layout(want).name, bus_layout(want).channels);
+        if (!ep_out[b].target.empty()) connect_endpoint(this, &ep_out[b]);
+    }
+
     const uint32_t cs = shm->cmd_seq.load(std::memory_order_acquire);
     if (cs != cmd_seen) {
         cmd_seen = cs;
@@ -1172,6 +1303,11 @@ void Engine::poll_control()
         case kCmdClearClip:
             for (int i = 0; i < kStrips; ++i) shm->meters.strip_clip[i].store(0);
             for (int b = 0; b < kBuses;  ++b) shm->meters.bus_clip[b].store(0);
+            break;
+        case kCmdResetLoudness:
+            // The integrated figure measures a take, not a level, so it is the
+            // one thing here with a "start again". Short-term keeps running.
+            for (int b = 0; b < kBuses; ++b) bdsp[b].loud.reset_integrated();
             break;
         case kCmdResetMeters:
             for (int i = 0; i < kStrips; ++i)
@@ -1315,6 +1451,11 @@ int main(int argc, char** argv)
         g_eng.duck_gain[i].snap(1.0f);
     }
     for (int b = 0; b < kBuses; ++b) g_eng.bdsp[b].configure(g_eng.sr);
+    for (int b = 0; b < kPhysBuses; ++b) {
+        int m = g_eng.shm->bus[b].mode.load();
+        g_eng.ep_out[b].mode = (m >= 0 && m < kBusModeCount) ? m : kBusNormal;
+        g_eng.ep_out[b].upmix.configure(g_eng.sr);
+    }
 
     pw_init(&argc, &argv);
     g_eng.loop = pw_main_loop_new(nullptr);

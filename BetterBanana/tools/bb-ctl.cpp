@@ -2,6 +2,8 @@
 // Maps the same shared-memory segment the GUI uses.
 #include "../common/protocol.h"
 #include "../common/preset.h"
+#include "../engine/surround.h"
+#include "../engine/delay.h"
 #include "../common/eqprofile.h"
 #include "../common/fxpreset.h"
 #include "../engine/autotune.h"
@@ -9,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -102,6 +105,13 @@ static void usage()
       "  strip <i> fx key <C..B> | scale <chromatic|major|minor>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
+      "  strip <i> delay <ms>        hold this strip back, 0 .. 500\n"
+      "  bus <b> delay <ms>          hold this bus back, 0 .. 500\n"
+      "  bus align                   delay every output to meet the slowest\n"
+      "  loudness reset              start the integrated measurement again\n"
+      "  bus <b> mode <name|n>       A1..A3 only: Normal, TV mix, Repeat,\n"
+      "                              Up-mix 2.1/4.1/5.1/7.1, Centre only,\n"
+      "                              Subwoofer only, Rears only\n"
       "  bus <b> preamp <dB>         EQ preamp, -24 .. +12\n"
       "  bus <b> band <0..11> <gain> <freq> <Q> [type] [on]\n"
       "                              type: pk ls hs hp lp notch bp\n"
@@ -135,6 +145,20 @@ static void usage()
       "  reset                       reset meters\n"
       "  quit                        stop the engine\n\n"
       "  strip index: 0=HW1 1=HW2 2=HW3 3=VAIO 4=AUX\n");
+}
+
+// Matches a mode name the way someone would type it: case, spaces, hyphens and
+// dots all ignored, and the British spelling of "centre" folded onto the other
+// one so both work.
+static std::string squash(const std::string& in)
+{
+    std::string o;
+    for (char c : in)
+        if (std::isalnum((unsigned char)c)) o += (char)std::tolower((unsigned char)c);
+    const std::string from = "centre", to = "center";
+    for (size_t at = o.find(from); at != std::string::npos; at = o.find(from, at + to.size()))
+        o.replace(at, from.size(), to);
+    return o;
 }
 
 static int bus_index(const char* s)
@@ -407,12 +431,24 @@ int main(int argc, char** argv)
             }
             std::printf("\n");
         }
-        std::printf("\n%-12s %7s %5s %5s %5s   device\n", "BUS", "GAIN", "MUTE", "MONO", "EQ");
+        std::printf("\n%-12s %7s %5s %5s %5s  %-12s %8s %8s %7s %7s  device\n",
+                    "BUS", "GAIN", "MUTE", "MONO", "EQ", "MODE",
+                    "LATENCY", "DELAY", "LUFS-S", "LUFS-I");
         for (int b = 0; b < kBuses; ++b) {
             BusParams& p = s->bus[b];
-            std::printf("%-12s %6.1f  %5d %5d %5d   %s\n",
+            // B1 and B2 are what other applications record from, so they have
+            // no mode to show rather than a mode that is always Normal.
+            const char* mode = b < kPhysBuses ? bus_layout(p.mode.load()).name : "-";
+            char lat[16] = "       -";
+            if (b < kPhysBuses) {
+                const float v = s->out_latency_ms[b].load();
+                if (v >= 0.0f) std::snprintf(lat, sizeof(lat), "%6.1fms", v);
+            }
+            std::printf("%-12s %6.1f  %5d %5d %5d  %-12s %8s %6.1fms %7.1f %7.1f  %s\n",
                 (lok && lbus[b][0]) ? lbus[b] : kBusName[b], p.gain_db.load(),
-                p.mute.load(), p.mono.load(), p.eq.on.load(),
+                p.mute.load(), p.mono.load(), p.eq.on.load(), mode,
+                lat, p.delay_ms.load(),
+                s->meters.bus_lufs_s[b].load(), s->meters.bus_lufs_i[b].load(),
                 b < kPhysBuses ? (out[b][0] ? out[b] : "(unassigned)") : "(virtual source)");
         }
         const char* st[] = { "idle", "RECORDING", "PLAYING" };
@@ -501,6 +537,7 @@ int main(int argc, char** argv)
             p.eq_high.store(clampf(atof(argv[6]), -12.0f, 12.0f));
         }
         else if (w == "eqon"   && argc >= 5) p.eq.on.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "delay"  && argc >= 5) p.delay_ms.store(clamp_delay(atof(argv[4])));
         else if (w == "preamp" && argc >= 5) p.eq.preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
         else if (w == "band" && argc >= 8) {
             if (!set_band(p.eq, argc, argv)) return 1;
@@ -517,6 +554,47 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "bus" && argc == 3 && std::string(argv[2]) == "align") {
+        char hw[kHwStrips][kNameLen], obo[kPhysBuses][kNameLen];
+        uint32_t rseq = 0;
+        bool rok = false;
+        for (int t = 0; t < 16 && !rok; ++t) rok = routing_read(s->routing, rseq, hw, obo);
+
+        float lat[kPhysBuses], want[kPhysBuses];
+        bool  inc[kPhysBuses];
+        for (int b = 0; b < kPhysBuses; ++b) {
+            lat[b]  = s->out_latency_ms[b].load();
+            want[b] = s->bus[b].delay_ms.load();
+            // The screen-share sink is heard by people somewhere else, on their
+            // own timeline. Delaying it only makes them wait.
+            inc[b] = !rok || std::strcmp(obo[b], kStreamSinkName) != 0;
+        }
+        if (!align_delays(lat, want, kPhysBuses, inc)) {
+            std::fprintf(stderr,
+                "bb-ctl: PipeWire has not reported a latency for any output that "
+                "can be aligned.\n        Assign a device to at least one A bus "
+                "and try again.\n");
+            return 1;
+        }
+        for (int b = 0; b < kPhysBuses; ++b) {
+            s->bus[b].delay_ms.store(want[b]);
+            if (!inc[b])
+                std::printf("A%d  %-24s excluded (capture only)\n", b + 1, obo[b]);
+            else if (lat[b] < 0.0f)
+                std::printf("A%d  latency unknown          delay unchanged\n", b + 1);
+            else
+                std::printf("A%d  latency %7.1f ms     delay %7.1f ms\n",
+                            b + 1, lat[b], want[b]);
+        }
+        return 0;
+    }
+
+    if (cmd == "loudness" && argc >= 3 && std::string(argv[2]) == "reset") {
+        send_cmd(s, kCmdResetLoudness);
+        std::printf("integrated loudness measurement restarted\n");
+        return 0;
+    }
+
     if (cmd == "bus" && argc >= 5) {
         const int b = bus_index(argv[2]);
         if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
@@ -526,6 +604,50 @@ int main(int argc, char** argv)
         else if (w == "mute") p.mute.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "mono") p.mono.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "eq")   p.eq.on.store(atoi(argv[4]) ? 1 : 0);
+        else if (w == "delay") p.delay_ms.store(clamp_delay(atof(argv[4])));
+        else if (w == "mode") {
+            if (b >= kPhysBuses) {
+                std::fprintf(stderr, "only A1..A3 have modes; B1 and B2 are what "
+                                     "other applications record from and are always "
+                                     "stereo\n");
+                return 1;
+            }
+            // A number or a name, matched loosely: "5.1" and "up-mix 5.1" and
+            // "upmix51" should all land on the same mode.
+            const std::string want = squash(argv[4]);
+            int found = -1;
+            for (int m = 0; m < kBusModeCount; ++m)
+                if (squash(bus_layout(m).name) == want) { found = m; break; }
+            // "5.1" should find "Up-mix 5.1" without anyone having to type the
+            // prefix. Only accept a suffix that matches exactly one mode.
+            if (found < 0 && !want.empty()) {
+                int hits = 0;
+                for (int m = 0; m < kBusModeCount; ++m) {
+                    const std::string n = squash(bus_layout(m).name);
+                    if (n.size() >= want.size() &&
+                        n.compare(n.size() - want.size(), want.size(), want) == 0) {
+                        found = m; ++hits;
+                    }
+                }
+                if (hits != 1) found = -1;
+            }
+            if (found < 0) {
+                char* end = nullptr;
+                const long n = std::strtol(argv[4], &end, 10);
+                if (end && *end == 0 && n >= 0 && n < kBusModeCount) found = (int)n;
+            }
+            if (found < 0) {
+                std::fprintf(stderr, "unknown bus mode \"%s\". They are:\n", argv[4]);
+                for (int m = 0; m < kBusModeCount; ++m)
+                    std::fprintf(stderr, "  %-14s %d ch   %s\n",
+                                 bus_layout(m).name, bus_layout(m).channels,
+                                 bus_layout(m).help);
+                return 1;
+            }
+            p.mode.store(found);
+            std::printf("A%d is %s (%d ch)\n", b + 1,
+                        bus_layout(found).name, bus_layout(found).channels);
+        }
         else if (w == "preamp") p.eq.preamp_db.store(clampf(atof(argv[4]), -24.0f, 12.0f));
         else if (w == "band" && argc >= 8) {
             if (!set_band(p.eq, argc, argv)) return 1;

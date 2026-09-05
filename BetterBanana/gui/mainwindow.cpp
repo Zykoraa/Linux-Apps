@@ -7,6 +7,8 @@
 #include "metrics.h"
 #include "../common/preset.h"
 #include "../engine/dsp.h"
+#include "../engine/surround.h"
+#include "../engine/delay.h"
 
 #include <QActionGroup>
 #include <QJsonArray>
@@ -24,7 +26,9 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFileSystemWatcher>
 #include <QFrame>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -36,6 +40,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QShortcut>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -49,7 +54,11 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QThread>
+#include <algorithm>
+#include <functional>
 #include <cmath>
+#include <csignal>
 
 using namespace bb;
 
@@ -582,6 +591,28 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
             emit routingChanged(m_index, m_device->currentData().toString());
         });
         root->addWidget(m_device);
+
+        // What the bus publishes. Only the A buses get one: B1 and B2 are what
+        // other applications record from, and a recording input that changed
+        // channel count under them would be a different kind of surprise.
+        m_mode = new DeviceCombo;
+        m_mode->setFixedHeight(bbui::rowH());
+        m_mode->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        for (int m = 0; m < kBusModeCount; ++m) {
+            const BusLayout& L = bus_layout(m);
+            m_mode->addItem(m == kBusNormal
+                                ? QString(L.name)
+                                : QString("%1  (%2 ch)").arg(L.name).arg(L.channels), m);
+            m_mode->setItemData(m_mode->count() - 1, QString(L.help), Qt::ToolTipRole);
+        }
+        connect(m_mode, &QComboBox::currentIndexChanged, this, [this](int i) {
+            if (i < 0) return;
+            m_shm->bus[m_index].mode.store(m_mode->itemData(i).toInt());
+            emit statusMessage(QString("%1 is now %2")
+                                   .arg(m_header->text(),
+                                        bus_layout(m_mode->itemData(i).toInt()).name));
+        });
+        root->addWidget(m_mode);
     } else {
         auto* vl = makeLabel(index == kPhysBuses ? "bb_b1" : "bb_b2", "caption");
         vl->setFixedHeight(bbui::rowH());
@@ -637,6 +668,19 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
     }
     m_gainLbl = makeLabel("+0.0 dB", "gain");
     root->addWidget(m_gainLbl);
+
+    // Peak says whether it will clip. This says how loud it will sound, which
+    // is what a streaming platform measures and what the meter beside it cannot
+    // tell you.
+    m_lufs = makeLabel("-- LUFS", "caption");
+    m_lufs->setAlignment(Qt::AlignHCenter);
+    m_lufs->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_lufs, &QLabel::customContextMenuRequested, this, [this](const QPoint&) {
+        m_shm->cmd.store(kCmdResetLoudness);
+        m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+        emit statusMessage("Integrated loudness measurement restarted");
+    });
+    root->addWidget(m_lufs);
     // A strip carries pan and a bus-assign row under its gain readout. Matching
     // that depth here lines every meter in the console up along one baseline.
     root->addStretch(1);
@@ -709,6 +753,21 @@ void BusWidget::pullFromShm()
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     m_header->setText(labelFor(m_shm, false, m_index, kBusLabel[m_index]));
 
+    if (m_mode) {
+        int m = p.mode.load();
+        if (m < 0 || m >= kBusModeCount) m = kBusNormal;
+        if (m_mode->currentIndex() != m) {
+            QSignalBlocker block(m_mode);   // a pull is not a change
+            m_mode->setCurrentIndex(m);
+        }
+        const BusLayout& L = bus_layout(m);
+        m_mode->setToolTip(QString("%1\n%2\n\nChanging this republishes the bus with "
+                                   "%3 channel%4, so the device it drives has to accept "
+                                   "that layout.")
+                               .arg(L.name, L.help).arg(L.channels)
+                               .arg(L.channels == 1 ? "" : "s"));
+    }
+
     if (m_thumb) {
         // Log-spaced, 20 Hz .. 20 kHz, one sample per two pixels. Cheap enough
         // at the 2 Hz sync rate that drives this, and it uses the engine's own
@@ -726,6 +785,22 @@ void BusWidget::pullFromShm()
 
 void BusWidget::refreshMeters()
 {
+    if (m_lufs) {
+        const float sh = m_shm->meters.bus_lufs_s[m_index].load(std::memory_order_relaxed);
+        const float in = m_shm->meters.bus_lufs_i[m_index].load(std::memory_order_relaxed);
+        // Below the floor there is no measurement to report, so say that rather
+        // than printing -70.0 as though it were a reading.
+        const QString t = sh <= -70.0f ? QString("-- LUFS")
+                                       : QString::asprintf("%.1f LUFS", sh);
+        if (m_lufs->text() != t) m_lufs->setText(t);
+        m_lufs->setToolTip(
+            QString("Short-term loudness, the rolling three seconds.\n"
+                    "Integrated since the last reset: %1\n\n"
+                    "Right-click to start the integrated measurement again.")
+                .arg(in <= -70.0f ? QString("not enough audio yet")
+                                  : QString::asprintf("%.1f LUFS", in)));
+    }
+
     float v[kChan];
     for (int c = 0; c < kChan; ++c)
         v[c] = m_shm->meters.bus_out[m_index][c].load(std::memory_order_relaxed);
@@ -1137,11 +1212,6 @@ void VbanDialog::apply()
 // HiFi__Line__sink") are unreadable, so the lists show pactl's `description`
 // ("UMC202HD 192k Line A") and keep node.name only as the stored value.
 // ---------------------------------------------------------------------------
-// The stream bus is a null sink: audio played into it is inaudible, because
-// nothing routes it back out. It is a legitimate BUS target (that is its whole
-// purpose) but never a place to send an application's playback.
-static const char* const kStreamSinkName = "betterbanana_stream";
-
 struct DevEntry { QString id, label; bool captureOnly = false; };
 
 static QString pactlRun(const QStringList& args)
@@ -1342,6 +1412,10 @@ struct StreamInfo {
     QString app;        // application.name - the key auto-routing rules use
     QString label;      // what the user sees
     QString target;     // node.name it is currently attached to
+    // What the application itself asked for. When this disagrees with `target`,
+    // WirePlumber is replaying a saved choice over the top of the application's
+    // own request - and no setting inside the application will fix it.
+    QString wanted;
 };
 
 static QVector<StreamInfo> parseStreams(const QString& js, const QString& shortList,
@@ -1375,6 +1449,7 @@ static QVector<StreamInfo> parseStreams(const QString& js, const QString& shortL
         si.label = si.app;
         if (!media.isEmpty() && media != si.app) si.label += "  \u2014  " + media;
         si.target = byId.value(o.value(playback ? "sink" : "source").toInt(-1));
+        si.wanted = props.value("target.object").toString();
         v.append(si);
     }
     return v;
@@ -1611,6 +1686,508 @@ void AppsDialog::refresh()
 
 
 // ---------------------------------------------------------------------------
+// Time alignment.
+//
+// Two output devices almost never have the same latency. A Bluetooth headset
+// runs about a quarter of a second behind a USB interface, so anything feeding
+// both arrives twice, far enough apart to hear. The fix is to hold the early
+// one back - and it has to be done on the BUS, because a strip feeds both and
+// delaying a strip moves both together.
+//
+// Nothing here is measured with test tones: PipeWire already reports the figure
+// for every device, and for a Bluetooth sink that figure includes the codec and
+// link delay, which is the part nothing else can see.
+// ---------------------------------------------------------------------------
+AlignDialog::AlignDialog(Shared* shm, QWidget* parent)
+    : QDialog(parent), m_shm(shm)
+{
+    setWindowTitle("Time alignment");
+    auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("Time alignment",
+        "What each device costs in delay, and how to make them agree"));
+
+    m_note = new QLabel;
+    m_note->setWordWrap(true);
+    m_note->setProperty("role", "caption");
+    root->addWidget(m_note);
+
+    auto* grid = new QGridLayout;
+    grid->setHorizontalSpacing(bbui::gapM());
+    grid->setVerticalSpacing(bbui::gapS());
+    int c = 0;
+    for (const char* h : { "", "Device", "Reported latency", "Delay", "Align" }) {
+        auto* l = new QLabel(h);
+        l->setProperty("role", "caption");
+        grid->addWidget(l, 0, c++);
+    }
+    int r = 1;
+
+    auto addRow = [&](Row& row, const QString& name, bool isBus, int idx) {
+        auto* tag = new QLabel(name);
+        tag->setProperty("role", "value");
+        grid->addWidget(tag, r, 0);
+        row.dev = new QLabel("-");
+        row.dev->setProperty("role", "caption");
+        grid->addWidget(row.dev, r, 1);
+        row.lat = new QLabel("-");
+        grid->addWidget(row.lat, r, 2);
+        row.delay = new QDoubleSpinBox;
+        row.delay->setRange(0.0, 500.0);
+        row.delay->setDecimals(1);
+        row.delay->setSingleStep(1.0);
+        row.delay->setSuffix(" ms");
+        row.delay->setToolTip(isBus
+            ? "Hold this output back so it lines up with the slowest one"
+            : "Hold this input back - for lip-sync against video, or against "
+              "another microphone on the same source");
+        connect(row.delay, &QDoubleSpinBox::valueChanged, this,
+                [this, isBus, idx](double v) {
+                    if (isBus) m_shm->bus[idx].delay_ms.store((float)v);
+                    else       m_shm->strip[idx].delay_ms.store((float)v);
+                });
+        grid->addWidget(row.delay, r, 3);
+        if (isBus) {
+            row.inc = new QCheckBox;
+            row.inc->setChecked(true);
+            row.inc->setToolTip(
+                "Include this output when aligning.\n\n"
+                "Turn it off for anything nobody is listening to in the room - a "
+                "screen-share sink is heard by people somewhere else, on their own "
+                "timeline, so delaying it only makes them wait.");
+            grid->addWidget(row.inc, r, 4, Qt::AlignCenter);
+        }
+        ++r;
+    };
+
+    { auto* l = new QLabel("INPUTS"); l->setProperty("role", "caption"); grid->addWidget(l, r++, 0); }
+    for (int i = 0; i < kHwStrips; ++i)
+        addRow(m_in[i], labelFor(m_shm, true, i, kStripTitle[i]), false, i);
+    { auto* l = new QLabel("OUTPUTS"); l->setProperty("role", "caption"); grid->addWidget(l, r++, 0); }
+    for (int b = 0; b < kPhysBuses; ++b)
+        addRow(m_out[b], labelFor(m_shm, false, b, kBusLabel[b]), true, b);
+
+    grid->setColumnStretch(1, 1);
+    root->addLayout(grid);
+
+    auto* align = new QPushButton("Align the outputs");
+    align->setToolTip("Delay every output so they all arrive together with the slowest");
+    connect(align, &QPushButton::clicked, this, &AlignDialog::alignOutputs);
+    auto* close = new QPushButton("Close");
+    connect(close, &QPushButton::clicked, this, &QDialog::accept);
+    root->addLayout(bbdlg::buttonRow(align, close));
+
+    m_timer = new QTimer(this);
+    connect(m_timer, &QTimer::timeout, this, &AlignDialog::refresh);
+    m_timer->start(500);
+    bbdlg::rememberGeometry(this, "align");
+    bbdlg::tameDefaults(this);
+    refresh();
+}
+
+void AlignDialog::refresh()
+{
+    char hw[kHwStrips][kNameLen] = {}, bo[kPhysBuses][kNameLen] = {};
+    char hwd[kHwStrips][kNameLen] = {}, bod[kPhysBuses][kNameLen] = {};
+    uint32_t seq = 0;
+    bool ok = false;
+    for (int t = 0; t < 16 && !ok; ++t)
+        ok = routing_read(m_shm->routing, seq, hw, bo, hwd, bod);
+
+    int known = 0;
+    auto fill = [&](Row& row, const QString& dev, const QString& node,
+                    float lat, float delay) {
+        row.dev->setText(dev.isEmpty() ? "- nothing assigned -" : dev);
+        // Untick a capture-only sink when it ARRIVES on this row, not on every
+        // refresh: someone who deliberately ticks it back on should keep it.
+        if (row.inc && node != row.lastDev) {
+            row.lastDev = node;
+            QSignalBlocker block(row.inc);
+            row.inc->setChecked(node != QString(kStreamSinkName));
+        }
+        if (lat >= 0.0f) { row.lat->setText(QString::asprintf("%.1f ms", lat)); ++known; }
+        else             row.lat->setText(dev.isEmpty() ? "-" : "not reported");
+        if (!row.delay->hasFocus()) {
+            QSignalBlocker block(row.delay);
+            row.delay->setValue(delay);
+        }
+    };
+    for (int i = 0; i < kHwStrips; ++i)
+        fill(m_in[i], ok ? QString::fromUtf8(hwd[i][0] ? hwd[i] : hw[i]) : QString(),
+             ok ? QString::fromUtf8(hw[i]) : QString(),
+             m_shm->in_latency_ms[i].load(), m_shm->strip[i].delay_ms.load());
+    for (int b = 0; b < kPhysBuses; ++b)
+        fill(m_out[b], ok ? QString::fromUtf8(bod[b][0] ? bod[b] : bo[b]) : QString(),
+             ok ? QString::fromUtf8(bo[b]) : QString(),
+             m_shm->out_latency_ms[b].load(), m_shm->bus[b].delay_ms.load());
+
+    m_note->setText(known
+        ? "These figures come from PipeWire, not from a measurement here: for a "
+          "Bluetooth headset the number includes the codec and link delay, which "
+          "is exactly the part you cannot guess at. Aligning holds the quicker "
+          "outputs back so everything reaches you together."
+        : "PipeWire has not reported a latency for anything yet. Assign a device "
+          "to a bus and this fills in.");
+}
+
+void AlignDialog::alignOutputs()
+{
+    float lat[kPhysBuses], want[kPhysBuses];
+    bool  inc[kPhysBuses];
+    for (int b = 0; b < kPhysBuses; ++b) {
+        lat[b]  = m_shm->out_latency_ms[b].load();
+        want[b] = m_shm->bus[b].delay_ms.load();
+        inc[b]  = !m_out[b].inc || m_out[b].inc->isChecked();
+    }
+    if (!align_delays(lat, want, kPhysBuses, inc)) {
+        QMessageBox::information(this, "BetterBanana",
+            "There is nothing to align against yet: PipeWire has not reported a "
+            "latency for any output that is ticked.\n\nAssign a device to an A bus "
+            "and try again.");
+        return;
+    }
+    QStringList said, left;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        const QString name = labelFor(m_shm, false, b, kBusLabel[b]);
+        if (!inc[b])          { left << name + " (not ticked)"; continue; }
+        if (lat[b] < 0.0f)    { left << name + " (no latency reported)"; continue; }
+        m_shm->bus[b].delay_ms.store(want[b]);
+        said << QString("%1  held back %2 ms").arg(name).arg(want[b], 0, 'f', 1);
+    }
+    refresh();
+    QMessageBox::information(this, "BetterBanana",
+        "Outputs aligned:\n\n  " + said.join("\n  ") +
+        (left.isEmpty() ? QString()
+                        : "\n\nLeft alone:\n  " + left.join("\n  ")) +
+        "\n\nEverything ticked now arrives together with the slowest of them. "
+        "Save a preset if you want this to survive the engine restarting.");
+}
+
+void MainWindow::openAlignDialog()
+{
+    if (!m_align) m_align = new AlignDialog(m_shm, this);
+    m_align->show();
+    m_align->raise();
+    m_align->activateWindow();
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics.
+//
+// The whole point is that none of these look like a fault. The mixer keeps
+// running, the meters keep moving, the unit reads active - and the audio is
+// simply somewhere else. Each one below has actually happened.
+// ---------------------------------------------------------------------------
+struct Finding {
+    int     level = 0;                  // 0 problem, 1 warning, 2 note
+    QString title;
+    QString detail;
+    QString fixLabel;                   // empty: nothing to press
+    std::function<void()> fix;
+};
+
+static QVector<Finding> diagnose(Shared* shm, MainWindow* owner)
+{
+    QVector<Finding> f;
+    auto sname = [shm](int i) { return labelFor(shm, true,  i, kStripTitle[i]); };
+    auto bname = [shm](int b) { return labelFor(shm, false, b, kBusLabel[b]); };
+
+    char hw[kHwStrips][kNameLen] = {}, bo[kPhysBuses][kNameLen] = {};
+    uint32_t seq = 0;
+    bool routed = false;
+    for (int t = 0; t < 16 && !routed; ++t) routed = routing_read(shm->routing, seq, hw, bo);
+
+    // Everything PipeWire is currently offering, by node name.
+    QSet<QString> present;
+    for (const QString& ln : (pactlRun({ "list", "short", "sinks" }) + "\n" +
+                              pactlRun({ "list", "short", "sources" }))
+                                 .split('\n', Qt::SkipEmptyParts)) {
+        const QStringList c = ln.split('\t');
+        if (c.size() >= 2) present.insert(c.at(1));
+    }
+
+    // --- the engine's own endpoints ---------------------------------------
+    // The failure that started the watchdog: same pid, heartbeat still ticking,
+    // unit still active, and every node gone from the graph.
+    QStringList gone;
+    for (const char* n : { "bb_vaio", "bb_aux", "bb_cable1", "bb_b1", "bb_b2" })
+        if (!present.contains(QString(n))) gone << n;
+    if (!gone.isEmpty())
+        f.append({ 0, "The engine's virtual devices are missing from the graph",
+                   QString("%1 %2 not in PipeWire's device list. The engine can be "
+                           "running - same pid, heartbeat ticking, unit active - with "
+                           "every one of its nodes gone, which is what a PipeWire "
+                           "restart does to it. No audio moves at all in that state.")
+                       .arg(gone.join(", "), gone.size() == 1 ? "is" : "are"),
+                   "Restart the engine", [owner] { owner->restartEngine(); } });
+
+    // --- audio routed somewhere that does not exist ------------------------
+    for (int i = 0; i < kStrips && routed; ++i) {
+        if (shm->strip[i].mute.load()) continue;
+        if (i < kHwStrips && !hw[i][0]) continue;          // nothing feeding it
+        for (int b = 0; b < kPhysBuses; ++b) {
+            if (!shm->strip[i].bus_on[b].load() || bo[b][0]) continue;
+            f.append({ 0, QString("%1 feeds %2, which has no output device")
+                              .arg(sname(i), bname(b)),
+                       QString("An A bus with no device assigned publishes no node, so "
+                               "everything routed into it is discarded without a word. "
+                               "Either give %1 an output device, or turn its button off "
+                               "on %2.").arg(bname(b), sname(i)), {}, {} });
+        }
+    }
+
+    // --- a device named but not connected ----------------------------------
+    for (int i = 0; i < kHwStrips && routed; ++i) {
+        const QString dev = QString::fromUtf8(hw[i]);
+        if (dev.isEmpty() || dev.startsWith(kCablePrefix)) continue;
+        if (shm->strip[i].present.load()) continue;
+        f.append({ 0, QString("%1 is set to a device that is not connected").arg(sname(i)),
+                   QString("The strip is assigned to \"%1\", which PipeWire is not "
+                           "offering. It stays silent until that device comes back.")
+                       .arg(dev), {}, {} });
+    }
+    for (int b = 0; b < kPhysBuses && routed; ++b) {
+        const QString dev = QString::fromUtf8(bo[b]);
+        if (dev.isEmpty() || present.contains(dev)) continue;
+        f.append({ 0, QString("%1 is set to a device that is not connected").arg(bname(b)),
+                   QString("The bus is assigned to \"%1\", which PipeWire is not "
+                           "offering, so everything routed into it goes nowhere.")
+                       .arg(dev), {}, {} });
+    }
+
+    // --- the echo rule ------------------------------------------------------
+    // Whichever bus points at the capture-only stream sink is what a screen
+    // share transmits. AUX carries what other people are saying.
+    int streamBus = -1;
+    for (int b = 0; b < kPhysBuses && routed; ++b)
+        if (QString::fromUtf8(bo[b]) == QString(kStreamSinkName)) streamBus = b;
+    if (streamBus >= 0 && shm->strip[kStrips - 1].bus_on[streamBus].load())
+        f.append({ 0, QString("%1 is routed to the stream bus, so callers hear themselves")
+                          .arg(sname(kStrips - 1)),
+                   QString("%1 is where incoming voice arrives. Sending it to %2, which "
+                           "is what a screen share transmits, mixes everyone's own voice "
+                           "back into the stream as an echo - and the people hearing it "
+                           "are the only ones who can tell.")
+                       .arg(sname(kStrips - 1), bname(streamBus)),
+                   "Turn that route off",
+                   [shm, streamBus] { shm->strip[kStrips - 1].bus_on[streamBus].store(0); } });
+
+    // --- the ducker ---------------------------------------------------------
+    if (shm->duck_enabled.load()) {
+        int key = -1;
+        for (int i = 0; i < kStrips; ++i)
+            if (shm->strip[i].duck_key.load()) { key = i; break; }
+        bool depth = false;
+        for (int i = 0; i < kStrips; ++i)
+            depth = depth || shm->strip[i].duck_depth_db.load() < -0.05f;
+        const float thr = shm->duck_threshold_db.load();
+
+        if (key < 0)
+            f.append({ 1, "Ducking is on, but no strip is set as the key",
+                       "Nothing triggers it, so it never does anything. Mark the strip "
+                       "that should cause the ducking - usually the microphone.", {}, {} });
+        else if (!depth)
+            f.append({ 1, "Ducking is on, but no strip has a depth",
+                       "Something triggers it and nothing responds. Give the strips that "
+                       "should get out of the way a depth in dB.", {}, {} });
+
+        if (key >= 0 && thr <= -60.0f)
+            f.append({ 1, "The ducking threshold is at the bottom of its range",
+                       QString("At %1 dB almost anything on %2 - a fan, a keyboard, your "
+                               "own speakers bleeding into the microphone - holds the "
+                               "ducker permanently open, so the strips it controls never "
+                               "come back up. A speaking voice usually sits near -20 dB.")
+                           .arg(thr, 0, 'f', 1).arg(sname(key)), {}, {} });
+
+        // What it is doing at this moment, which is the part no setting shows.
+        if (key >= 0 && shm->meters.duck_env.load() > 0.7f) {
+            const float lin = qMax(shm->meters.strip_pre[key][0].load(),
+                                   shm->meters.strip_pre[key][1].load());
+            const float db = lin > 1e-6f ? 20.0f * std::log10(lin) : -99.9f;
+            f.append({ 1, "The ducker is holding strips down right now",
+                       QString("%1 is at %2 dB against a %3 dB threshold. If nobody is "
+                               "talking, the threshold is below the room and the ducked "
+                               "strips will never come back up.")
+                           .arg(sname(key)).arg(db, 0, 'f', 1).arg(thr, 0, 'f', 1),
+                       {}, {} });
+        }
+    }
+
+    // --- WirePlumber overruling an application ------------------------------
+    for (const StreamInfo& si : listStreams(true)) {
+        if (si.wanted.isEmpty() || si.target.isEmpty() || si.wanted == si.target) continue;
+        bool numeric = false;
+        si.wanted.toLongLong(&numeric);
+        if (numeric) continue;                       // a serial, not a name
+        if (!present.contains(si.wanted)) continue;  // it asked for something gone
+        f.append({ 0, QString("%1 is not playing where it asked to").arg(si.app),
+                   QString("It requested \"%1\" and PipeWire put it on \"%2\". That is "
+                           "WirePlumber replaying a saved choice from "
+                           "~/.local/state/wireplumber, and it wins over the setting "
+                           "inside the application - changing it there will not stick. "
+                           "Moving the stream now is what makes WirePlumber save the new "
+                           "answer instead.").arg(si.wanted, si.target),
+                   QString("Move it to %1").arg(si.wanted),
+                   [si] { pactlRun({ "move-sink-input", QString::number(si.index),
+                                     si.wanted }); } });
+    }
+
+    // --- headroom -----------------------------------------------------------
+    const double load = shm->dsp_load.load() / 10.0;
+    if (load > 70.0)
+        f.append({ 1, QString("The mixer is using %1% of its realtime budget")
+                          .arg(load, 0, 'f', 1),
+                   "Past about 80% the audio starts breaking up. Formant shifting is the "
+                   "most expensive thing here; turning it off on a strip that is not "
+                   "using it buys back the most.", {}, {} });
+
+    // --- things left switched on --------------------------------------------
+    for (int i = 0; i < kStrips; ++i)
+        if (shm->strip[i].solo.load())
+            f.append({ 2, QString("%1 is soloed").arg(sname(i)),
+                       "Every other input is silenced on the buses this strip feeds. It "
+                       "is easy to leave up, and it sounds exactly like the other strips "
+                       "having stopped working.",
+                       "Clear it", [shm, i] { shm->strip[i].solo.store(0); } });
+
+    for (int b = 0; b < kPhysBuses && routed; ++b)
+        if (bo[b][0] && shm->bus[b].mute.load())
+            f.append({ 2, QString("%1 is muted").arg(bname(b)),
+                       QString("It has \"%1\" assigned, so something is routed there and "
+                               "nothing is coming out.").arg(QString::fromUtf8(bo[b])),
+                       "Unmute it", [shm, b] { shm->bus[b].mute.store(0); } });
+
+    // --- the system defaults a PipeWire restart throws away ------------------
+    const QString defSink = pactlRun({ "get-default-sink" }).trimmed();
+    const QString defSrc  = pactlRun({ "get-default-source" }).trimmed();
+    if (!defSink.isEmpty() && !defSink.startsWith("bb_") && present.contains("bb_vaio"))
+        f.append({ 1, "The system's default output is not a BetterBanana device",
+                   QString("New applications will open on \"%1\" and never appear on a "
+                           "strip. A PipeWire restart resets this, and it is the usual "
+                           "reason everything sounds fine while the mixer shows nothing.")
+                       .arg(defSink),
+                   "Point it at VAIO", [] { pactlRun({ "set-default-sink", "bb_vaio" }); } });
+    if (!defSrc.isEmpty() && !defSrc.startsWith("bb_") && present.contains("bb_b1"))
+        f.append({ 1, "The system's default input is not a BetterBanana device",
+                   QString("Applications that record will open on \"%1\" rather than on "
+                           "what the mixer sends out of B1.").arg(defSrc),
+                   "Point it at B1", [] { pactlRun({ "set-default-source", "bb_b1" }); } });
+
+    std::stable_sort(f.begin(), f.end(),
+                     [](const Finding& a, const Finding& b) { return a.level < b.level; });
+    return f;
+}
+
+DiagnoseDialog::DiagnoseDialog(Shared* shm, MainWindow* owner, QWidget* parent)
+    : QDialog(parent), m_shm(shm), m_owner(owner)
+{
+    setWindowTitle("Check this setup");
+    auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("Check this setup",
+        "Things that are wrong without looking wrong"));
+
+    m_summary = new QLabel;
+    m_summary->setWordWrap(true);
+    root->addWidget(m_summary);
+
+    auto* area = new QScrollArea;
+    area->setWidgetResizable(true);
+    area->setFrameShape(QFrame::NoFrame);
+    auto* holder = new QWidget;
+    m_list = new QVBoxLayout(holder);
+    m_list->setContentsMargins(0, 0, 0, 0);
+    m_list->setSpacing(bbui::gapS());
+    m_list->addStretch(1);
+    area->setWidget(holder);
+    root->addWidget(area, 1);
+
+    auto* again = new QPushButton("Check again");
+    connect(again, &QPushButton::clicked, this, &DiagnoseDialog::recheck);
+    auto* close = new QPushButton("Close");
+    connect(close, &QPushButton::clicked, this, &QDialog::accept);
+    root->addLayout(bbdlg::buttonRow(close, again));
+    bbdlg::rememberGeometry(this, "diagnose");
+    bbdlg::tameDefaults(this);
+    resize(qMax(width(), bbui::px(660)), qMax(height(), bbui::px(480)));
+    recheck();
+}
+
+void DiagnoseDialog::recheck()
+{
+    while (m_list->count() > 1) {                    // the trailing stretch stays
+        QLayoutItem* it = m_list->takeAt(0);
+        if (QWidget* w = it->widget()) w->deleteLater();
+        delete it;
+    }
+
+    const QVector<Finding> found = diagnose(m_shm, m_owner);
+    int problems = 0, warnings = 0;
+    for (const Finding& f : found) { if (f.level == 0) ++problems; else if (f.level == 1) ++warnings; }
+
+    if (found.isEmpty())
+        m_summary->setText("Nothing to report. Every check below the surface passed: the "
+                           "engine's devices are in the graph, everything routed has "
+                           "somewhere to go, and no application has been overruled.");
+    else
+        m_summary->setText(QString("%1 to fix, %2 worth a look, %3 worth knowing.")
+                               .arg(problems).arg(warnings)
+                               .arg(found.size() - problems - warnings));
+
+    static const char* kChipRole[] = { "mute", "solo", "accent" };
+    static const char* kChipText[] = { "FIX",  "LOOK", "NOTE" };
+    for (const Finding& f : found) {
+        // A plain QWidget, because that is what QWidget[role="card"] in the
+        // theme is written against and what every other card here is.
+        auto* card = new QWidget;
+        card->setProperty("role", "card");
+        auto* lay = new QGridLayout(card);
+        lay->setContentsMargins(bbui::gapM(), bbui::gapS(), bbui::gapM(), bbui::gapS());
+        lay->setHorizontalSpacing(bbui::gapM());
+
+        auto* chip = new QLabel(kChipText[f.level]);
+        chip->setProperty("role", "diagchip");
+        chip->setProperty("sev", kChipRole[f.level]);
+        chip->setAlignment(Qt::AlignCenter);
+        lay->addWidget(chip, 0, 0, Qt::AlignTop);
+
+        auto* title = new QLabel(f.title);
+        title->setWordWrap(true);
+        title->setProperty("role", "value");
+        lay->addWidget(title, 0, 1);
+
+        auto* detail = new QLabel(f.detail);
+        detail->setWordWrap(true);
+        detail->setProperty("role", "caption");
+        lay->addWidget(detail, 1, 1);
+
+        if (!f.fixLabel.isEmpty()) {
+            auto* go = new QPushButton(f.fixLabel);
+            go->setProperty("cta", "primary");
+            const auto act = f.fix;
+            connect(go, &QPushButton::clicked, this, [this, act] {
+                if (act) act();
+                // Re-run rather than tick the row off: a fix can resolve more
+                // than one finding, or expose the next one.
+                QTimer::singleShot(400, this, &DiagnoseDialog::recheck);
+            });
+            lay->addWidget(go, 0, 2, 2, 1, Qt::AlignVCenter);
+        }
+        lay->setColumnStretch(1, 1);
+        m_list->insertWidget(m_list->count() - 1, card);
+    }
+}
+
+void MainWindow::openDiagnoseDialog()
+{
+    if (!m_diag) m_diag = new DiagnoseDialog(m_shm, this, this);
+    else         m_diag->recheck();
+    m_diag->show();
+    m_diag->raise();
+    m_diag->activateWindow();
+}
+
+// ---------------------------------------------------------------------------
 // Start-at-login. The engine is a systemd user service; the mixer window is a
 // plain XDG autostart entry. They are independent on purpose: most people want
 // the engine always up (otherwise their virtual devices vanish) but not
@@ -1618,11 +2195,14 @@ void AppsDialog::refresh()
 // ---------------------------------------------------------------------------
 static const char* kUnit = "betterbanana-engine.service";
 
-static QString runProc(const QString& prog, const QStringList& args, int* code = nullptr)
+// `msec` is generous for `systemctl restart`, which does not return until the
+// unit has actually come back up.
+static QString runProc(const QString& prog, const QStringList& args,
+                       int* code = nullptr, int msec = 4000)
 {
     QProcess p;
     p.start(prog, args);
-    if (!p.waitForFinished(4000)) { if (code) *code = -1; return QString(); }
+    if (!p.waitForFinished(msec)) { if (code) *code = -1; return QString(); }
     if (code) *code = p.exitCode();
     return QString::fromUtf8(p.readAllStandardOutput()).trimmed();
 }
@@ -1643,6 +2223,31 @@ static void setEngineAutostart(bool on)
 {
     runProc("systemctl", { "--user", on ? "enable" : "disable", kUnit });
 }
+
+// Started by systemd, as opposed to merely having the unit installed. An engine
+// launched by hand while the unit is installed must not be restarted through
+// systemd: that would start a second one alongside the first, and the engine
+// refuses to be the second.
+static bool engineUnitActive()
+{
+    return runProc("systemctl", { "--user", "is-active", kUnit }) == "active";
+}
+
+// Where bb-engine is, for the case where there is no unit to start.
+static QString engineBinary()
+{
+    // Beside this binary first. A build tree and an install prefix both put the
+    // two side by side, and the graphical session's PATH may well not carry
+    // ~/.local/bin.
+    const QString sib = QCoreApplication::applicationDirPath() + "/bb-engine";
+    if (QFileInfo(sib).isExecutable()) return sib;
+    const QString found = QStandardPaths::findExecutable("bb-engine");
+    if (!found.isEmpty()) return found;
+    const QString local = QDir::homePath() + "/.local/bin/bb-engine";
+    return QFileInfo(local).isExecutable() ? local : QString();
+}
+
+static bool pidAlive(pid_t p) { return p > 0 && ::kill(p, 0) == 0; }
 
 static QString guiAutostartPath()
 {
@@ -1692,6 +2297,68 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     m_alert->setVisible(false);
     outer->addWidget(m_alert);
 
+    // And a second one for the condition that is not a fault but a loss: the
+    // engine restarted underneath the window and took the mix with it. This one
+    // carries its own answer, and is deliberately not a modal dialog - it can
+    // appear while a call or a game is in the foreground.
+    m_offer = new QFrame;
+    m_offer->setProperty("role", "offer");
+    m_offer->setVisible(false);
+    {
+        auto* lay = new QHBoxLayout(m_offer);
+        lay->setContentsMargins(bbui::px(10), bbui::px(6), bbui::px(6), bbui::px(6));
+        lay->setSpacing(bbui::gapM());
+        m_offerText = new QLabel;
+        m_offerText->setWordWrap(true);
+        lay->addWidget(m_offerText, 1);
+        auto* put = new QPushButton("Put my mix back");
+        put->setProperty("cta", "primary");
+        connect(put, &QPushButton::clicked, this, [this] {
+            const QByteArray keep = m_recovered;
+            m_recovered.clear();
+            m_offer->setVisible(false);
+            if (keep.isEmpty() || !shm_compatible(m_shm)) return;
+            applyState(keep);
+            say("Your mix is back", 6000);
+        });
+        lay->addWidget(put);
+        auto* keep = new QPushButton("Keep this one");
+        connect(keep, &QPushButton::clicked, this, [this] {
+            m_recovered.clear();
+            m_offer->setVisible(false);
+        });
+        lay->addWidget(keep);
+    }
+    outer->addWidget(m_offer);
+
+    // The preset bar. Loading a preset used to mean Ctrl+O and a file dialog,
+    // which is a lot of ceremony for something switched several times an
+    // evening - "screen share" is a different mix from "listening to music".
+    m_presetBar = new QWidget;
+    m_presetLay = new QHBoxLayout(m_presetBar);
+    m_presetLay->setContentsMargins(0, 0, 0, 0);
+    m_presetLay->setSpacing(bbui::gapS());
+    outer->addWidget(m_presetBar);
+
+    // Presets saved from bb-ctl in another terminal show up here too.
+    QDir().mkpath(QString::fromStdString(presets_path()));
+    m_presetWatch = new QFileSystemWatcher(this);
+    m_presetWatch->addPath(QString::fromStdString(presets_path()));
+    connect(m_presetWatch, &QFileSystemWatcher::directoryChanged, this,
+            [this] { rebuildPresetBar(); });
+
+    // Ctrl+1..9 follow the bar's own order, so what the eye reads left to right
+    // is what the fingers count.
+    for (int i = 0; i < 9; ++i) {
+        auto* sc = new QShortcut(QKeySequence(QString("Ctrl+%1").arg(i + 1)), this);
+        connect(sc, &QShortcut::activated, this, [this, i] {
+            if (i >= m_presetOrder.size()) return;
+            const QString name = m_presetOrder[i];
+            if (loadPresetFile(QString::fromStdString(preset_path_for(name.toStdString()))))
+                say("Loaded \"" + name + "\"");
+        });
+    }
+
     auto* row = new QHBoxLayout;
     row->setSpacing(bbui::gapM());
 
@@ -1730,6 +2397,8 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
                     applyDeviceEq(idx, n);
                 });
         connect(w, &BusWidget::eqEditRequested, this, &MainWindow::openBusEq);
+        connect(w, &BusWidget::statusMessage, this,
+                [this](const QString& t) { say(t, 7000); });
         m_buses.push_back(w);
         outRow->addWidget(w);
         if (b == kPhysBuses - 1) outRow->addSpacing(bbui::gapM() + 2);
@@ -1809,6 +2478,9 @@ MainWindow::MainWindow(Shared* shm, QWidget* parent)
     // point, so the first Ctrl+Z comes back here rather than nowhere.
     m_committed = m_seen = QByteArray::fromStdString(preset_serialize(m_shm));
     refreshUndoActions();
+
+    rebuildPresetBar();
+    setPresetBarVisible(QSettings("betterbanana", "gui").value("presetBar", true).toBool());
 
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
@@ -2066,56 +2738,13 @@ void MainWindow::populateAnalyzerMenu(QMenu* menu)
 void MainWindow::buildMenus()
 {
     auto* file = menuBar()->addMenu("&Preset");
-    file->addAction("&Save preset...", QKeySequence("Ctrl+S"), this, [this] {
-        QDir().mkpath(QString::fromStdString(presets_path()));
-        QString f = QFileDialog::getSaveFileName(this, "Save preset",
-                        QString::fromStdString(presets_path()), "Presets (*.bbp)");
-        if (f.isEmpty()) return;
-        if (!f.endsWith(".bbp")) f += ".bbp";
-        if (!save_preset(m_shm, f.toUtf8().constData())) {
-            QMessageBox::warning(this, "BetterBanana", "Could not write " + f);
-            return;
-        }
-        m_presetName = QFileInfo(f).completeBaseName();
-        m_dirty = false;
-        refreshTitle();
-        say("Saved " + f);
-        // Asked once, and only while nothing is set: the engine starts with a
-        // default mixer until something is chosen, which is worth saying out
-        // loud the first time rather than leaving to be discovered.
-        if (!startup_preset_name().empty()) return;
-        const QString name = QFileInfo(f).completeBaseName();
-        if (QMessageBox::question(this, "BetterBanana",
-                QString("Load \"%1\" whenever the audio engine starts?\n\n"
-                        "Nothing is set at the moment, so the engine currently "
-                        "comes up with a default mixer. You can change this "
-                        "later under Preset -> Load on startup.").arg(name))
-            != QMessageBox::Yes) return;
-        set_startup_preset_name(QFileInfo(f).absoluteFilePath() ==
-                                QString::fromStdString(preset_path_for(name.toStdString()))
-                                ? name.toStdString()
-                                : f.toStdString());
-        say("\"" + name + "\" will load when the engine starts", 6000);
-    });
+    file->addAction("&Save preset...", QKeySequence("Ctrl+S"), this,
+                    &MainWindow::savePresetAs);
     file->addAction("&Load preset...", QKeySequence("Ctrl+O"), this, [this] {
         const QString f = QFileDialog::getOpenFileName(this, "Load preset",
                               QString::fromStdString(presets_path()), "Presets (*.bbp)");
         if (f.isEmpty()) return;
-        if (load_preset(m_shm, f.toUtf8().constData())) {
-            m_shm->cmd.store(kCmdVbanReload);
-            m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
-            for (auto* s : m_strips) s->pullFromShm();
-            for (auto* b : m_buses)  b->pullFromShm();
-            m_presetName = QFileInfo(f).completeBaseName();
-            m_dirty = false;
-            refreshTitle();
-            say("Loaded " + f);
-            // The engine re-finds a device whose node name moved on its next
-            // control poll, so give it one before reporting what is missing.
-            QTimer::singleShot(800, this, &MainWindow::reportMissingDevices);
-        } else {
-            say("Could not read " + f, 6000);
-        }
+        if (loadPresetFile(f)) say("Loaded " + f);
     });
     file->addSeparator();
     auto* startup = file->addMenu("Load on &startup");
@@ -2175,6 +2804,13 @@ void MainWindow::buildMenus()
     for (int b = 0; b < kBuses; ++b)
         eqMenu->addAction(labelFor(m_shm, false, b, kBusLabel[b]) + "...",
                           this, [this, b] { openBusEq(b); });
+    eng->addAction("&Time alignment...", QKeySequence("Ctrl+T"), this, &MainWindow::openAlignDialog)
+       ->setToolTip("Line up outputs that do not arrive at the same moment");
+    eng->addAction("Reset &loudness measurement", this, [this] {
+        m_shm->cmd.store(kCmdResetLoudness);
+        m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+        say("Integrated loudness measurement restarted");
+    });
     eng->addAction("Sidechain &ducking...", QKeySequence("Ctrl+D"), this, &MainWindow::openDuckDialog);
     eng->addAction("&VBAN streams...", QKeySequence("Ctrl+B"), this, &MainWindow::openVbanDialog);
 
@@ -2182,6 +2818,19 @@ void MainWindow::buildMenus()
     mic->setToolTip("Measure a microphone and be told which control to change");
     connect(mic, &QMenu::aboutToShow, this, [this, mic] { populateAnalyzerMenu(mic); });
     populateAnalyzerMenu(mic);
+    eng->addSeparator();
+
+    eng->addAction("&Check this setup...", this, &MainWindow::openDiagnoseDialog)
+       ->setToolTip("Look for the mistakes that do not look like mistakes");
+    m_restartAct = eng->addAction("&Restart audio engine...", this,
+                                  &MainWindow::restartEngine);
+    m_restartAct->setToolTip("Stop and start the mixing process. The first thing to "
+                             "try when the audio graph gets stuck");
+    // Deliberately no shortcut: this one stops the sound for a moment.
+    connect(eng, &QMenu::aboutToShow, this, [this] {
+        m_restartAct->setText(m_engineLive ? "&Restart audio engine..."
+                                           : "&Start audio engine...");
+    });
     eng->addSeparator();
 
     auto* boot = eng->addMenu("Start at &login");
@@ -2209,6 +2858,11 @@ void MainWindow::buildMenus()
     eng->addAction("&Quit GUI", QKeySequence("Ctrl+Q"), this, [this] { close(); });
 
     auto* view = menuBar()->addMenu("&View");
+    m_presetBarAct = view->addAction("&Preset bar", this,
+                                     [this](bool on) { setPresetBarVisible(on); });
+    m_presetBarAct->setCheckable(true);
+    m_presetBarAct->setToolTip("One button per saved preset across the top, Ctrl+1..9 to match");
+    view->addSeparator();
     {   // A preference on top of the compositor's scale, not a HiDPI fix.
         auto* zoom = view->addMenu("Interface &size");
         auto* zg = new QActionGroup(this);
@@ -2436,6 +3090,490 @@ void MainWindow::refreshUndoActions()
     if (m_redoAct) m_redoAct->setEnabled(!m_redo.isEmpty());
 }
 
+// The mixer really did change, and it now matches whatever it was changed to.
+// Loading a preset and restarting the engine both mean this, and both used to
+// leave the snapshot behind: the next tick found a state nobody had committed,
+// recorded it as a change, and marked the title dirty - so loading "Screen
+// share" showed "Screen share *" half a second later.
+void MainWindow::commitAsSettled()
+{
+    m_undo.append(m_committed);
+    if (m_undo.size() > kUndoDepth) m_undo.removeFirst();
+    m_redo.clear();
+    m_committed = m_seen = QByteArray::fromStdString(preset_serialize(m_shm));
+    refreshUndoActions();
+}
+
+// ---------------------------------------------------------------------------
+// The preset bar.
+//
+// One button per saved preset across the top, the loaded one lit, Ctrl+1..9 in
+// the same order. Presets are how a mixer this size is actually used - a mix
+// for a call is not a mix for music - and reaching them through a file dialog
+// made switching feel like filing rather than like a control.
+// ---------------------------------------------------------------------------
+bool MainWindow::loadPresetFile(const QString& path)
+{
+    if (!load_preset(m_shm, path.toUtf8().constData())) {
+        say("Could not read " + path, 6000);
+        return false;
+    }
+    m_shm->cmd.store(kCmdVbanReload);
+    m_shm->cmd_seq.fetch_add(1, std::memory_order_release);
+    for (auto* w : m_strips) w->pullFromShm();
+    for (auto* w : m_buses)  w->pullFromShm();
+    readRouting();
+    m_presetName = QFileInfo(path).completeBaseName();
+    m_dirty = false;
+    commitAsSettled();
+    refreshTitle();
+    rebuildPresetBar();                 // the lit button moves
+    // The engine re-finds a device whose node name moved on its next control
+    // poll, so give it one before reporting what is missing.
+    QTimer::singleShot(800, this, &MainWindow::reportMissingDevices);
+    return true;
+}
+
+void MainWindow::savePresetAs()
+{
+    QDir().mkpath(QString::fromStdString(presets_path()));
+    QString f = QFileDialog::getSaveFileName(this, "Save preset",
+                    QString::fromStdString(presets_path()), "Presets (*.bbp)");
+    if (f.isEmpty()) return;
+    if (!f.endsWith(".bbp")) f += ".bbp";
+    if (!save_preset(m_shm, f.toUtf8().constData())) {
+        QMessageBox::warning(this, "BetterBanana", "Could not write " + f);
+        return;
+    }
+    m_presetName = QFileInfo(f).completeBaseName();
+    m_dirty = false;
+    refreshTitle();
+    rebuildPresetBar();
+    say("Saved " + f);
+    // Asked once, and only while nothing is set: the engine starts with a
+    // default mixer until something is chosen, which is worth saying out
+    // loud the first time rather than leaving to be discovered.
+    if (!startup_preset_name().empty()) return;
+    const QString name = QFileInfo(f).completeBaseName();
+    if (QMessageBox::question(this, "BetterBanana",
+            QString("Load \"%1\" whenever the audio engine starts?\n\n"
+                    "Nothing is set at the moment, so the engine currently "
+                    "comes up with a default mixer. You can change this "
+                    "later under Preset -> Load on startup.").arg(name))
+        != QMessageBox::Yes) return;
+    set_startup_preset_name(QFileInfo(f).absoluteFilePath() ==
+                            QString::fromStdString(preset_path_for(name.toStdString()))
+                            ? name.toStdString()
+                            : f.toStdString());
+    say("\"" + name + "\" will load when the engine starts", 6000);
+}
+
+// Right-clicking a preset button. The three things wanted often enough to be
+// worth not opening a file manager for: update it, make it the one the engine
+// comes up with, and get rid of it.
+void MainWindow::presetMenu(QWidget* anchor, const QString& name,
+                            const QString& path, const QPoint& pos)
+{
+    const bool isStartup = QString::fromStdString(startup_preset_name()) == name;
+
+    QMenu m;
+    m.addAction("&Load", this, [this, name, path] {
+        if (loadPresetFile(path)) say("Loaded \"" + name + "\"");
+    });
+    m.addAction("&Overwrite with the current mix", this, [this, name, path] {
+        if (QMessageBox::question(this, "BetterBanana",
+                QString("Replace \"%1\" with the mixer as it is now?").arg(name))
+            != QMessageBox::Yes) return;
+        if (!save_preset(m_shm, path.toUtf8().constData())) {
+            QMessageBox::warning(this, "BetterBanana", "Could not write " + path);
+            return;
+        }
+        m_presetName = name;
+        m_dirty = false;
+        refreshTitle();
+        rebuildPresetBar();
+        say("\"" + name + "\" updated");
+    });
+    QAction* boot = m.addAction("Load when the engine &starts", this,
+                                [this, name, isStartup] {
+        set_startup_preset_name(isStartup ? std::string() : name.toStdString());
+        say(isStartup ? "The engine will start with a default mixer"
+                      : "\"" + name + "\" will load when the engine starts", 6000);
+    });
+    boot->setCheckable(true);
+    boot->setChecked(isStartup);
+    m.addSeparator();
+    QAction* del = m.addAction("&Delete...", this, [this, name, path, isStartup] {
+        if (QMessageBox::question(this, "BetterBanana",
+                QString("Delete the preset \"%1\"?%2\n\nThe mixer keeps playing "
+                        "exactly as it is; only the saved file goes.")
+                    .arg(name, isStartup
+                        ? "\n\nIt is also what the engine loads at startup, so "
+                          "that choice is cleared and the engine will come up with "
+                          "a default mixer."
+                        : ""))
+            != QMessageBox::Yes) return;
+        if (!QFile::remove(path)) {
+            QMessageBox::warning(this, "BetterBanana", "Could not delete " + path);
+            return;
+        }
+        // A startup marker pointing at a file that is gone makes the engine log
+        // a failure and come up default without ever saying why.
+        if (isStartup) set_startup_preset_name(std::string());
+        // The name stays in the title: the mixer is still set up that way, it
+        // just no longer has a file to go back to. Hence the asterisk.
+        if (m_presetName == name) { m_dirty = true; refreshTitle(); }
+        rebuildPresetBar();
+        say("Deleted \"" + name + "\"");
+    });
+    del->setProperty("cta", "danger");
+    m.exec(anchor->mapToGlobal(pos));
+}
+
+void MainWindow::setPresetBarVisible(bool on)
+{
+    QSettings("betterbanana", "gui").setValue("presetBar", on);
+    if (m_presetBarAct) m_presetBarAct->setChecked(on);
+    if (m_presetBar) m_presetBar->setVisible(on);
+}
+
+void MainWindow::rebuildPresetBar()
+{
+    if (!m_presetLay) return;
+    while (QLayoutItem* it = m_presetLay->takeAt(0)) {
+        if (QWidget* w = it->widget()) w->deleteLater();
+        delete it;
+    }
+    m_presetOrder.clear();
+
+    const QString dir = QString::fromStdString(presets_path());
+    const QStringList files = QDir(dir).entryList({ "*.bbp" }, QDir::Files, QDir::Name);
+
+    auto* cap = new QLabel("PRESET");
+    cap->setProperty("role", "caption");
+    m_presetLay->addWidget(cap);
+
+    if (files.isEmpty()) {
+        auto* none = new QLabel("nothing saved yet");
+        none->setProperty("role", "caption");
+        m_presetLay->addWidget(none);
+    }
+
+    // Nine, because that is how many Ctrl+<digit> there are. The rest stay
+    // reachable through Preset -> Load.
+    const int shown = qMin(files.size(), 9);
+    for (int i = 0; i < shown; ++i) {
+        const QString name = QFileInfo(files[i]).completeBaseName();
+        m_presetOrder << name;
+        auto* b = new QPushButton(name);
+        b->setProperty("role", "preset");
+        b->setCheckable(true);
+        b->setChecked(name == m_presetName);
+        b->setToolTip(QString("Load \"%1\"   (Ctrl+%2)\nRight-click for more")
+                          .arg(name).arg(i + 1));
+        const QString path = QString::fromStdString(preset_path_for(name.toStdString()));
+        connect(b, &QPushButton::clicked, this, [this, name, path] {
+            if (loadPresetFile(path)) say("Loaded \"" + name + "\"");
+            else rebuildPresetBar();            // put the lit button back
+        });
+        b->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(b, &QPushButton::customContextMenuRequested, this,
+                [this, b, name, path](const QPoint& pos) { presetMenu(b, name, path, pos); });
+        m_presetLay->addWidget(b);
+    }
+    if (files.size() > shown) {
+        auto* more = new QLabel(QString("+%1 more").arg(files.size() - shown));
+        more->setProperty("role", "caption");
+        more->setToolTip("Preset -> Load preset... reaches all of them");
+        m_presetLay->addWidget(more);
+    }
+
+    m_presetLay->addStretch(1);
+    auto* add = new QPushButton("Save as...");
+    add->setProperty("role", "preset");
+    add->setToolTip("Save the mixer as it is now under a new name");
+    connect(add, &QPushButton::clicked, this, [this] { savePresetAs(); });
+    m_presetLay->addWidget(add);
+}
+
+// ---------------------------------------------------------------------------
+// Restarting the engine from inside the mixer.
+//
+// It lives here, next to the undo machinery, because a restart has to leave
+// that machinery consistent: the mix as it was before is either put straight
+// back, or becomes exactly one undo step.
+//
+// The shared segment is deliberately never unlinked (see engine.cpp), so this
+// window's mapping stays valid across the bounce and there is nothing to
+// re-attach. What does NOT survive is the mix: the engine loads the startup
+// preset and writes nothing on exit, so without carrying the state across by
+// hand a restart would silently revert to whatever Preset -> Load on startup
+// names. Hence the checkbox - and hence the state is captured before anything
+// is stopped, since by the time it is wanted back the engine has zeroed the
+// segment.
+//
+// The meter timer is stopped for the duration rather than left running, and the
+// polling below reads only magic, version, struct_size, the pid and the
+// heartbeat - the fields at the top of Shared, which have never moved. A
+// rebuilt engine may lay Shared out differently and ftruncate the segment
+// SMALLER, and reading a field past the end of a shrunk mapping is a SIGBUS
+// rather than a wrong number, so the layout is checked before anything else
+// is touched.
+// ---------------------------------------------------------------------------
+void MainWindow::restartEngine()
+{
+    if (m_restarting) return;
+
+    const pid_t old = (pid_t)m_shm->engine_pid.load();
+    const bool live = m_engineLive && pidAlive(old);
+
+    QMessageBox ask(this);
+    ask.setWindowTitle("BetterBanana");
+    ask.setIcon(QMessageBox::Question);
+    ask.setText(live ? "<b>Restart the audio engine?</b>"
+                     : "<b>Start the audio engine?</b>");
+    ask.setInformativeText(live
+        ? "Sound stops for a second or two. BetterBanana's virtual devices leave "
+          "the graph and come back, so anything playing into one needs a moment - "
+          "and an application that was pointed at a BetterBanana device by hand, "
+          "rather than by a remembered rule, may land somewhere else.\n\n"
+          "This window keeps running."
+        : "Nothing is being mixed at the moment. Starting the engine puts the "
+          "virtual devices back into the graph.");
+    QCheckBox* keep = nullptr;
+    if (live) {
+        keep = new QCheckBox("Put the current mix back afterwards");
+        keep->setChecked(true);
+        keep->setToolTip("Otherwise the engine comes up with the preset named under "
+                         "Preset -> Load on startup");
+        ask.setCheckBox(keep);                      // takes ownership
+    }
+    QPushButton* go = ask.addButton(live ? "Restart" : "Start", QMessageBox::AcceptRole);
+    go->setProperty("cta", "primary");
+    ask.addButton("Cancel", QMessageBox::RejectRole);
+    ask.setDefaultButton(go);
+    ask.exec();
+    if (ask.clickedButton() != go) return;
+
+    const bool restore = live && keep->isChecked();
+    // Read while the engine is still up and the segment still says what the
+    // mixer looks like.
+    const QByteArray before = QByteArray::fromStdString(preset_serialize(m_shm));
+
+    const bool unit       = engineUnitInstalled();
+    const bool viaSystemd = unit && engineUnitActive();
+    // Resolved before anything is stopped. Discovering there is nothing to
+    // start only after the engine has been killed leaves the machine silent.
+    const QString bin = unit ? QString() : engineBinary();
+    if (!unit && bin.isEmpty()) {
+        QMessageBox::warning(this, "BetterBanana",
+            "bb-engine cannot be found, and there is no service to start it.\n\n"
+            "Nothing was changed. Run 'make install' so the systemd user unit "
+            "exists, or put bb-engine on PATH.");
+        return;
+    }
+
+    // Puts back everything the wait below disturbs, however this returns.
+    struct Busy {
+        MainWindow* w;
+        bool resumeTimer = true;
+        ~Busy() {
+            hold_health_watchdog(0);
+            QGuiApplication::restoreOverrideCursor();
+            w->menuBar()->setEnabled(true);
+            w->m_restarting = false;
+            // Adopt the new engine as the one being watched, or the tick after
+            // this would report the restart the user just asked for as one that
+            // happened behind their back.
+            w->m_enginePid = w->m_shm->engine_pid.load();
+            if (!resumeTimer) return;
+            // The counter restarted from zero, so re-prime the stall detector
+            // rather than let it read one fresh heartbeat as a stalled one.
+            w->m_lastHeartbeat = w->m_shm->engine_heartbeat.load();
+            w->m_stallTicks = 0;
+            w->m_timer->start(33);
+        }
+    } busy{this};
+
+    m_restarting = true;
+    m_timer->stop();
+    // This restart was asked for, so it is not the loss the banner is about.
+    m_recovered.clear();
+    m_offer->setVisible(false);
+    menuBar()->setEnabled(false);
+    QGuiApplication::setOverrideCursor(Qt::BusyCursor);
+    // bb-health repairs exactly the symptom this is about to produce. Left to
+    // itself it would race: restart the engine a second time, then put its own
+    // last-known-good snapshot back over the mix restored below.
+    hold_health_watchdog(45);
+    m_alert->setText(live ? "Restarting the audio engine..."
+                          : "Starting the audio engine...");
+    m_alert->setVisible(true);
+
+    // processEvents returns as soon as the queue is empty, so on its own the
+    // polling below would be a spin. The window is frozen anyway.
+    auto settle = [] {
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 20);
+        QThread::msleep(30);
+    };
+    settle();
+
+    int code = 0;
+    if (viaSystemd) {
+        // systemctl restart does not return until the unit is back up.
+        runProc("systemctl", { "--user", "restart", kUnit }, &code, 45000);
+    } else {
+        if (pidAlive(old)) {
+            ::kill(old, SIGTERM);
+            QElapsedTimer t; t.start();
+            while (t.elapsed() < 5000 && pidAlive(old)) settle();
+            if (pidAlive(old)) {
+                QMessageBox::warning(this, "BetterBanana",
+                    QString("The running engine (pid %1) did not stop, so it was "
+                            "left alone.\n\nStop it by hand and try again:\n"
+                            "    bb-ctl quit").arg(old));
+                return;
+            }
+        }
+        // An engine started by hand while the unit exists is stopped above and
+        // restarted through systemd, which is where it should have been.
+        if (unit) runProc("systemctl", { "--user", "start", kUnit }, &code, 45000);
+        else      code = QProcess::startDetached(bin, {}) ? 0 : 1;
+    }
+
+    // Wait for a different, living engine to claim the segment, then for it to
+    // start mixing. The pid is written before PipeWire is even connected; the
+    // heartbeat only moves once the graph is running, and by then the engine
+    // has finished loading its own startup preset - so the write below cannot
+    // race it.
+    QElapsedTimer t; t.start();
+    pid_t fresh = 0;
+    while (code == 0 && t.elapsed() < 15000) {
+        const pid_t p = (pid_t)m_shm->engine_pid.load();
+        if (p > 0 && p != old && pidAlive(p)) { fresh = p; break; }
+        settle();
+    }
+    bool ticking = false;
+    const uint32_t h0 = m_shm->engine_heartbeat.load();
+    while (fresh && t.elapsed() < 25000) {
+        if (m_shm->engine_heartbeat.load() != h0) { ticking = true; break; }
+        settle();
+    }
+    if (!ticking) {
+        m_alert->setText("The audio engine did not come back.");
+        // An engine that got as far as reinitialising the segment and then died
+        // has already replaced the mix with its own defaults, so putting it back
+        // is what makes the sentence below true.
+        const bool kept = restore && shm_compatible(m_shm);
+        if (kept) applyState(before);
+        QMessageBox::warning(this, "BetterBanana",
+            QString("The engine did not come back.%1\n\nWhat stopped it is in "
+                    "its log:\n    systemctl --user status betterbanana-engine\n"
+                    "    journalctl --user -u betterbanana-engine -n 50")
+                .arg(kept ? "\n\nYour mix is still in this window, and "
+                            "Preset -> Save preset will write it out." : ""));
+        return;
+    }
+
+    // A rebuilt engine can speak a different protocol, and everything from here
+    // on reads past the header. Checked before any of it.
+    if (!shm_compatible(m_shm)) {
+        busy.resumeTimer = false;           // never tick against this mapping again
+        QMessageBox box(this);
+        box.setWindowTitle("BetterBanana");
+        box.setIcon(QMessageBox::Warning);
+        box.setText("<b>The engine that came back is a different build.</b>");
+        box.setInformativeText(
+            QString("It speaks protocol v%1 and this window speaks v%2, so the "
+                    "window has to be reopened before it can be trusted with "
+                    "what the engine says.")
+                .arg(m_shm->version.load()).arg(kVersion));
+        QPushButton* again = box.addButton("Reopen the mixer", QMessageBox::AcceptRole);
+        again->setProperty("cta", "primary");
+        box.addButton("Quit", QMessageBox::RejectRole);
+        box.setDefaultButton(again);
+        box.exec();
+        saveWindowGeometry();
+        if (box.clickedButton() == again)   // carry the flags forward
+            QProcess::startDetached(QApplication::applicationFilePath(),
+                                    QApplication::arguments().mid(1));
+        qApp->quit();
+        return;
+    }
+
+    // Every node in the graph is new, so both device lists are stale. Done
+    // before the state is written back, so the routing below has something to
+    // select from.
+    refreshDevices();
+
+    if (restore) {
+        // The mixer ends up where it started, so there is nothing to record.
+        // applyState adopts this as the settled state, which is what stops the
+        // next snapshot from reporting the round trip as a change.
+        applyState(before);
+    } else {
+        // The mixer really did change, to whatever the startup preset says.
+        // `before` rather than m_committed: the two are the same here, but this
+        // is the state the dialog promised was recoverable.
+        m_committed = before;
+        commitAsSettled();
+        const std::string want = startup_preset_name();
+        m_presetName = want.empty()
+            ? QString()
+            : QFileInfo(QString::fromStdString(want)).completeBaseName();
+        m_dirty = false;
+        refreshTitle();
+        for (auto* w : m_strips) w->pullFromShm();
+        for (auto* w : m_buses)  w->pullFromShm();
+        readRouting();
+    }
+
+    m_alert->setVisible(false);
+    m_alert->setText(QString());
+    refreshCardStates();
+    const QString what = QString("Audio engine %1 (pid %2)")
+                             .arg(live ? "restarted" : "started").arg(fresh);
+    say(restore            ? what + ", and your mix is back"
+        : m_presetName.isEmpty() ? what + " with a default mixer"
+                                 : what + QString(" from \"%1\"").arg(m_presetName),
+        8000);
+    // The engine re-finds a device on its next control poll, so give it one
+    // before anything is reported as missing.
+    QTimer::singleShot(1500, this, &MainWindow::reportMissingDevices);
+}
+
+// The other half of the restart story: an engine that came back without being
+// asked. The unit is PartOf=pipewire.service so a PipeWire restart takes the
+// engine with it, and the watchdog restarts it whenever its nodes leave the
+// graph. Either way what comes back is the startup preset - a choice made once,
+// not what was actually set up - and until now that happened silently.
+//
+// Neither accepting it nor undoing it on the user's behalf is right, so the
+// window says what happened and puts the answer next to it.
+void MainWindow::offerRecoveredMix()
+{
+    if (m_recovered.isEmpty() || m_restarting) return;
+    if (!shm_compatible(m_shm)) { m_recovered.clear(); return; }
+
+    // Every node in the graph is new, so the device lists are stale whether or
+    // not anything turns out to have been lost. Before the messages below,
+    // which it would otherwise overwrite.
+    refreshDevices();
+
+    const QByteArray now = QByteArray::fromStdString(preset_serialize(m_shm));
+    if (now == m_recovered) {           // it came back exactly where it was
+        m_recovered.clear();
+        say("The audio engine restarted. Your mix came back unchanged.", 6000);
+        return;
+    }
+    m_offerText->setText("The audio engine restarted on its own, and came back with "
+                         "its startup preset. The mix you had is one click away.");
+    m_offer->setVisible(true);
+    // The banner is easy to miss on a window that was not in front, so the
+    // status bar carries it as well.
+    say("The audio engine restarted - your previous mix can be put back", 12000);
+}
+
 // Settings a strip is told to remember follow the microphone, not the slot:
 // plug the same interface into another strip and its gate, compressor and EQ
 // come with it. Only a real change of the combo reaches here.
@@ -2598,6 +3736,29 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
 
 void MainWindow::tick()
 {
+    // restartEngine() stops this timer, but an event already queued when it did
+    // would still arrive - and everything below reads a segment that is being
+    // reinitialised, possibly by a build that lays it out differently.
+    if (m_restarting) return;
+
+    // Did the engine get replaced without being asked? The pid is the only
+    // honest witness: the heartbeat stall takes a second to declare, by which
+    // time a replacement engine has already reinitialised the segment, and the
+    // mix that was in it is gone. Checked before the snapshot below, so
+    // m_committed still holds the mixer as it was rather than as it now is.
+    {
+        const int pid = m_shm->engine_pid.load();
+        if (pid > 0 && m_enginePid > 0 && pid != m_enginePid) {
+            // A second restart while an offer is still standing must not
+            // replace the mix being offered with the preset that replaced it.
+            if (m_recovered.isEmpty()) m_recovered = m_committed;
+            // Let the new engine load its own startup preset and publish its
+            // nodes before deciding anything was actually lost.
+            QTimer::singleShot(2000, this, &MainWindow::offerRecoveredMix);
+        }
+        if (pid > 0) m_enginePid = pid;
+    }
+
     if (++m_ruleTicks >= 30) { m_ruleTicks = 0; applyAppRules(); }
     // If a pactl round somehow neither finishes nor errors, the busy flag would
     // latch and application routing would stop for the life of the window.
@@ -2631,8 +3792,9 @@ void MainWindow::tick()
     if (live != m_engineLive) {
         m_engineLive = live;
         m_alert->setText(live ? QString()
-                              : "The audio engine has stopped responding. "
-                                "Nothing you change here is reaching it.");
+                              : "The audio engine has stopped responding. Nothing "
+                                "you change here is reaching it - try Engine \u2192 "
+                                "Restart audio engine.");
         m_alert->setVisible(!live);
         refreshCardStates();
     }

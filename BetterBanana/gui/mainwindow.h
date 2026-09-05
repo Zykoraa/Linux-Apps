@@ -121,6 +121,7 @@ public:
 signals:
     void routingChanged(int busIndex, const QString& nodeName);
     void eqEditRequested(int busIndex);
+    void statusMessage(const QString& text);
 
 private:
     bb::Shared* m_shm;
@@ -129,11 +130,13 @@ private:
     bool  m_missing = false;
 
     QComboBox*   m_device = nullptr;
+    QComboBox*   m_mode   = nullptr;   // A buses only; B1/B2 are always stereo
     QPushButton* m_eq     = nullptr;
     QPushButton* m_mono   = nullptr;
     QPushButton* m_mute   = nullptr;
     Fader*       m_fader  = nullptr;
     QLabel*      m_gainLbl = nullptr;
+    QLabel*      m_lufs   = nullptr;   // short-term loudness, integrated in the tip
     LevelMeter*  m_meter  = nullptr;
     QLabel*      m_header = nullptr;
     EqThumb*     m_thumb  = nullptr;
@@ -248,6 +251,58 @@ private:
     QTimer* m_timer = nullptr;
 };
 
+// What the mixer can check about its own setup.
+//
+// Every check behind this dialog is a mistake that has actually been made on a
+// real machine and taken hours to find, because none of them look like a fault:
+// the mixer keeps running, the meters keep moving, and the audio simply goes
+// somewhere else. They are all cheap to test and impossible to guess at.
+class MainWindow;
+
+// Time alignment. Two output devices almost never have the same latency, and
+// PipeWire already knows the figure for each of them - for a Bluetooth sink it
+// is the codec and link delay, which nothing else can see - so this reads them
+// and offers to hold the early ones back.
+class AlignDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit AlignDialog(bb::Shared* shm, QWidget* parent = nullptr);
+
+private slots:
+    void refresh();
+
+private:
+    void alignOutputs();
+
+    bb::Shared* m_shm;
+    struct Row {
+        QLabel* dev = nullptr;
+        QLabel* lat = nullptr;
+        class QDoubleSpinBox* delay = nullptr;
+        QCheckBox* inc = nullptr;   // outputs only: include this one in an align
+        QString    lastDev;         // so a device CHANGE can reset the tick
+    };
+    Row m_in [bb::kHwStrips];
+    Row m_out[bb::kPhysBuses];
+    QLabel* m_note = nullptr;
+    QTimer* m_timer = nullptr;
+};
+
+class DiagnoseDialog : public QDialog {
+    Q_OBJECT
+public:
+    DiagnoseDialog(bb::Shared* shm, MainWindow* owner, QWidget* parent = nullptr);
+
+public slots:
+    void recheck();
+
+private:
+    bb::Shared* m_shm;
+    MainWindow* m_owner;
+    class QVBoxLayout* m_list = nullptr;
+    QLabel* m_summary = nullptr;
+};
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -259,12 +314,17 @@ public:
     void openStripEq(int strip);
     void openStripFx(int strip);
     void openDuckDialog();
+    void openDiagnoseDialog();
+    void openAlignDialog();
+    // Public because a diagnostic finding offers it as its fix.
+    void restartEngine();
 
 private slots:
     void tick();
     void refreshDevices();
     void applyTheme(int index);
     void refreshAutostart();
+    void offerRecoveredMix();
     void undo();
     void redo();
 
@@ -293,6 +353,15 @@ private:
                            const QString& sinkShort, const QString& sourceOutputs,
                            const QString& sourceShort, bool complete);
     void buildMenus();
+    // Loading, restarting and undo all share one idea: the mixer really did
+    // change, and it now matches the thing it was changed to.
+    void commitAsSettled();
+    bool loadPresetFile(const QString& path);
+    void rebuildPresetBar();
+    void setPresetBarVisible(bool on);
+    void savePresetAs();
+    void presetMenu(QWidget* anchor, const QString& name, const QString& path,
+                    const QPoint& pos);
     // The title carries the loaded preset and whether it has drifted, since on
     // a tiling compositor the title bar may be the only place either shows.
     void refreshTitle();
@@ -319,7 +388,17 @@ private:
     QVector<QAction*> m_themeActions;
     QAction* m_autoEngine = nullptr;
     QAction* m_autoGui = nullptr;
+    QAction* m_restartAct = nullptr;   // says "Start" when nothing is running
+    QAction* m_presetBarAct = nullptr;
+
+    // The preset bar: one lit button per saved preset, Ctrl+1..9 to match.
+    QWidget*                m_presetBar   = nullptr;
+    class QHBoxLayout*      m_presetLay   = nullptr;
+    class QFileSystemWatcher* m_presetWatch = nullptr;
+    QStringList             m_presetOrder;   // what Ctrl+1..9 point at
     AppsDialog* m_apps = nullptr;
+    DiagnoseDialog* m_diag = nullptr;
+    AlignDialog* m_align = nullptr;
     QSet<int>   m_ruledStreams;
     bool        m_ruleBusy = false;
     int         m_ruleWait = 0;
@@ -329,8 +408,20 @@ private:
     QString  m_presetName;        // "" until a preset is loaded or saved
     bool     m_dirty = false;
     bool     m_engineLive = true;
+    // Set while restartEngine() is bouncing the engine: the heartbeat is
+    // expected to stop, so the alarm and the undo recorder both stand down.
+    bool     m_restarting = false;
     QLabel*  m_alert = nullptr;   // the banner across the top when it is not
     QString  m_statusColour;      // so a theme change repaints it and a tick does not
+
+    // An engine that restarts on its own - a PipeWire restart, the watchdog, a
+    // crash - comes back holding the startup preset, which silently discards
+    // whatever was actually set up. The pid is what gives it away, and the last
+    // settled state is what can be offered back.
+    int        m_enginePid = 0;
+    QByteArray m_recovered;
+    class QFrame* m_offer = nullptr;
+    QLabel*       m_offerText = nullptr;
 
     QVector<QByteArray> m_undo, m_redo;
     QByteArray  m_committed;      // the last settled state

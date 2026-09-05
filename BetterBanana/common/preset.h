@@ -15,19 +15,30 @@
 #include <sys/stat.h>
 #include <cstdarg>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 namespace bb {
 
+// 9 added the strip and bus delays, so an alignment survives a restart.
+// 8 added the bus mode, so a bus that drives a surround card comes back as one.
 // 7 added pitch correction to the voice changer. 6 added its reverb. 5 added its independent formant control,
 // 4 the voice changer itself. 3 added the per-strip parametric EQ,
 // and the two strip fields (mono-source fold, limiter ceiling) that had never
 // been written. 2 added the per-band filter type / bypass flag and the bus EQ
 // preamp. All still load: every field a file omits is reset to its default
 // rather than left over from whatever was loaded before.
-constexpr int kPresetVersion = 7;
+constexpr int kPresetVersion = 9;
+
+// The delay line has a fixed ceiling; a preset must not be able to ask for more
+// than it can hold, whether by hand-editing or by coming from a future version.
+inline float clamp_delay(double ms)
+{
+    if (!(ms > 0.0)) return 0.0f;
+    return ms > 500.0 ? 500.0f : (float)ms;
+}
 
 inline std::string preset_dir()
 {
@@ -37,6 +48,33 @@ inline std::string preset_dir()
     return base + "/betterbanana";
 }
 inline std::string presets_path()  { return preset_dir() + "/presets"; }
+
+// ---------------------------------------------------------------------------
+// Standing the watchdog down.
+//
+// A deliberate engine restart takes the virtual nodes out of the graph for a
+// second or two, which is exactly the symptom bb-health exists to repair. Left
+// alone it would race: restart the engine a second time, then put its own
+// last-known-good snapshot back over the mix that was just restored. While the
+// deadline in this file is in the future the watchdog skips its checks.
+//
+// A deadline rather than a flag, so a writer that dies mid-restart releases the
+// watchdog by itself instead of disarming it until the next login.
+// ---------------------------------------------------------------------------
+inline std::string health_inhibit_path() { return preset_dir() + "/health-inhibit"; }
+
+// Holds the watchdog off for `seconds` from now; 0 or less releases it.
+inline bool hold_health_watchdog(int seconds)
+{
+    const std::string path = health_inhibit_path();
+    if (seconds <= 0) { ::remove(path.c_str()); return true; }
+    mkdir(preset_dir().c_str(), 0755);
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return false;
+    fprintf(f, "%lld\n", (long long)time(nullptr) + seconds);
+    fclose(f);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // The startup preset.
@@ -231,6 +269,7 @@ inline std::string preset_serialize(const Shared* s)
         detail::addf(out, "strip.%d.mono %d\n", i, p.mono.load());
         detail::addf(out, "strip.%d.monosrc %d\n", i, p.mono_source.load());
         detail::addf(out, "strip.%d.limit %.3f\n", i, p.limit_db.load());
+        detail::addf(out, "strip.%d.delay %.3f\n", i, p.delay_ms.load());
         detail::addf(out, "strip.%d.gate %.3f\n", i, p.gate.load());
         detail::addf(out, "strip.%d.comp %.3f\n", i, p.comp.load());
         detail::addf(out, "strip.%d.aud %.3f\n", i, p.audibility.load());
@@ -254,6 +293,8 @@ inline std::string preset_serialize(const Shared* s)
         detail::addf(out, "bus.%d.gain %.3f\n", b, p.gain_db.load());
         detail::addf(out, "bus.%d.mute %d\n", b, p.mute.load());
         detail::addf(out, "bus.%d.mono %d\n", b, p.mono.load());
+        detail::addf(out, "bus.%d.mode %d\n", b, p.mode.load());
+        detail::addf(out, "bus.%d.delay %.3f\n", b, p.delay_ms.load());
         // "bus.N.eq" is the v1/v2 spelling of the block's on/off flag; it stays
         // so an old preset and a new one mean the same thing.
         detail::addf(out, "bus.%d.eq %d\n", b, p.eq.on.load());
@@ -314,6 +355,8 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
     bool touched_routing = false;
 
     bool bus_band_seen[kBuses][kEqBands] = {}, bus_eq_seen[kBuses] = {}, bus_pre_seen[kBuses] = {};
+    bool bus_mode_seen[kBuses] = {};
+    bool bus_delay_seen[kBuses] = {}, str_delay_seen[kStrips] = {};
     bool str_band_seen[kStrips][kEqBands] = {}, str_eq_seen[kStrips] = {}, str_pre_seen[kStrips] = {};
     bool str_fx_seen[kStrips] = {};
 
@@ -407,6 +450,10 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         else if (keyed("strip.", ".monosrc", i) && i < kStrips) s->strip[i].mono_source.store(atoi(val) ? 1 : 0);
         else if (keyed("strip.", ".mono", i) && i < kStrips) s->strip[i].mono.store(atoi(val));
         else if (keyed("strip.", ".limit", i) && i < kStrips) s->strip[i].limit_db.store(atof(val));
+        else if (keyed("strip.", ".delay", i) && i < kStrips) {
+            s->strip[i].delay_ms.store(clamp_delay(atof(val)));
+            str_delay_seen[i] = true;
+        }
         else if (keyed("strip.", ".gate", i) && i < kStrips) s->strip[i].gate.store(atof(val));
         else if (keyed("strip.", ".comp", i) && i < kStrips) s->strip[i].comp.store(atof(val));
         else if (keyed("strip.", ".aud",  i) && i < kStrips) s->strip[i].audibility.store(atof(val));
@@ -467,6 +514,15 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         else if (keyed("bus.", ".gain", i) && i < kBuses) s->bus[i].gain_db.store(atof(val));
         else if (keyed("bus.", ".mute", i) && i < kBuses) s->bus[i].mute.store(atoi(val));
         else if (keyed("bus.", ".mono", i) && i < kBuses) s->bus[i].mono.store(atoi(val));
+        else if (keyed("bus.", ".delay", i) && i < kBuses) {
+            s->bus[i].delay_ms.store(clamp_delay(atof(val)));
+            bus_delay_seen[i] = true;
+        }
+        else if (keyed("bus.", ".mode", i) && i < kBuses) {
+            const int m = atoi(val);
+            s->bus[i].mode.store(m >= 0 && m < kBusModeCount ? m : kBusNormal);
+            bus_mode_seen[i] = true;
+        }
         else if (keyed("bus.", ".eq",   i) && i < kBuses) {
             s->bus[i].eq.on.store(atoi(val) ? 1 : 0);
             bus_eq_seen[i] = true;
@@ -519,8 +575,18 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         }
     }
 
-    for (int b = 0; b < kBuses; ++b)
+    for (int b = 0; b < kBuses; ++b) {
         if (bus_eq_seen[b]) detail::reset_unseen(s->bus[b].eq, bus_band_seen[b], bus_pre_seen[b]);
+        // A preset written before v8 describes no bus mode, so a bus goes back
+        // to stereo rather than keeping a surround layout from a previous load
+        // and quietly republishing a six-channel node.
+        if (!bus_mode_seen[b]) s->bus[b].mode.store(kBusNormal);
+        // A preset written before v9 describes no delay, so alignment clears
+        // rather than being inherited from whatever was loaded before.
+        if (!bus_delay_seen[b]) s->bus[b].delay_ms.store(0.0f);
+    }
+    for (int i = 0; i < kStrips; ++i)
+        if (!str_delay_seen[i]) s->strip[i].delay_ms.store(0.0f);
     // A preset written before v3 describes no strip EQ at all, so every strip
     // block goes back to flat rather than keeping whatever was there.
     for (int i = 0; i < kStrips; ++i) {

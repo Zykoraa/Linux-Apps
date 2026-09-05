@@ -15,8 +15,15 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 10;
+constexpr uint32_t kVersion    = 11;
 constexpr const char* kShmName = "/betterbanana.state";
+
+// The null sink a screen share transmits. Audio played into it is inaudible in
+// the room by design - it exists to be captured by something else - so it is a
+// legitimate bus target but never somewhere to send an application's playback,
+// and never something to time-align against: the people hearing it are not in
+// the room, and delaying it only makes them wait.
+constexpr const char* kStreamSinkName = "betterbanana_stream";
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
 constexpr int kVirtStrips = 2;                 // BetterBanana VAIO, AUX
@@ -47,12 +54,18 @@ enum EqFilterType : int32_t {
     kEqNotch, kEqBandPass, kEqTypeCount
 };
 
-// Bus modes. The surround variants of the original need >2 channel buses;
-// stereo-only modes are implemented, the rest are reserved.
+// Bus modes. A bus sums its strips in stereo; the mode decides what comes out
+// and how many channels that takes. engine/surround.h holds the layout and the
+// matrix for each one, and asserts that its table still lines up with this list.
+//
+// This used to name the original's modes and implement none of them. Amix and
+// Bmix are gone rather than reserved: they describe mixing one bus into another,
+// which has no counterpart here, and a name with nothing behind it is worse than
+// no name. UpMix61 became 5.1 and 7.1, which is what sound cards actually have.
 enum BusMode : int32_t {
-    kBusNormal = 0, kBusAmix, kBusBmix, kBusRepeat, kBusComposite,
-    kBusTvMix,  kBusUpMix21, kBusUpMix41, kBusUpMix61,
-    kBusCenterOnly, kBusLfeOnly, kBusRearOnly, kBusModeCount
+    kBusNormal = 0, kBusTvMix, kBusRepeat, kBusUpMix21, kBusUpMix41,
+    kBusUpMix51, kBusUpMix71, kBusCenterOnly, kBusLfeOnly, kBusRearOnly,
+    kBusModeCount
 };
 
 // A twelve-band parametric EQ. Buses have had one since v5; input strips gained
@@ -167,6 +180,9 @@ struct StripParams {
     af  pan_x, pan_y;             // -1 .. +1
     ai  mono_source;              // fold a mono capture across both channels
     af  limit_db;                 // output limiter ceiling
+    // Time alignment, 0..500 ms. Applied at the very end of the strip, so every
+    // bus it feeds gets the same delayed signal.
+    af  delay_ms;
     ai  duck_key;                 // this strip's level drives the ducker
     af  duck_depth_db;            // how far this strip drops while ducking (<= 0)
     EqParams eq;                  // the parametric block, after the tone knobs
@@ -177,6 +193,12 @@ struct BusParams {
     af  gain_db;
     ai  mute, mono, sel;
     ai  mode;                     // BusMode
+    // Time alignment, 0..500 ms, applied last of all. This is the one that
+    // matters for listening: two output devices almost never have the same
+    // latency (a Bluetooth headset can sit a quarter of a second behind a USB
+    // interface), and only a delay on the BUS can line them up - a strip feeds
+    // both, so delaying it moves both together.
+    af  delay_ms;
     EqParams eq;
 };
 
@@ -190,6 +212,13 @@ struct Meters {
     ai strip_clip     [kStrips];     // latched; cleared by the GUI
     ai bus_clip       [kBuses];
     af duck_env;                     // 0..1, how open the ducker currently is
+
+    // Loudness, ITU-R BS.1770-4. Peak says whether it will clip; loudness says
+    // how loud it will sound, which is what every streaming platform measures
+    // and what a peak meter cannot tell you. Short-term is the rolling 3 s
+    // window; integrated is gated and runs from the last reset.
+    af bus_lufs_s [kBuses];
+    af bus_lufs_i [kBuses];
 };
 
 // ---------------------------------------------------------------------------
@@ -229,7 +258,7 @@ struct Routing {
 enum Command : int32_t {
     kCmdNone = 0, kCmdReconnect, kCmdResetMeters, kCmdQuit,
     kCmdRecStart, kCmdRecStop, kCmdPlayStart, kCmdPlayStop, kCmdVbanReload,
-    kCmdClearClip
+    kCmdClearClip, kCmdResetLoudness
 };
 
 enum RecState : int32_t { kRecIdle = 0, kRecRecording, kRecPlaying };
@@ -302,6 +331,14 @@ struct Shared {
     au  dsp_load;
     au  engine_heartbeat;         // engine bumps every graph cycle
 
+    // What PipeWire reports for each assigned device, in milliseconds: the
+    // whole chain from this node to the speaker (or from the microphone to
+    // this node). Read rather than measured - the graph already knows, and for
+    // a Bluetooth sink it is the codec and link delay that nothing else can
+    // see. This is what "align the outputs" divides up. -1 = not known yet.
+    af  in_latency_ms [kHwStrips];
+    af  out_latency_ms[kPhysBuses];
+
     StripParams strip[kStrips];
     BusParams   bus[kBuses];
     Meters      meters;
@@ -371,6 +408,12 @@ inline void set_defaults(Shared* s)
     s->samplerate.store(48000.0f);
     s->quantum.store(1024);
     s->dsp_load.store(0);
+    for (int i = 0; i < kHwStrips;  ++i) s->in_latency_ms[i].store(-1.0f);
+    for (int b = 0; b < kPhysBuses; ++b) s->out_latency_ms[b].store(-1.0f);
+    for (int b = 0; b < kBuses; ++b) {
+        s->meters.bus_lufs_s[b].store(-70.0f);
+        s->meters.bus_lufs_i[b].store(-70.0f);
+    }
 
     for (int i = 0; i < kStrips; ++i) {
         StripParams& p = s->strip[i];
@@ -387,6 +430,7 @@ inline void set_defaults(Shared* s)
         p.pan_x.store(0.0f); p.pan_y.store(0.0f);
         p.mono_source.store(0);
         p.limit_db.store(12.0f);
+        p.delay_ms.store(0.0f);
         p.duck_key.store(0);
         p.duck_depth_db.store(0.0f);
         eq_set_defaults(p.eq);
@@ -397,6 +441,7 @@ inline void set_defaults(Shared* s)
         p.gain_db.store(0.0f);
         p.mute.store(0); p.mono.store(0); p.sel.store(b == 0 ? 1 : 0);
         p.mode.store(kBusNormal);
+        p.delay_ms.store(0.0f);
         eq_set_defaults(p.eq);
     }
     routing_write_begin(s->routing);

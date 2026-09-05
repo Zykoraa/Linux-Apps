@@ -255,6 +255,15 @@ QString buildStyleSheet(const Theme& t)
                      "font-weight:bold;padding:6px 10px;border-radius:%4px;}")
                 .arg(c(a), c(onFill(a))).arg(fsBody()).arg(radCtl());
     }
+    {
+        // An offer, not an alarm: something recoverable happened and there is a
+        // button for it. The alert red would read as a fault the user caused.
+        const QColor a = bbcolor::fitFill(t.accent, bbcolor::kTextFloor);
+        s += QString("QFrame[role=\"offer\"]{background:%1;border-radius:%2px;}"
+                     "QFrame[role=\"offer\"] QLabel{background:transparent;color:%3;"
+                     "font-size:%4px;font-weight:bold;}")
+                .arg(c(a)).arg(radCtl()).arg(c(onFill(a))).arg(fsBody());
+    }
 
     // --- text -------------------------------------------------------------
     s += QString("QLabel{background:transparent;color:%1;}").arg(c(t.text));
@@ -333,11 +342,18 @@ QString buildStyleSheet(const Theme& t)
     s += QString("QPushButton[role]:disabled{color:%1;border-color:%1;}").arg(off);
     // Five of these across one card, beside a fader and a meter.
     s += QString("QPushButton[bus]{padding:2px 1px;font-size:%1px;}").arg(fsTiny());
+    // The preset bar carries words rather than two-letter chips, so it takes the
+    // control size and room to breathe instead of the chip metrics above.
+    s += QString("QPushButton[role=\"preset\"]{padding:%1px %2px;font-size:%3px;}")
+            .arg(px(3)).arg(px(9)).arg(fsControl());
 
     struct RoleColour { const char* role; QColor col; };
     const RoleColour roles[] = {
         { "busA", t.busA }, { "busB", t.busB }, { "mute", t.mute }, { "solo", t.solo },
         { "mono", t.mono }, { "eq",   t.eqOn }, { "rec",  t.rec  }, { "accent", t.accent },
+        // The preset bar: the one that is loaded reads as lit, like every other
+        // state in the console.
+        { "preset", t.accent },
         // The off half of the record indicator's pulse. Recording is the one
         // state in this app that is destructive to get wrong, and a static red
         // chip looks the same as a chip that is merely armed.
@@ -358,6 +374,18 @@ QString buildStyleSheet(const Theme& t)
         s += QString("QPushButton[role=\"%1\"]:checked:disabled{background:%2;color:%3;"
                      "border-color:%2;}")
                 .arg(r.role, c(bbcolor::mix(r.col, t.panel, 0.55)), off);
+    }
+
+    // The severity chip in the diagnostics list. Same three colours the console
+    // already uses for "wrong", "watch this" and "here is a thing".
+    s += QString("QLabel[role=\"diagchip\"]{font-size:%1px;font-weight:bold;"
+                 "padding:2px %2px;border-radius:%3px;}")
+            .arg(fsChip()).arg(px(6)).arg(radCtl());
+    for (const RoleColour& r0 : { RoleColour{ "mute", t.mute }, RoleColour{ "solo", t.solo },
+                                  RoleColour{ "accent", t.accent } }) {
+        const QColor col = bbcolor::fitFill(r0.col, bbcolor::kTextFloor);
+        s += QString("QLabel[role=\"diagchip\"][sev=\"%1\"]{background:%2;color:%3;}")
+                .arg(r0.role, c(col), c(onFill(col)));
     }
 
     // Five buses, five hues. All A-buses used to share one colour and all

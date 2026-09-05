@@ -46,6 +46,7 @@ static void scramble(Shared* s)
         p.mono.store(i == 2);
         p.mono_source.store(i == 1);
         p.limit_db.store(6.0f - i);
+        p.delay_ms.store(12.0f * i);
         p.gate.store(0.5f * i);
         p.comp.store(1.25f * i);
         p.audibility.store(0.75f * i);
@@ -96,6 +97,8 @@ static void scramble(Shared* s)
         p.gain_db.store(2.0f * b - 5.0f);
         p.mute.store(b == 1);
         p.mono.store(b == 4);
+        p.mode.store((b + 1) % kBusModeCount);
+        p.delay_ms.store(3.5f * b);
         p.eq.on.store(b != 2);
         p.eq.preamp_db.store(-1.5f * b);
         for (int k = 0; k < kEqBands; ++k) {
@@ -188,6 +191,13 @@ int main()
     chk(blank->strip[3].eq.on.load() == 0, "a strip EQ left off stays off");
     chk(blank->strip[1].mono_source.load() == 1, "mono-source fold round trips");
     near(blank->strip[4].limit_db.load(), 2.0, 1e-3, "limiter ceiling round trips");
+    for (int b = 0; b < kBuses; ++b) {
+        chk(blank->bus[b].mode.load() == (b + 1) % kBusModeCount, "bus mode round trips");
+        near(blank->bus[b].delay_ms.load(), 3.5 * b, 1e-3, "bus delay round trips");
+    }
+    near(blank->strip[2].delay_ms.load(), 24.0, 1e-3, "strip delay round trips");
+    chk(clamp_delay(9999.0) == 500.0f, "a delay past the ceiling is clamped on load");
+    chk(clamp_delay(-5.0) == 0.0f, "and a negative one becomes none");
     near(blank->strip[3].fx.pitch.load(), 3.0, 1e-3, "voice-changer pitch round trips");
     near(blank->strip[3].fx.formant.load(), -0.9, 1e-3, "formant shift round trips");
     chk(blank->strip[3].fx.formant_on.load() == 1, "and its enable flag");
@@ -272,6 +282,48 @@ int main()
         chk(!migrate_autosave(nullptr), "it does not migrate over a cleared choice");
         chk(startup_preset_name().empty(), "which stays cleared");
         unlink(old.c_str());
+    }
+
+    // --- a preset older than the bus mode must clear one, not keep it ---------
+    // Otherwise loading a stereo preset over a 5.1 one leaves the bus quietly
+    // republishing a six-channel node that nothing asked for.
+    {
+        auto old8 = std::make_unique<Shared>();
+        set_defaults(old8.get());
+        old8->bus[0].mode.store(kBusUpMix51);
+        old8->bus[0].delay_ms.store(120.0f);
+        chk(preset_deserialize(old8.get(),
+                "betterbanana-preset 7\nbus.0.gain 0.000\n"),
+            "a preset from before the bus mode loads");
+        chk(old8->bus[0].mode.load() == kBusNormal,
+            "and puts the bus back to stereo rather than leaving it in surround");
+        chk(old8->bus[0].delay_ms.load() == 0.0f,
+            "and clears an alignment it does not describe");
+    }
+
+    // --- standing the watchdog down -------------------------------------------
+    // bb-health reads this file with float(), so the format is part of the
+    // contract and not just an implementation detail: a bare unix deadline,
+    // nothing else on the line.
+    {
+        const std::string p = health_inhibit_path();
+        chk(p == preset_dir() + "/health-inhibit", "the marker has a fixed name");
+
+        chk(hold_health_watchdog(45), "the watchdog can be held off");
+        FILE* f = fopen(p.c_str(), "r");
+        chk(f != nullptr, "which writes the marker");
+        long long deadline = -1;
+        char extra[64] = {};
+        const int got = f ? fscanf(f, "%lld%63s", &deadline, extra) : 0;
+        if (f) fclose(f);
+        chk(got >= 1, "holding a number bb-health can parse");
+        chk(extra[0] == '\0', "and nothing else on the line");
+        chk(deadline > (long long)time(nullptr), "with the deadline in the future");
+        chk(deadline <= (long long)time(nullptr) + 45, "and no further out than asked");
+
+        chk(hold_health_watchdog(0), "and released again");
+        chk(fopen(p.c_str(), "r") == nullptr, "which removes the marker");
+        chk(hold_health_watchdog(0), "releasing twice is not an error");
     }
 
     // --- per-device strip snapshots -------------------------------------------

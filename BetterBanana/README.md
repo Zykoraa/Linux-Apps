@@ -583,6 +583,195 @@ decides what counts as speech rather than every keyboard click.
     bb-ctl strip 1 duck -12     # this strip drops 12 dB while you talk
     bb-ctl duck on
 
+## Restarting the engine
+
+**Engine → Restart audio engine** stops the mixing process and starts it again
+without closing the window. It is the first thing to try when the audio graph
+gets stuck: nodes that will not appear, a device that stays silent after being
+re-plugged, a strip that has stopped passing signal. Sound stops for a second or
+two while the virtual devices leave the graph and come back.
+
+The dialog offers to **put the current mix back afterwards**, and it is ticked by
+default. It matters because a restarted engine loads your **startup preset** and
+nothing else — the engine writes nothing on exit — so without it a restart quietly
+reverts to a choice you made once rather than to what you were doing a moment ago.
+Untick it when the restart is *how* you want to get back to that known state.
+
+Either way the mix as it was becomes one **undo** step, so `Ctrl+Z` puts it back.
+
+Some things a restart cannot carry across, because they were never BetterBanana's
+to hold:
+
+- An application pointed at a BetterBanana device **by hand** may land elsewhere
+  when the device disappears. One that got there through a remembered rule
+  (**Engine → Applications**) is put back.
+- The engine re-finds each assigned device by node name on its first control
+  poll. Anything it cannot find is named in the status bar a second later.
+
+The watchdog stands down while this runs — see below — and it works whether the
+engine is a systemd user service or was started by hand. If the engine has
+stopped altogether the same entry reads **Start audio engine**.
+
+The shell equivalent is what it has always been:
+
+    systemctl --user restart betterbanana-engine
+
+### When the engine restarts on its own
+
+A PipeWire restart takes the engine with it, and the watchdog restarts it
+whenever its nodes leave the graph. Either way what comes back is your **startup
+preset** — a choice you made once, not what you had actually set up — and until
+now that happened in silence.
+
+The mixer notices (the engine's pid is the giveaway; the heartbeat takes a second
+to declare, by which time a replacement engine has already reinitialised the
+shared state) and offers the mix back on a banner, with the device lists
+refreshed. It is a banner rather than a dialog on purpose: it can appear while a
+call or a game is in the foreground. If the engine came back exactly where it
+was, it says so and offers nothing.
+
+## Time alignment
+
+Two output devices almost never have the same latency. On the machine this was
+built on, a USB interface reports 32 ms and a pair of Bluetooth earbuds report
+266 ms — anything feeding both arrives twice, a quarter of a second apart, which
+is far past the point where it stops sounding like one sound.
+
+**Engine → Time alignment** (`Ctrl+T`, or `bb-gui --align`) shows what each
+device costs and lets you hold the quick ones back:
+
+- **The latency is read, not measured.** PipeWire already reports it for every
+  node, and for a Bluetooth sink that figure includes the codec and link delay —
+  exactly the part you cannot guess at and no test tone would tell you either.
+  There is nothing to calibrate and nothing to play.
+- **Align the outputs** delays every ticked output to meet the slowest one.
+- **Buses, not strips, are what align outputs.** A strip feeds both A1 and A2,
+  so delaying a strip moves both together. Only a delay on the bus can separate
+  them. Strips have their own delay for the other job: lip-sync against video,
+  or lining up two microphones on one source.
+- **Untick anything nobody is listening to in the room.** A bus feeding a
+  screen-share sink is heard by people somewhere else, on their own timeline;
+  delaying it only makes them wait, and if it were the slowest it would hold the
+  whole room back to match. The capture-only stream sink is unticked for you.
+- Delays are saved in presets, so an alignment survives the engine restarting.
+
+        bb-ctl bus align                 # delay every output to meet the slowest
+        bb-ctl bus A1 delay 234          # or by hand, 0 .. 500 ms
+        bb-ctl strip 0 delay 40
+        bb-ctl status                    # the LATENCY and DELAY columns
+
+## Loudness
+
+Every bus carries a loudness meter to **ITU-R BS.1770-4**, under its level
+readout. A peak meter tells you whether something will clip; it tells you
+nothing about how loud it will sound, which is what every streaming platform
+measures and the reason two mixes that both peak at −1 dBFS can be six decibels
+apart to a listener.
+
+- **Short-term** is the rolling three seconds — the number to watch while
+  talking. It is what the bus card shows.
+- **Integrated** is everything since the last reset, gated so the pauses between
+  sentences do not drag it down. It is in the tooltip; right-click the readout
+  (or **Engine → Reset loudness measurement**) to start it again.
+- `--` means there is not enough signal to report rather than a reading of zero.
+
+Broadcast and streaming targets sit around −23 LUFS (EBU R 128) to −14 LUFS
+(most music streaming). The K-weighting filters are derived from the analog
+specifications in the standard rather than pasted in as 48 kHz coefficients, so
+the meter stays correct if PipeWire negotiates 44.1 or 96 kHz;
+`tests/test_loudness.cpp` checks the derivation against the published numbers and
+the whole chain against the EBU Tech 3341 compliance case.
+
+        bb-ctl status                    # the LUFS-S and LUFS-I columns
+        bb-ctl loudness reset
+
+## Checking the setup
+
+**Engine → Check this setup** (or `bb-gui --check`) looks for the mistakes that do not look like
+mistakes. Every check behind it is one that has actually been made on a real
+machine and taken hours to find, because in each case the mixer keeps running,
+the meters keep moving, and the audio simply goes somewhere else:
+
+- **The engine's virtual devices are missing from the graph.** Same pid,
+  heartbeat ticking, unit active, every node gone. Offers a restart.
+- **A strip feeds a bus with no output device.** An A bus with nothing assigned
+  publishes no node, so everything routed into it is discarded without a word.
+- **A strip or bus names a device that is not connected.**
+- **AUX is routed to the stream bus**, so everyone on the call hears themselves
+  echoed back — and the people hearing it are the only ones who can tell. Offers
+  to turn that route off.
+- **An application is not playing where it asked to.** Its requested
+  `target.object` disagrees with the sink it landed on, which means WirePlumber
+  is replaying a saved choice over the top of the application's own request.
+  Changing the setting inside the application will not fix that; moving the
+  stream will, because WirePlumber then saves the new answer. There is a button
+  for it.
+- **The ducker's threshold is at the bottom of its range**, so speaker bleed
+  holds it permanently open and the strips it controls never come back up — or
+  it is holding them down right now.
+- **The system default output or input is not a BetterBanana device**, so new
+  applications never appear on a strip. A PipeWire restart causes this.
+- Things left switched on: a solo, a muted bus with a device assigned.
+
+Findings are ranked, and the ones with an obvious fix carry a button that
+applies it and re-runs the checks.
+
+## Bus modes and surround
+
+A bus sums its strips in stereo. Its **mode** — the second drop-down on each A
+bus, under the device — decides what comes out of the other side and how many
+channels that takes. Only A1..A3 have one: B1 and B2 are what other applications
+record from, and a recording input that changed channel count underneath them
+would be a different kind of surprise.
+
+| Mode | Channels | What it does |
+| --- | --- | --- |
+| Normal | 2 | Stereo, straight through |
+| TV mix | 2 | Narrowed to 35% width, so it survives being played in mono |
+| Repeat | 4 | Front pair copied to the rear pair, unchanged |
+| Up-mix 2.1 | 3 | Stereo plus a crossed-over subwoofer channel |
+| Up-mix 4.1 | 5 | Fronts, subwoofer, rears carrying the stereo difference |
+| Up-mix 5.1 | 6 | Centre taken out of the fronts, subwoofer crossed over, rears decorrelated |
+| Up-mix 7.1 | 8 | 5.1, with the sides carrying a second, longer-delayed rear image |
+| Centre only | 6 | A 5.1 stream with signal on the centre alone |
+| Subwoofer only | 6 | …on the LFE alone |
+| Rears only | 6 | …on the rear pair alone |
+
+Changing the mode republishes the bus with the new channel layout, positions and
+all — a mode is not a parameter you can apply to a live stream. The device it
+drives has to accept that layout, or PipeWire will convert it back down.
+
+The matrices are BetterBanana's own. Voicemeeter's are not published, and
+inventing behaviour to fit a borrowed name is worse than defining one, so
+`engine/surround.h` says exactly what each mode means. Two of the original's
+modes (Amix, Bmix) describe mixing one bus into another, which has no counterpart
+here, and are absent rather than present and wrong.
+
+Three details that matter if you are listening rather than reading:
+
+- **The subwoofer crossover is a real crossover.** The fronts are high-passed at
+  120 Hz and the LFE low-passed at the same point, 12 dB/octave, rather than the
+  bass being sent to both and counted twice. The two halves are a Linkwitz-Riley
+  pair, which only reconstruct flat with one of them inverted — get that backwards
+  and there is a hole an octave wide exactly where the bass lives, in a room where
+  nobody can hear the two halves separately to tell. `tests/test_surround.cpp`
+  measures the sum across the crossover and holds it within 1 dB.
+- **The centre is taken out of the fronts**, not added alongside them. Half the
+  mono content moves to the centre channel and the fronts lose exactly that much,
+  so front plus centre still reconstructs the original. Otherwise a real centre
+  speaker plays it as well and the middle of the image comes out 3 dB loud.
+- **The rears carry the stereo difference, delayed 15 ms.** Mono content puts
+  nothing in the rears, which is correct — there is no difference to send. The
+  delay is what keeps the rears from fusing with the fronts into one image in the
+  middle of the room.
+
+From the shell:
+
+    bb-ctl bus A1 mode "5.1"       # names are matched loosely
+    bb-ctl bus A1 mode normal
+    bb-ctl bus A1 mode 99          # lists them all
+    bb-ctl status                  # the MODE column
+
 ## Start at login
 
 **Engine → Start at login** has two independent toggles:
@@ -627,6 +816,13 @@ engine that is genuinely broken produces a loud log instead of a restart loop.
 Snapshots are only taken while the mixer is healthy, so a bad state never
 overwrites a good one.
 
+A restart you asked for looks exactly like the fault it repairs, so the mixer
+parks the watchdog while **Engine → Restart audio engine** runs, by writing a
+deadline to `~/.config/betterbanana/health-inhibit`. Without it the two would
+race: the watchdog would restart the engine a second time and put its own
+snapshot back over the mix that had just been restored. It is a deadline rather
+than a flag, so a mixer killed mid-restart releases the watchdog by itself.
+
 To save or restore config yourself at any time:
 
     bb-ctl preset save <name|path>
@@ -643,7 +839,8 @@ disappeared from the graph. Nothing looks wrong except that no audio moves.
 
 The shipped unit sets `PartOf=pipewire.service`, so systemd restarts the engine
 whenever PipeWire restarts and the nodes come back on their own. If you are
-running an older install, or the engine ends up in this state anyway:
+running an older install, or the engine ends up in this state anyway, use
+**Engine → Restart audio engine**, or:
 
     systemctl --user restart betterbanana-engine
 
@@ -681,10 +878,11 @@ it:
 
 Inside the app, **Help → Keyboard and mouse** lists every gesture the faders,
 knobs, strips and buses respond to. The menus carry the usual accelerators, and
-`Ctrl+S` / `Ctrl+O` save and load a preset, the platform's undo and redo keys
-step the whole mixer backwards and forwards, `Ctrl+A` opens the application
-router, `Ctrl+D` the ducker, `Ctrl+B` the VBAN streams, `F5` re-reads the device
-list and `Ctrl+Q` closes the window (the engine keeps running).
+`Ctrl+S` / `Ctrl+O` save and load a preset, `Ctrl+1` … `Ctrl+9` load the presets
+in the bar across the top, the platform's undo and redo keys step the whole mixer
+backwards and forwards, `Ctrl+A` opens the application router, `Ctrl+D` the
+ducker, `Ctrl+B` the VBAN streams, `Ctrl+T` time alignment, `F5` re-reads the
+device list and `Ctrl+Q` closes the window (the engine keeps running).
 
 For system-wide binds, `packaging/betterbanana.lua.example` binds the mixer to
 Hyprland. It is *not*
@@ -797,6 +995,15 @@ Presets are **explicit**. The mixer does not save your session when you quit and
 does not silently reload it — it loads exactly the one preset you nominate, and
 nothing else.
 
+- **The preset bar** across the top of the window is one button per saved
+  preset, with the loaded one lit, and `Ctrl+1` … `Ctrl+9` in the same order.
+  A mix for a call is not a mix for music, and switching between them should not
+  mean a file dialog. **View → Preset bar** hides it.
+- **Right-click a preset button** for the three things wanted often enough not to
+  open a file manager for: *Overwrite with the current mix*, *Load when the
+  engine starts*, and *Delete*. Deleting the startup preset clears that choice
+  too, rather than leaving the engine to fail at startup and come up default
+  without saying why.
 - **Preset menu** — Save (`Ctrl+S`), Load (`Ctrl+O`), and **Load on startup**.
 - **Load on startup** lists your saved presets; the one you tick is what the
   engine restores when it starts. `(none)` means it comes up with a default
@@ -1062,11 +1269,14 @@ strip** (`s0`–`s4`), because they are the same kind of block:
 
     ./build/test_dsp          # 30 DSP assertions, no audio server needed
     ./build/test_eq           # 61 EQ profile / import / preset assertions
-    ./build/test_preset       # 53 preset, startup and per-device assertions
+    ./build/test_preset       # 79 preset, startup, watchdog and per-device assertions
     ./build/test_spectrum     # 14 FFT and analyser-calibration assertions
     ./build/test_voicefx      # 54 voice changer assertions, measured by FFT
     ./build/test_autotune     # 20 note-snapping assertions
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
+    ./build/test_surround     # 32 bus-mode assertions: layouts, matrices, crossover
+    ./build/test_delay        # 26 delay-line and output-alignment assertions
+    ./build/test_loudness     # 24 BS.1770 assertions, incl. EBU 3341 compliance
     ./build/test_fader        # fader value, clamping, paging and fine drag
     ./build/test_contrast     # the colour contract, over all ten palettes
     ./build/test_widgets      # the custom widgets, driven by real mouse events
@@ -1131,7 +1341,16 @@ compressor / tone knobs / audibility / pan / mono / solo / mute / fader,
 the 12-band parametric EQ on every strip and bus with profiles, AutoEq import
 and a live spectrum analyser, the per-strip voice changer with independent
 pitch and formant shifting, undo across the whole
-mixer, per-bus mono / mute / fader, metering, hardware assignment, the tape deck,
-and VBAN send/receive.
+mixer, per-bus mono / mute / fader, the bus modes including 2.1 / 4.1 / 5.1 /
+7.1 up-mixing, per-strip and per-bus time alignment driven by the latency
+PipeWire reports, BS.1770 loudness metering, peak metering, hardware assignment,
+the tape deck, and VBAN send/receive.
 
-Not implemented: the surround bus modes, which need buses wider than stereo.
+The bus modes were the last gap. They were verified end to end rather than only
+in the unit tests: a bus pointed at a real six-channel device, a tone through the
+mixer, the output captured back and measured per channel — centre content landing
+in the fronts and the centre with the 440 Hz tone 16 dB down in the LFE, and
+side content landing in the rears with nothing in the centre.
+
+Not implemented: nothing from the original's scope that was ever planned.
+MacroButtons and the remote API were out of scope from the start.
