@@ -41,6 +41,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QShortcut>
+#include <QStyle>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -1694,10 +1695,112 @@ void AppsDialog::refresh()
 // one back - and it has to be done on the BUS, because a strip feeds both and
 // delaying a strip moves both together.
 //
-// Nothing here is measured with test tones: PipeWire already reports the figure
-// for every device, and for a Bluetooth sink that figure includes the codec and
-// link delay, which is the part nothing else can see.
+// The figures are read, not measured: PipeWire already reports one for every
+// device, and for a Bluetooth sink it includes the codec and link delay, which
+// is the part nothing else can see.
+//
+// What this dialog has to do, though, is not report figures - it is to answer
+// one question, "do these arrive together?", for somebody who does not think in
+// milliseconds. So it adds the two numbers up rather than leaving that to the
+// reader, draws the sums to a shared scale so they can be compared by eye,
+// leads with a sentence saying what the gap would actually sound like, and ends
+// with a tick you can listen to. A reported figure you cannot check is a figure
+// you have to take on faith, and the Bluetooth one is negotiated with the
+// headset rather than declared by it - so it is the one most worth checking.
 // ---------------------------------------------------------------------------
+
+// The one device class whose figure is negotiated per connection rather than
+// fixed by the hardware, so it is worth saying which row is one.
+static bool looks_bluetooth(const QString& node, const QString& desc)
+{
+    return node.contains("bluez", Qt::CaseInsensitive)
+        || node.contains("bluetooth", Qt::CaseInsensitive)
+        || desc.contains("bluetooth", Qt::CaseInsensitive);
+}
+
+// mm:ss.mmm is no use here; everything is tens or hundreds of milliseconds.
+static QString msText(float ms)
+{
+    return ms < 0.0f ? QString("--") : QString::asprintf("%.1f ms", ms);
+}
+
+AlignBarCell::AlignBarCell(QWidget* parent) : QWidget(parent)
+{
+    setMinimumWidth(bbui::px(120));
+    setMinimumHeight(bbui::px(16));
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+}
+
+void AlignBarCell::setScale(float fullMs, float targetMs)
+{
+    m_full = fullMs > 1.0f ? fullMs : 1.0f;
+    m_target = targetMs;
+    update();
+}
+
+void AlignBarCell::setValues(float latencyMs, float delayMs, bool included)
+{
+    m_lat = latencyMs;
+    m_delay = delayMs > 0.0f ? delayMs : 0.0f;
+    m_inc = included;
+    update();
+}
+
+void AlignBarCell::paintEvent(QPaintEvent*)
+{
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    const Theme& t = theme();
+    const qreal rad = bbui::radWell();
+    const QRectF box = QRectF(rect()).adjusted(0.0, bbui::px(3), -1.0, -bbui::px(3));
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(t.well);
+    p.drawRoundedRect(box, rad, rad);
+
+    auto atX = [&](float ms) {
+        const double f = std::clamp((double)ms / (double)m_full, 0.0, 1.0);
+        return box.left() + f * box.width();
+    };
+
+    if (m_lat < 0.0f) {
+        // Nothing reported. A zero-length bar would read as "instant", which is
+        // the one thing it definitely does not mean.
+        p.setPen(QPen(t.textDim, 1.0, Qt::DotLine));
+        const qreal y = box.center().y();
+        p.drawLine(QPointF(box.left() + 3, y), QPointF(box.right() - 3, y));
+        return;
+    }
+
+    // Two segments, because they are two different things: what the device
+    // costs and cannot be argued with, and what the mixer chose to add. Told
+    // apart three ways over, so no palette can flatten them into one bar:
+    // a dimmer tone, a shorter bar, and a seam of trough between them.
+    const QColor dev = alignDeviceColour(t, m_inc);
+    const QColor add = alignDelayColour(t, m_inc);
+    const qreal x0 = box.left(), x1 = atX(m_lat), x2 = atX(m_lat + m_delay);
+
+    p.setBrush(dev);
+    if (x1 > x0 + 0.5) {
+        QPainterPath path;
+        path.addRoundedRect(QRectF(x0, box.top(), x1 - x0, box.height()), rad, rad);
+        p.drawPath(path);
+    }
+    p.setBrush(add);
+    if (x2 > x1 + 1.5)
+        p.drawRect(QRectF(x1 + 1.0, box.top() + box.height() * 0.22,
+                          x2 - x1 - 1.0, box.height() * 0.56));
+
+    // Where everything is trying to meet. A row whose bar ends on this line is
+    // aligned; the distance from the end of the bar to the line is the error.
+    if (m_target >= 0.0f) {
+        const qreal tx = atX(m_target);
+        p.setPen(QPen(t.text, 1.0, Qt::DashLine));
+        p.drawLine(QPointF(tx, box.top() - bbui::px(2)),
+                   QPointF(tx, box.bottom() + bbui::px(2)));
+    }
+}
+
 AlignDialog::AlignDialog(Shared* shm, QWidget* parent)
     : QDialog(parent), m_shm(shm)
 {
@@ -1705,84 +1808,328 @@ AlignDialog::AlignDialog(Shared* shm, QWidget* parent)
     auto* root = new QVBoxLayout(this);
     bbdlg::chrome(root);
     root->addWidget(bbdlg::header("Time alignment",
-        "What each device costs in delay, and how to make them agree"));
+        "Making Bluetooth headphones and everything else arrive at the same moment"));
 
-    m_note = new QLabel;
-    m_note->setWordWrap(true);
-    m_note->setProperty("role", "caption");
-    root->addWidget(m_note);
+    // Enough sections that a small screen has to be able to scroll them.
+    auto* area = new QScrollArea;
+    area->setWidgetResizable(true);
+    area->setFrameShape(QFrame::NoFrame);
+    auto* holder = new QWidget;
+    auto* col = new QVBoxLayout(holder);
+    col->setContentsMargins(0, 0, 0, 0);
+    col->setSpacing(bbui::gapM());
+    area->setWidget(holder);
+    root->addWidget(area, 1);
 
-    auto* grid = new QGridLayout;
-    grid->setHorizontalSpacing(bbui::gapM());
-    grid->setVerticalSpacing(bbui::gapS());
-    int c = 0;
-    for (const char* h : { "", "Device", "Reported latency", "Delay", "Align" }) {
-        auto* l = new QLabel(h);
-        l->setProperty("role", "caption");
-        grid->addWidget(l, 0, c++);
+    auto section = [&](const QString& title, const QString& sub) {
+        auto* head = new QLabel(title);
+        head->setProperty("role", "value");
+        col->addWidget(head);
+        auto* s = new QLabel(sub);
+        s->setProperty("role", "caption");
+        s->setWordWrap(true);
+        col->addWidget(s);
+    };
+
+    // --- the verdict ------------------------------------------------------
+    // The lead, because it is the only thing most people open this for. A
+    // number nobody can interpret is not an answer; "you would hear that as an
+    // echo" is.
+    m_verdict = new QFrame;
+    m_verdict->setProperty("role", "verdict");
+    {
+        auto* v = new QVBoxLayout(m_verdict);
+        v->setContentsMargins(bbui::gapM(), bbui::gapS(), bbui::gapM(), bbui::gapS());
+        v->setSpacing(bbui::gapXS());
+        m_verdictText = new QLabel;
+        m_verdictText->setWordWrap(true);
+        m_verdictText->setProperty("role", "verdicttop");
+        v->addWidget(m_verdictText);
+        m_verdictSub = new QLabel;
+        m_verdictSub->setWordWrap(true);
+        v->addWidget(m_verdictSub);
     }
-    int r = 1;
+    col->addWidget(m_verdict);
 
-    auto addRow = [&](Row& row, const QString& name, bool isBus, int idx) {
-        auto* tag = new QLabel(name);
+    // --- a device that moved after it was aligned --------------------------
+    m_driftOffer = new QFrame;
+    m_driftOffer->setProperty("role", "offer");
+    {
+        auto* h = new QHBoxLayout(m_driftOffer);
+        h->setContentsMargins(bbui::gapM(), bbui::gapS(), bbui::gapM(), bbui::gapS());
+        m_driftText = new QLabel;
+        m_driftText->setWordWrap(true);
+        h->addWidget(m_driftText, 1);
+        auto* again = new QPushButton("Align again");
+        again->setProperty("cta", "primary");
+        connect(again, &QPushButton::clicked, this, &AlignDialog::alignOutputs);
+        h->addWidget(again, 0, Qt::AlignVCenter);
+    }
+    m_driftOffer->hide();
+    col->addWidget(m_driftOffer);
+
+    // --- outputs ----------------------------------------------------------
+    section("Outputs — what you hear",
+            "The delay belongs on the bus, not the strip. One strip feeds both A1 and "
+            "A2, so delaying the strip moves both of them together; only a delay here "
+            "can separate two outputs. Ticked outputs are the ones aligning considers.");
+
+    auto* og = new QGridLayout;
+    og->setHorizontalSpacing(bbui::gapM());
+    og->setVerticalSpacing(bbui::gapS());
+    {
+        int c = 0;
+        for (const char* h : { "", "Device", "", "Device takes", "",
+                               "Mixer adds", "", "You hear it at",
+                               "How that lands", "Align" }) {
+            auto* l = new QLabel(h);
+            l->setProperty("role", "caption");
+            og->addWidget(l, 0, c++);
+        }
+    }
+
+    auto addOut = [&](Row& row, int b, int r) {
+        auto* tag = new QLabel(labelFor(m_shm, false, b, kBusLabel[b]));
         tag->setProperty("role", "value");
-        grid->addWidget(tag, r, 0);
+        og->addWidget(tag, r, 0);
+
         row.dev = new QLabel("-");
         row.dev->setProperty("role", "caption");
-        grid->addWidget(row.dev, r, 1);
+        row.dev->setMaximumWidth(bbui::px(200));
+        og->addWidget(row.dev, r, 1);
+
+        row.kind = new QLabel("BLUETOOTH");
+        row.kind->setProperty("role", "diagchip");
+        row.kind->setProperty("sev", "accent");
+        row.kind->setToolTip(
+            "A Bluetooth sink negotiates its codec with the headset every time it "
+            "connects, so this figure is not a property of the hardware - it can be "
+            "different tomorrow, and the mixer will say so when it changes.");
+        row.kind->hide();
+        og->addWidget(row.kind, r, 2);
+
         row.lat = new QLabel("-");
-        grid->addWidget(row.lat, r, 2);
+        og->addWidget(row.lat, r, 3);
+
+        auto* plus = new QLabel("+");
+        plus->setProperty("role", "caption");
+        og->addWidget(plus, r, 4);
+
         row.delay = new QDoubleSpinBox;
-        row.delay->setRange(0.0, 500.0);
+        row.delay->setRange(0.0, (double)Delay::kMaxMs);
         row.delay->setDecimals(1);
         row.delay->setSingleStep(1.0);
         row.delay->setSuffix(" ms");
-        row.delay->setToolTip(isBus
-            ? "Hold this output back so it lines up with the slowest one"
-            : "Hold this input back - for lip-sync against video, or against "
-              "another microphone on the same source");
-        connect(row.delay, &QDoubleSpinBox::valueChanged, this,
-                [this, isBus, idx](double v) {
-                    if (isBus) m_shm->bus[idx].delay_ms.store((float)v);
-                    else       m_shm->strip[idx].delay_ms.store((float)v);
-                });
-        grid->addWidget(row.delay, r, 3);
-        if (isBus) {
-            row.inc = new QCheckBox;
-            row.inc->setChecked(true);
-            row.inc->setToolTip(
-                "Include this output when aligning.\n\n"
-                "Turn it off for anything nobody is listening to in the room - a "
-                "screen-share sink is heard by people somewhere else, on their own "
-                "timeline, so delaying it only makes them wait.");
-            grid->addWidget(row.inc, r, 4, Qt::AlignCenter);
-        }
-        ++r;
+        row.delay->setToolTip(
+            "How much this output is held back, on top of what the device already "
+            "costs.\n\nAligning fills this in for you, but it is a plain control: "
+            "start the test tick and hold the arrow keys, and you can close the gap "
+            "by ear against whatever the reported figure got slightly wrong.");
+        connect(row.delay, &QDoubleSpinBox::valueChanged, this, [this, b](double v) {
+            m_shm->bus[b].delay_ms.store((float)v);
+            refresh();
+        });
+        og->addWidget(row.delay, r, 5);
+
+        auto* eq = new QLabel("=");
+        eq->setProperty("role", "caption");
+        og->addWidget(eq, r, 6);
+
+        row.arrive = new QLabel("-");
+        row.arrive->setProperty("role", "value");
+        row.arrive->setToolTip("When a sound reaches you through this output: what the "
+                               "device costs plus what the mixer is adding. This is the "
+                               "number that has to match across outputs.");
+        og->addWidget(row.arrive, r, 7);
+
+        row.bar = new AlignBarCell;
+        og->addWidget(row.bar, r, 8);
+
+        row.inc = new QCheckBox;
+        row.inc->setChecked(true);
+        row.inc->setToolTip(
+            "Include this output when aligning, and tick it for the test click.\n\n"
+            "Turn it off for anything nobody is listening to in the room - a "
+            "screen-share sink is heard by people somewhere else, on their own "
+            "timeline, so delaying it only makes them wait, and if it were the "
+            "slowest it would hold the whole room back to match it.");
+        connect(row.inc, &QCheckBox::toggled, this, [this] {
+            if (m_clicking) setClickRunning(true);       // retarget a running tick
+            refresh();
+        });
+        og->addWidget(row.inc, r, 9, Qt::AlignCenter);
     };
+    for (int b = 0; b < kPhysBuses; ++b) addOut(m_out[b], b, b + 1);
+    og->setColumnStretch(1, 1);
+    og->setColumnStretch(8, 2);
+    col->addLayout(og);
 
-    { auto* l = new QLabel("INPUTS"); l->setProperty("role", "caption"); grid->addWidget(l, r++, 0); }
-    for (int i = 0; i < kHwStrips; ++i)
-        addRow(m_in[i], labelFor(m_shm, true, i, kStripTitle[i]), false, i);
-    { auto* l = new QLabel("OUTPUTS"); l->setProperty("role", "caption"); grid->addWidget(l, r++, 0); }
-    for (int b = 0; b < kPhysBuses; ++b)
-        addRow(m_out[b], labelFor(m_shm, false, b, kBusLabel[b]), true, b);
+    m_scaleCap = new QLabel;
+    m_scaleCap->setProperty("role", "caption");
+    m_scaleCap->setWordWrap(true);
+    col->addWidget(m_scaleCap);
 
-    grid->setColumnStretch(1, 1);
-    root->addLayout(grid);
+    // The one that makes an alignment stay one. Off by default, because it
+    // writes a delay with nobody watching.
+    {
+        auto* keep = new QCheckBox("Keep them lined up when a device's latency changes");
+        keep->setChecked(QSettings("betterbanana", "gui")
+                             .value("align/auto", false).toBool());
+        keep->setToolTip(
+            "A Bluetooth link negotiates its codec with the headset every time it "
+            "connects, so the figure an alignment was built on can be different "
+            "tomorrow and the alignment quietly stops being one.\n\n"
+            "With this on, the mixer notices a reported latency moving and lines the "
+            "outputs up again - but only when they WERE lined up beforehand. A mix "
+            "you set by hand never has a spread of zero, so it is never touched.");
+        connect(keep, &QCheckBox::toggled, this, [](bool on) {
+            QSettings("betterbanana", "gui").setValue("align/auto", on);
+        });
+        col->addWidget(keep);
+    }
 
-    auto* align = new QPushButton("Align the outputs");
-    align->setToolTip("Delay every output so they all arrive together with the slowest");
-    connect(align, &QPushButton::clicked, this, &AlignDialog::alignOutputs);
+    // --- check it by ear ---------------------------------------------------
+    section("Check it by ear",
+            "The figures are what PipeWire reports, and for Bluetooth that is a "
+            "negotiation rather than a measurement, so it can be a few milliseconds "
+            "out. This is how you find out.");
+    {
+        auto* h = new QHBoxLayout;
+        h->setSpacing(bbui::gapM());
+        m_clickBtn = new QPushButton("Play a test tick");
+        m_clickBtn->setCheckable(true);
+        m_clickBtn->setToolTip(
+            "A short tick on every ticked output, from one shared clock, every "
+            "0.7 s.\n\nIf they arrive together you hear one tick. If they do not you "
+            "hear a flam - two ticks close together - and turning the delay on the "
+            "early one walks the flam closed.\n\nThe tick is inserted after the fader "
+            "and the limiter, so a bus you have turned down or muted still ticks.");
+        connect(m_clickBtn, &QPushButton::toggled, this, &AlignDialog::setClickRunning);
+        h->addWidget(m_clickBtn);
+        m_clickHint = new QLabel;
+        m_clickHint->setProperty("role", "caption");
+        m_clickHint->setWordWrap(true);
+        h->addWidget(m_clickHint, 1);
+        col->addLayout(h);
+    }
+
+    // --- what it costs -----------------------------------------------------
+    section("What aligning costs you",
+            "Aligning can only hold the quick outputs back; nothing can make a "
+            "Bluetooth headset faster. So everything ends up as late as the slowest "
+            "thing you are listening on, and anything you are watching stays where it "
+            "was.");
+    m_costText = new QLabel;
+    m_costText->setProperty("role", "caption");
+    m_costText->setWordWrap(true);
+    m_costText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    col->addWidget(m_costText);
+
+    // --- inputs ------------------------------------------------------------
+    section("Inputs — what the mixer hears",
+            "These are not part of aligning the outputs, and the button below leaves "
+            "them alone. A strip delay is for the other job: holding a microphone back "
+            "to meet a camera, or lining up two microphones on one source.");
+
+    auto* ig = new QGridLayout;
+    ig->setHorizontalSpacing(bbui::gapM());
+    ig->setVerticalSpacing(bbui::gapS());
+    {
+        int c = 0;
+        for (const char* h : { "", "Device", "", "Device takes", "",
+                               "Mixer adds", "", "Reaches the mix at" }) {
+            auto* l = new QLabel(h);
+            l->setProperty("role", "caption");
+            ig->addWidget(l, 0, c++);
+        }
+    }
+    auto addIn = [&](Row& row, int i, int r) {
+        auto* tag = new QLabel(labelFor(m_shm, true, i, kStripTitle[i]));
+        tag->setProperty("role", "value");
+        ig->addWidget(tag, r, 0);
+        row.dev = new QLabel("-");
+        row.dev->setProperty("role", "caption");
+        row.dev->setMaximumWidth(bbui::px(200));
+        ig->addWidget(row.dev, r, 1);
+        row.kind = new QLabel("BLUETOOTH");
+        row.kind->setProperty("role", "diagchip");
+        row.kind->setProperty("sev", "accent");
+        row.kind->hide();
+        ig->addWidget(row.kind, r, 2);
+        row.lat = new QLabel("-");
+        ig->addWidget(row.lat, r, 3);
+        auto* plus = new QLabel("+");
+        plus->setProperty("role", "caption");
+        ig->addWidget(plus, r, 4);
+        row.delay = new QDoubleSpinBox;
+        row.delay->setRange(0.0, (double)Delay::kMaxMs);
+        row.delay->setDecimals(1);
+        row.delay->setSingleStep(1.0);
+        row.delay->setSuffix(" ms");
+        row.delay->setToolTip(
+            "Hold this input back - for lip-sync against a camera, or against another "
+            "microphone on the same source. It moves the strip everywhere at once, on "
+            "every bus it feeds.");
+        connect(row.delay, &QDoubleSpinBox::valueChanged, this, [this, i](double v) {
+            m_shm->strip[i].delay_ms.store((float)v);
+            refresh();
+        });
+        ig->addWidget(row.delay, r, 5);
+        auto* eq = new QLabel("=");
+        eq->setProperty("role", "caption");
+        ig->addWidget(eq, r, 6);
+        row.arrive = new QLabel("-");
+        row.arrive->setProperty("role", "value");
+        ig->addWidget(row.arrive, r, 7);
+    };
+    for (int i = 0; i < kHwStrips; ++i) addIn(m_in[i], i, i + 1);
+    ig->setColumnStretch(1, 1);
+    col->addLayout(ig);
+    col->addStretch(1);
+
+    m_alignBtn = new QPushButton("Align the outputs");
+    m_alignBtn->setToolTip("Hold every ticked output back until they all arrive together "
+                           "with the slowest one");
+    connect(m_alignBtn, &QPushButton::clicked, this, &AlignDialog::alignOutputs);
+
+    // The way back. Aligning was a button and un-aligning was arithmetic you
+    // had to do yourself, which is fine right up until the device you aligned
+    // against is unplugged - then every output keeps the padding that was
+    // holding it back, and the mixer sounds late for no visible reason.
+    m_clearBtn = new QPushButton("Clear the output delays");
+    connect(m_clearBtn, &QPushButton::clicked, this, &AlignDialog::undoOrClear);
+
     auto* close = new QPushButton("Close");
     connect(close, &QPushButton::clicked, this, &QDialog::accept);
-    root->addLayout(bbdlg::buttonRow(align, close));
+    auto* foot = bbdlg::buttonRow(m_alignBtn, close);
+    foot->insertWidget(0, m_clearBtn);
+    m_status = new bbdlg::StatusStrip(this);
+    foot->insertWidget(0, m_status->widget(), 1);
+    root->addLayout(foot);
+
+    // A tick left running in someone's headphones is miserable, so it stops
+    // with the dialog as well as on the engine's own dead-man timer.
+    connect(this, &QDialog::finished, this, [this] {
+        if (m_clicking) m_clickBtn->setChecked(false);
+    });
+    m_clickStop = new QTimer(this);
+    m_clickStop->setSingleShot(true);
+    connect(m_clickStop, &QTimer::timeout, this, [this] {
+        if (m_clicking) m_clickBtn->setChecked(false);
+    });
 
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &AlignDialog::refresh);
     m_timer->start(500);
-    bbdlg::rememberGeometry(this, "align");
+    bbdlg::rememberGeometry(this, "align2");
     bbdlg::tameDefaults(this);
+    resize(qMax(width(), bbui::px(940)), qMax(height(), bbui::px(600)));
     refresh();
+}
+
+AlignDialog::~AlignDialog()
+{
+    if (m_shm) m_shm->click_mask.store(0);
 }
 
 void AlignDialog::refresh()
@@ -1797,7 +2144,17 @@ void AlignDialog::refresh()
     int known = 0;
     auto fill = [&](Row& row, const QString& dev, const QString& node,
                     float lat, float delay) {
-        row.dev->setText(dev.isEmpty() ? "- nothing assigned -" : dev);
+        row.node = node;
+        // Elided, not wrapped: a device description runs to sixty characters
+        // ("BetterBanana Stream Bus (capture only - do not select)"), and a
+        // column that wide pushes the grid past the window, which stops every
+        // paragraph in the dialog from wrapping to the width you can see.
+        const QString full = dev.isEmpty() ? QString("- nothing assigned -") : dev;
+        row.dev->setToolTip(full);
+        row.dev->setText(row.dev->fontMetrics().elidedText(
+            full, Qt::ElideRight, bbui::px(190)));
+        row.bt = !node.isEmpty() && looks_bluetooth(node, dev);
+        if (row.kind) row.kind->setVisible(row.bt);
         // Untick a capture-only sink when it ARRIVES on this row, not on every
         // refresh: someone who deliberately ticks it back on should keep it.
         if (row.inc && node != row.lastDev) {
@@ -1805,29 +2162,323 @@ void AlignDialog::refresh()
             QSignalBlocker block(row.inc);
             row.inc->setChecked(node != QString(kStreamSinkName));
         }
-        if (lat >= 0.0f) { row.lat->setText(QString::asprintf("%.1f ms", lat)); ++known; }
-        else             row.lat->setText(dev.isEmpty() ? "-" : "not reported");
+        if (lat >= 0.0f) { row.lat->setText(msText(lat)); ++known; }
+        else             row.lat->setText(dev.isEmpty() ? "--" : "not reported");
         if (!row.delay->hasFocus()) {
             QSignalBlocker block(row.delay);
             row.delay->setValue(delay);
         }
+        const float arr = arrival_ms(lat, delay);
+        row.arrive->setText(arr < 0.0f ? QString("--") : msText(arr));
     };
+
+    float lat[kPhysBuses], del[kPhysBuses];
+    bool  inc[kPhysBuses];
     for (int i = 0; i < kHwStrips; ++i)
         fill(m_in[i], ok ? QString::fromUtf8(hwd[i][0] ? hwd[i] : hw[i]) : QString(),
              ok ? QString::fromUtf8(hw[i]) : QString(),
              m_shm->in_latency_ms[i].load(), m_shm->strip[i].delay_ms.load());
-    for (int b = 0; b < kPhysBuses; ++b)
+    for (int b = 0; b < kPhysBuses; ++b) {
+        lat[b] = m_shm->out_latency_ms[b].load();
+        del[b] = m_shm->bus[b].delay_ms.load();
+        inc[b] = m_out[b].inc->isChecked();
         fill(m_out[b], ok ? QString::fromUtf8(bod[b][0] ? bod[b] : bo[b]) : QString(),
              ok ? QString::fromUtf8(bo[b]) : QString(),
-             m_shm->out_latency_ms[b].load(), m_shm->bus[b].delay_ms.load());
+             lat[b], del[b]);
+    }
 
-    m_note->setText(known
-        ? "These figures come from PipeWire, not from a measurement here: for a "
-          "Bluetooth headset the number includes the codec and link delay, which "
-          "is exactly the part you cannot guess at. Aligning holds the quicker "
-          "outputs back so everything reaches you together."
-        : "PipeWire has not reported a latency for anything yet. Assign a device "
-          "to a bus and this fills in.");
+    // --- the bars ---------------------------------------------------------
+    // One scale across every row, or they cannot be compared, which is the only
+    // reason to draw them. Rounded up so the longest bar does not touch the end.
+    int early = -1, late = -1;
+    const float spread = arrival_spread_ms(lat, del, kPhysBuses, inc, &early, &late);
+    float full = 50.0f, target = -1.0f;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        const float a = arrival_ms(lat[b], del[b]);
+        if (a > full) full = a;
+        if (inc[b] && a > target) target = a;
+    }
+    full = std::ceil(full * 1.12f / 25.0f) * 25.0f;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        m_out[b].bar->setScale(full, target);
+        m_out[b].bar->setValues(lat[b], del[b], inc[b]);
+    }
+    m_scaleCap->setText(QString(
+        "Bars share one scale, 0 to %1 ms. "
+        "<span style=\"color:%2\">■</span> what the device costs&nbsp;&nbsp;"
+        "<span style=\"color:%3\">▬</span> what the mixer is adding&nbsp;&nbsp;"
+        "<span style=\"color:%4\">┆</span> where they are all trying to meet.")
+        .arg((int)full)
+        .arg(alignDeviceColour(theme()).name(), alignDelayColour(theme()).name(),
+             theme().text.name()));
+
+    // --- is anything being held back for no reason? ------------------------
+    // Checked before the gap, and it wins. Aligning writes a delay to meet the
+    // slowest device in the set; unplug that device and the padding stays on
+    // everything else, so the mixer is late for a reason nothing shows. Reading
+    // that as an ordinary gap and offering to align would be answering the
+    // wrong question.
+    float want[kPhysBuses];
+    const float excess = excess_delay_ms(lat, del, kPhysBuses, inc, want);
+    int worst = -1;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        if (!inc[b] || lat[b] < 0.0f) continue;
+        if (worst < 0 || del[b] - want[b] > del[worst] - want[worst]) worst = b;
+    }
+
+    // --- the verdict ------------------------------------------------------
+    QString sev = "good", top, sub;
+    if (!known) {
+        sev = "warn";
+        top = "PipeWire has not reported a latency for anything yet.";
+        sub = "Assign a device to an A bus and these fill in. Nothing here needs "
+              "calibrating - the figure arrives with the device.";
+    } else if (excess > 1.0f && worst >= 0) {
+        sev = "bad";
+        top = QString("%1 is held back %2 more than anything needs — that is why it "
+                      "sounds late.")
+                  .arg(labelFor(m_shm, false, worst, kBusLabel[worst]), msText(excess));
+        sub = "Alignment holds an output back to meet the slowest device in the set. "
+              "Unplug that device, or swap it for a quicker one, and the padding stays "
+              "behind with nothing left to justify it. Clearing the output delays puts every "
+              "output straight through again; aligning does the same for whatever is "
+              "plugged in now.";
+    } else if (spread < 0.0f) {
+        sev = "warn";
+        top = "Only one output is ticked, so there is nothing to line it up with.";
+        sub = "Alignment is about two things arriving together. Assign and tick a "
+              "second output - your speakers as well as your headphones - and this "
+              "becomes a comparison.";
+    } else {
+        const GapVerdict gv = gap_verdict(spread);
+        const QString eName = labelFor(m_shm, false, early, kBusLabel[early]);
+        const QString lName = labelFor(m_shm, false, late,  kBusLabel[late]);
+        if (gv == kGapTogether) {
+            sev = "good";
+            top = QString("Everything ticked arrives together, within %1.")
+                      .arg(msText(spread));
+            sub = "That is under a millisecond apart, which is closer than the ear "
+                  "can resolve as two events. Save a preset if you want it to survive "
+                  "the engine restarting.";
+        } else {
+            sev = gv == kGapEcho ? "bad" : "warn";
+            top = QString("%1 is %2 ahead of %3 — you would hear that as %4.")
+                      .arg(eName, msText(spread), lName, gap_sounds_like(gv));
+            sub = QString("Aligning holds %1 back by %2 so the two land together. "
+                          "Nothing can make %3 quicker; only the early one can move.")
+                      .arg(eName, msText(spread), lName);
+        }
+    }
+    m_verdictText->setText(top);
+    m_verdictSub->setText(sub);
+    if (m_verdict->property("sev").toString() != sev) {
+        m_verdict->setProperty("sev", sev);
+        // A dynamic property only re-selects the stylesheet on a restyle, and
+        // the children carry their own colour rules.
+        for (QWidget* w : QList<QWidget*>{ m_verdict, m_verdictText, m_verdictSub }) {
+            w->style()->unpolish(w);
+            w->style()->polish(w);
+        }
+    }
+    m_alignBtn->setEnabled(spread >= 0.0f);
+
+    // The way back, and what it will actually do when pressed.
+    const bool undoable = undoAvailable();
+    float held = 0.0f;
+    for (int b = 0; b < kPhysBuses; ++b) held = std::max(held, del[b]);
+    m_clearBtn->setText(undoable ? "Undo the alignment"
+                                 : "Clear the output delays");
+    m_clearBtn->setEnabled(undoable || held > 0.0f);
+    m_clearBtn->setToolTip(undoable
+        ? "Put every output delay back exactly as it was before the last align"
+        : "Set every A-bus delay to zero, so each output goes straight through. "
+          "Input delays are left alone - those are for lip-sync, not alignment - "
+          "the device latencies are not affected because nothing can change those, "
+          "and aligning again is one button away.");
+    // When something is being held back for no reason, the way out is the thing
+    // to press, not the thing that made it.
+    {
+        const bool rescue = excess > 1.0f;
+        auto cta = [](QPushButton* b, bool on) {
+            const QString want = on ? "primary" : QString();
+            if (b->property("cta").toString() == want) return;
+            b->setProperty("cta", want);
+            b->style()->unpolish(b);
+            b->style()->polish(b);
+        };
+        cta(m_clearBtn, rescue);
+        cta(m_alignBtn, !rescue);
+    }
+
+    // --- has a Bluetooth device moved since it was aligned? ----------------
+    // Only worth raising while the alignment is actually out. The offer used to
+    // appear whenever a figure had moved, which meant it could sit under a
+    // verdict reading "arrives together, within 0.0 ms" and quote a different
+    // number as the error - two lines disagreeing about the same thing. The
+    // verdict owns the error; this says why it appeared.
+    const int drift = spread > 1.0f ? driftedBus() : -1;
+    m_driftOffer->setVisible(drift >= 0);
+    if (drift >= 0) {
+        QSettings cfg("betterbanana", "gui");
+        const float was = cfg.value(QString("align/lat%1").arg(drift), -1.0).toFloat();
+        m_driftText->setText(
+            QString("%1 now reports %2, and it was %3 when you last aligned. A "
+                    "Bluetooth link renegotiates its codec on every reconnect, so the "
+                    "figure everything was lined up against has moved underneath you.")
+                .arg(labelFor(m_shm, false, drift, kBusLabel[drift]),
+                     msText(lat[drift]), msText(was)));
+    }
+
+    // --- what it costs ----------------------------------------------------
+    if (target >= 0.0f) {
+        const double sec = target / 1000.0;
+        m_costText->setText(
+            QString("Ticked outputs land %1 after an application plays a sound, and "
+                    "that is as good as it gets while the slowest device is in the "
+                    "set.\n\n"
+                    "Video does not know about it. A player asks PipeWire what its "
+                    "sink costs and is told about the mixer's own virtual sink, not "
+                    "about the Bluetooth link past it, so picture runs about %1 "
+                    "ahead of sound. Give the player that figure back:\n"
+                    "    mpv    --audio-delay=%2        (negative delays the video)\n"
+                    "    VLC    Tools → Track synchronisation → %3 ms\n"
+                    "Start from that number and trim it by eye; it is close, not exact, "
+                    "because the player's own buffering is its business.")
+                .arg(msText(target))
+                .arg(-sec, 0, 'f', 3)
+                .arg(-target, 0, 'f', 0));
+    } else {
+        m_costText->setText("Nothing ticked has a reported latency yet, so there is no "
+                            "figure to give a video player.");
+    }
+
+    // --- the tick ---------------------------------------------------------
+    int muted = 0, ticked = 0;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        if (!inc[b] || m_out[b].node.isEmpty()) continue;
+        ++ticked;
+        if (m_shm->bus[b].mute.load()) ++muted;
+    }
+    QString hint = m_clicking
+        ? QString("Ticking on %1 output%2. One tick means they agree; a flam means they "
+                  "do not - turn the delay on the early one until it closes.")
+              .arg(ticked).arg(ticked == 1 ? "" : "s")
+        : QString("Plays a tick every 0.7 s on the %1 ticked output%2, from one clock. "
+                  "One tick = aligned. Two = not.")
+              .arg(ticked).arg(ticked == 1 ? "" : "s");
+    if (ticked < 2 && !m_clicking)
+        hint = "Tick at least two outputs to have something to compare - the point of "
+               "the test is one tick against another.";
+    if (muted)
+        hint += QString("  (%1 of them %2 muted; the tick goes in after the fader, so "
+                        "you will still hear it.)")
+                    .arg(muted).arg(muted == 1 ? "is" : "are");
+    m_clickHint->setText(hint);
+    m_clickBtn->setEnabled(ticked > 0);
+    m_clickBtn->setText(m_clicking ? "Stop the tick" : "Play a test tick");
+
+    // The engine stops the tick by itself if this window goes away; keep the
+    // button honest when it does.
+    if (m_clicking && m_shm->click_mask.load() == 0) m_clickBtn->setChecked(false);
+}
+
+// Which output's reported latency has moved since the last align, if any. Only
+// worth saying for a device that is still the same device: swapping headphones
+// for speakers changes the figure too, and that is not drift, it is a new setup.
+int AlignDialog::driftedBus() const
+{
+    QSettings cfg("betterbanana", "gui");
+    for (int b = 0; b < kPhysBuses; ++b) {
+        if (!m_out[b].inc->isChecked()) continue;
+        const QString node = cfg.value(QString("align/node%1").arg(b)).toString();
+        if (node.isEmpty() || node != m_out[b].node) continue;
+        const float was = cfg.value(QString("align/lat%1").arg(b), -1.0).toFloat();
+        const float now = m_shm->out_latency_ms[b].load();
+        if (was < 0.0f || now < 0.0f) continue;
+        // A couple of milliseconds is quantum jitter, not a renegotiation.
+        if (std::fabs(now - was) > 3.0f) return b;
+    }
+    return -1;
+}
+
+// Only while the delays are untouched since the align wrote them. The moment
+// somebody nudges one by hand, "undo the alignment" would be a lie about what
+// the button is going to do, and it goes back to offering zero.
+bool AlignDialog::undoAvailable() const
+{
+    if (!m_haveUndo) return false;
+    float now[kPhysBuses];
+    for (int b = 0; b < kPhysBuses; ++b) now[b] = m_shm->bus[b].delay_ms.load();
+    return align_undo_available(m_beforeAlign, m_afterAlign, now, kPhysBuses);
+}
+
+void AlignDialog::undoOrClear()
+{
+    QStringList said;
+    if (undoAvailable()) {
+        for (int b = 0; b < kPhysBuses; ++b) {
+            if (std::fabs(m_afterAlign[b] - m_beforeAlign[b]) <= 0.05f) continue;
+            m_shm->bus[b].delay_ms.store(m_beforeAlign[b]);
+            said << QString("%1 back to %2")
+                        .arg(labelFor(m_shm, false, b, kBusLabel[b]), msText(m_beforeAlign[b]));
+        }
+        m_haveUndo = false;
+        m_status->say("Alignment undone - " + said.join(", "), 8000);
+    } else {
+        for (int b = 0; b < kPhysBuses; ++b) {
+            if (m_shm->bus[b].delay_ms.load() <= 0.0f) continue;
+            m_shm->bus[b].delay_ms.store(0.0f);
+            said << labelFor(m_shm, false, b, kBusLabel[b]);
+        }
+        m_haveUndo = false;
+        m_status->say(said.isEmpty() ? "No output was being held back"
+                                     : "Cleared " + said.join(", ")
+                                       + " - every output is straight through again",
+                      8000);
+    }
+    // The remembered figures described an alignment that no longer exists, so
+    // the drift watch must not go on comparing against them.
+    forgetAlignment();
+    refresh();
+}
+
+void AlignDialog::forgetAlignment()
+{
+    QSettings cfg("betterbanana", "gui");
+    for (int b = 0; b < kPhysBuses; ++b) {
+        cfg.remove(QString("align/node%1").arg(b));
+        cfg.remove(QString("align/lat%1").arg(b));
+    }
+}
+
+void AlignDialog::rememberAlignment()
+{
+    QSettings cfg("betterbanana", "gui");
+    for (int b = 0; b < kPhysBuses; ++b) {
+        cfg.setValue(QString("align/node%1").arg(b), m_out[b].node);
+        cfg.setValue(QString("align/lat%1").arg(b),
+                     (double)m_shm->out_latency_ms[b].load());
+    }
+}
+
+void AlignDialog::setClickRunning(bool on)
+{
+    int mask = 0;
+    if (on)
+        for (int b = 0; b < kPhysBuses; ++b)
+            if (m_out[b].inc->isChecked() && !m_out[b].node.isEmpty()) mask |= 1 << b;
+
+    m_clicking = on && mask != 0;
+    m_shm->click_mask.store(mask);
+    if (on && !mask) {
+        QSignalBlocker block(m_clickBtn);
+        m_clickBtn->setChecked(false);
+    }
+    // Match the engine's dead-man, so the button does not sit there claiming to
+    // be ticking after the engine has given up on it.
+    if (m_clicking) m_clickStop->start(kClickMaxSec * 1000);
+    else            m_clickStop->stop();
+    refresh();
 }
 
 void AlignDialog::alignOutputs()
@@ -1837,7 +2488,7 @@ void AlignDialog::alignOutputs()
     for (int b = 0; b < kPhysBuses; ++b) {
         lat[b]  = m_shm->out_latency_ms[b].load();
         want[b] = m_shm->bus[b].delay_ms.load();
-        inc[b]  = !m_out[b].inc || m_out[b].inc->isChecked();
+        inc[b]  = m_out[b].inc->isChecked();
     }
     if (!align_delays(lat, want, kPhysBuses, inc)) {
         QMessageBox::information(this, "BetterBanana",
@@ -1847,20 +2498,30 @@ void AlignDialog::alignOutputs()
         return;
     }
     QStringList said, left;
+    // Everything this is about to overwrite, so it can be put back exactly
+    // rather than only flattened to zero.
+    for (int b = 0; b < kPhysBuses; ++b)
+        m_beforeAlign[b] = m_shm->bus[b].delay_ms.load();
     for (int b = 0; b < kPhysBuses; ++b) {
         const QString name = labelFor(m_shm, false, b, kBusLabel[b]);
         if (!inc[b])          { left << name + " (not ticked)"; continue; }
         if (lat[b] < 0.0f)    { left << name + " (no latency reported)"; continue; }
         m_shm->bus[b].delay_ms.store(want[b]);
-        said << QString("%1  held back %2 ms").arg(name).arg(want[b], 0, 'f', 1);
+        said << QString("%1  held back %2 ms, so it arrives at %3 ms")
+                    .arg(name).arg(want[b], 0, 'f', 1).arg(lat[b] + want[b], 0, 'f', 1);
     }
+    for (int b = 0; b < kPhysBuses; ++b)
+        m_afterAlign[b] = m_shm->bus[b].delay_ms.load();
+    m_haveUndo = true;
+    rememberAlignment();
     refresh();
     QMessageBox::information(this, "BetterBanana",
         "Outputs aligned:\n\n  " + said.join("\n  ") +
         (left.isEmpty() ? QString()
                         : "\n\nLeft alone:\n  " + left.join("\n  ")) +
-        "\n\nEverything ticked now arrives together with the slowest of them. "
-        "Save a preset if you want this to survive the engine restarting.");
+        "\n\nEverything ticked now arrives together with the slowest of them. Play the "
+        "test tick to hear it, and save a preset if you want it to survive the engine "
+        "restarting.");
 }
 
 void MainWindow::openAlignDialog()
@@ -1953,6 +2614,44 @@ static QVector<Finding> diagnose(Shared* shm, MainWindow* owner)
                    QString("The bus is assigned to \"%1\", which PipeWire is not "
                            "offering, so everything routed into it goes nowhere.")
                        .arg(dev), {}, {} });
+    }
+
+    // --- a delay that nothing justifies any more ---------------------------
+    // The one that took a whole evening to find. The mixer was aligned against
+    // Bluetooth earbuds at 303 ms; the earbuds were unplugged, everything moved
+    // to the wired interface, and the 282 ms of padding stayed behind on the
+    // bus. Every sound was a quarter of a second late, and nothing anywhere
+    // said so: the meters moved, the routing was right, the engine was healthy.
+    if (routed) {
+        float lat[kPhysBuses], del[kPhysBuses], want[kPhysBuses];
+        bool  inc[kPhysBuses];
+        for (int b = 0; b < kPhysBuses; ++b) {
+            lat[b] = shm->out_latency_ms[b].load();
+            del[b] = shm->bus[b].delay_ms.load();
+            inc[b] = bo[b][0] && std::strcmp(bo[b], kStreamSinkName) != 0;
+        }
+        const float ex = excess_delay_ms(lat, del, kPhysBuses, inc, want);
+        int worst = -1;
+        for (int b = 0; b < kPhysBuses; ++b) {
+            if (!inc[b] || lat[b] < 0.0f) continue;
+            if (worst < 0 || del[b] - want[b] > del[worst] - want[worst]) worst = b;
+        }
+        // Below the slap threshold it is as likely to be deliberate as stale.
+        if (ex >= 50.0f && worst >= 0)
+            f.append({ 0, QString("%1 is held back %2 ms more than anything needs")
+                              .arg(bname(worst)).arg(ex, 0, 'f', 0),
+                       QString("Time alignment holds an output back so it meets the "
+                               "slowest device you are listening on. Unplug that device "
+                               "- swapping Bluetooth earbuds for wired headphones does "
+                               "it - and the padding stays behind with nothing left to "
+                               "justify it. Everything through %1 arrives %2 ms late, "
+                               "and no meter or setting shows it.")
+                           .arg(bname(worst)).arg(ex, 0, 'f', 0),
+                       "Clear the output delays",
+                       [shm] {
+                           for (int b = 0; b < kPhysBuses; ++b)
+                               shm->bus[b].delay_ms.store(0.0f);
+                       } });
     }
 
     // --- the echo rule ------------------------------------------------------
@@ -3734,6 +4433,75 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
     if (complete) m_ruledStreams.intersect(seen);
 }
 
+// Bluetooth is the reason this exists. A link negotiates its codec with the
+// headset every time it connects, so the figure an alignment was built on can be
+// forty milliseconds different tomorrow - and the alignment quietly stops being
+// one, with nothing on screen to say so.
+//
+// Deliberately narrow, and off unless asked for. It moves a delay only when the
+// outputs WERE aligned before the device moved: after that test, writing the
+// new figure is restoring the state the user asked for, not inventing one. A
+// mix somebody set by hand never has a spread of zero, so it is never touched.
+void MainWindow::watchAlignment()
+{
+    if (m_versionLost || m_restarting) return;
+    float now[kPhysBuses], del[kPhysBuses];
+    bool  inc[kPhysBuses];
+
+    char hw[kHwStrips][kNameLen] = {}, bo[kPhysBuses][kNameLen] = {};
+    uint32_t seq = 0;
+    bool routed = false;
+    for (int t = 0; t < 16 && !routed; ++t) routed = routing_read(m_shm->routing, seq, hw, bo);
+
+    bool moved = false;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        now[b] = m_shm->out_latency_ms[b].load();
+        del[b] = m_shm->bus[b].delay_ms.load();
+        // Same rule as the button and as bb-ctl: the screen-share sink is heard
+        // by people on their own timeline and is never part of this.
+        inc[b] = routed && bo[b][0] && std::strcmp(bo[b], kStreamSinkName) != 0;
+        if (m_outLatSeen[b] >= 0.0f && now[b] >= 0.0f &&
+            std::fabs(now[b] - m_outLatSeen[b]) > 3.0f) moved = true;   // not jitter
+    }
+
+    // The spread as it was before the device moved. Computed first, because the
+    // next loop forgets the old figures whether or not anything is done.
+    const float was = arrival_spread_ms(m_outLatSeen, del, kPhysBuses, inc);
+    const bool  unchanged = !moved;
+    for (int b = 0; b < kPhysBuses; ++b) m_outLatSeen[b] = now[b];
+    if (unchanged) return;
+
+    if (!QSettings("betterbanana", "gui").value("align/auto", false).toBool()) return;
+    if (!(was >= 0.0f && was <= 1.0f)) return;      // it was not aligned; leave it
+
+    float want[kPhysBuses];
+    for (int b = 0; b < kPhysBuses; ++b) want[b] = del[b];
+    if (!align_delays(now, want, kPhysBuses, inc)) return;
+    for (int b = 0; b < kPhysBuses; ++b)
+        if (inc[b] && now[b] >= 0.0f) m_shm->bus[b].delay_ms.store(want[b]);
+    say("An output's latency changed - the outputs were lined up again", 8000);
+}
+
+// The engine came back as a build that lays the shared segment out
+// differently. There is nothing safe left to do here: reading gives the wrong
+// field and writing corrupts one, so the window stops rather than carrying on
+// looking like it works.
+void MainWindow::engineVersionChanged()
+{
+    if (m_versionLost) return;
+    m_versionLost = true;
+    m_timer->stop();
+    m_restarting = true;                 // belt and braces: no writes from anywhere
+    QMessageBox::critical(this, "BetterBanana",
+        QString("The audio engine was replaced by a different build.\n\n"
+                "This window speaks protocol v%1 and the engine now running does "
+                "not, so it can no longer read or change the mix safely - it has "
+                "stopped rather than move settings you did not touch.\n\n"
+                "Your mix is intact in the engine. Start the mixer again to see it.")
+            .arg(kVersion));
+    close();
+}
+
 void MainWindow::tick()
 {
     // restartEngine() stops this timer, but an event already queued when it did
@@ -3749,6 +4517,21 @@ void MainWindow::tick()
     {
         const int pid = m_shm->engine_pid.load();
         if (pid > 0 && m_enginePid > 0 && pid != m_enginePid) {
+            // The replacement can be a DIFFERENT BUILD. The segment is never
+            // unlinked - that is exactly what lets a mix survive a restart -
+            // so this window stays mapped over it at the old layout, and every
+            // field past the first change of shape is now somewhere else.
+            // Nothing announces that: the meters keep moving, and a write lands
+            // on whatever now occupies the offset. Installing a build with one
+            // new field silently zeroed a bus delay while this was being
+            // written, from a window that had not been touched.
+            //
+            // The pid is stored after the header, so by the time it changes the
+            // magic, version and size are all readable - and those three live
+            // at the front of the segment, which is mapped whatever the other
+            // build's Shared looks like.
+            if (!shm_compatible(m_shm)) { engineVersionChanged(); return; }
+
             // A second restart while an offer is still standing must not
             // replace the mix being offered with the preset that replaced it.
             if (m_recovered.isEmpty()) m_recovered = m_committed;
@@ -3759,6 +4542,7 @@ void MainWindow::tick()
         if (pid > 0) m_enginePid = pid;
     }
 
+    if (++m_alignTicks >= 60) { m_alignTicks = 0; watchAlignment(); }   // ~2 s
     if (++m_ruleTicks >= 30) { m_ruleTicks = 0; applyAppRules(); }
     // If a pactl round somehow neither finishes nor errors, the busy flag would
     // latch and application routing would stop for the life of the window.

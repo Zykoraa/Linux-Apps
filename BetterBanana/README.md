@@ -633,32 +633,116 @@ was, it says so and offers nothing.
 ## Time alignment
 
 Two output devices almost never have the same latency. On the machine this was
-built on, a USB interface reports 32 ms and a pair of Bluetooth earbuds report
-266 ms — anything feeding both arrives twice, a quarter of a second apart, which
+built on, a USB interface reports 16 ms and a pair of Bluetooth earbuds report
+303 ms — anything feeding both arrives twice, a quarter of a second apart, which
 is far past the point where it stops sounding like one sound.
 
-**Engine → Time alignment** (`Ctrl+T`, or `bb-gui --align`) shows what each
-device costs and lets you hold the quick ones back:
+**Engine → Time alignment** (`Ctrl+T`, or `bb-gui --align`) is built around one
+question — *do these arrive together?* — for somebody who does not think in
+milliseconds:
 
-- **The latency is read, not measured.** PipeWire already reports it for every
-  node, and for a Bluetooth sink that figure includes the codec and link delay —
-  exactly the part you cannot guess at and no test tone would tell you either.
-  There is nothing to calibrate and nothing to play.
-- **Align the outputs** delays every ticked output to meet the slowest one.
-- **Buses, not strips, are what align outputs.** A strip feeds both A1 and A2,
-  so delaying a strip moves both together. Only a delay on the bus can separate
-  them. Strips have their own delay for the other job: lip-sync against video,
-  or lining up two microphones on one source.
-- **Untick anything nobody is listening to in the room.** A bus feeding a
-  screen-share sink is heard by people somewhere else, on their own timeline;
-  delaying it only makes them wait, and if it were the slowest it would hold the
-  whole room back to match. The capture-only stream sink is unticked for you.
-- Delays are saved in presets, so an alignment survives the engine restarting.
+- **It adds the two numbers up for you.** Every row reads *device takes* **+**
+  *mixer adds* **=** *you hear it at*. That last column is the one that has to
+  match across outputs, and it used to be arithmetic the reader had to do in
+  their head across four rows.
+- **It draws them.** All the bars share one scale, so a row that ends short of
+  the dashed line is early by exactly that much. Solid is what the device costs
+  and cannot be argued with; the lighter block is what the mixer added.
+- **It leads with a sentence, not a figure.** "234 ms" means nothing to most
+  people; "you would hear that as two distinct sounds — an echo" does. The bands
+  are the ones where the ear's behaviour actually changes: under a millisecond
+  is one sound, up to about 30 ms is still one sound but hollow and phasey
+  (two copies comb-filter), to 60 ms is a slap, past that is an echo.
+- **Align the outputs** delays every ticked output to meet the slowest.
+- **Undo the alignment / Clear the output delays** is the way back, and the
+  button says which of the two it is about to do. Straight after an align it
+  offers to put the delays back exactly as they were; once one has been nudged
+  by hand — or in a later session — it offers zero instead. Input delays are
+  never touched: those are for lip-sync, not alignment.
 
+### When the device you aligned against goes away
+
+This is the failure aligning creates, and the reason the button above exists.
+The delay is written to meet the slowest device *in the set*. Unplug that device
+— swap Bluetooth earbuds for wired headphones — and the padding stays behind on
+everything else. Nothing looks wrong: the meters move, the routing is right, the
+engine is healthy, and every sound is a quarter of a second late.
+
+So the mixer says so, in three places:
+
+- The alignment verdict leads with it, in red, and the **Clear the output
+  delays** button becomes the highlighted one instead of **Align**:
+  *"A1 is held back 282.0 ms more than anything needs — that is why it sounds
+  late."*
+- **Engine → Check this setup** raises it as a **FIX** with the same button.
+- `bb-ctl timing` prints it before anything else.
+
+It is worked out rather than remembered: the mixer compares each output's delay
+against what alignment would write for the devices connected *now*, so it is
+still right after a reboot, a preset load, or a delay set from the shell.
+
+### Bluetooth
+
+The reason the whole section exists, and the one device class the figures cannot
+be taken entirely on faith for:
+
+- **The latency is read, not measured.** PipeWire reports it per node, and for a
+  Bluetooth sink that figure includes the codec and link delay — exactly the
+  part you cannot guess at. Rows for one are marked **BLUETOOTH**.
+- **It changes.** A Bluetooth link negotiates its codec with the headset on
+  every reconnect, so the figure you aligned against last week may not be the
+  figure today. The dialog remembers what each device reported when you aligned,
+  and if one has moved since — and the alignment is actually out because of it —
+  it says so and offers to do it again.
+- **Keep them lined up when a device's latency changes** does it without you.
+  Off by default, because it writes a delay with nobody watching, and
+  deliberately narrow: it only moves anything when the outputs *were* lined up
+  before the device moved. A mix set by hand never has a spread of zero, so it
+  is never touched. Put the earbuds back on and they come back aligned.
+- **Play a test tick** is how you check. It plays a short tick on every ticked
+  output, from one shared clock, every 0.7 s. If they arrive together you hear
+  one tick; if they do not you hear a flam, and holding the arrow keys on the
+  early output's delay walks the flam closed. That is the part no reported
+  figure can do for you. The tick goes in after the fader and the limiter, so a
+  bus you have turned down or muted still ticks, and it stops by itself after
+  three minutes if something goes wrong at the other end.
+
+### What aligning costs you
+
+Nothing can make a Bluetooth headset quicker, so aligning can only hold the
+early outputs back — everything ends up as late as the slowest thing you are
+listening on. **Video does not know about it.** A player asks PipeWire what its
+sink costs and is told about the mixer's own virtual sink, not about the
+Bluetooth link past it, so the picture runs ahead of the sound by the whole
+figure. The dialog prints the number to hand back:
+
+        mpv --audio-delay=-0.303        # negative delays the video
+        VLC  Tools -> Track synchronisation -> -303 ms
+
+Start from that and trim by eye; the player's own buffering is its business.
+
+### Buses, not strips
+
+A strip feeds both A1 and A2, so delaying a strip moves both of them together.
+Only a delay on the **bus** can separate two outputs. Strips have their own
+delay for the other job: lip-sync against a camera, or lining up two microphones
+on one source. **Align the outputs** leaves them alone.
+
+Untick anything nobody is listening to in the room. A bus feeding a screen-share
+sink is heard by people somewhere else, on their own timeline; delaying it only
+makes them wait, and if it were the slowest it would hold the whole room back to
+match. The capture-only stream sink is unticked for you.
+
+Delays are saved in presets, so an alignment survives the engine restarting.
+
+        bb-ctl timing                    # the whole picture, in words
+        bb-ctl bus align clear           # take an alignment back
+        bb-ctl click on                  # tick the outputs; `off` to stop
+        bb-ctl click on A1 A2            # or just one pair
         bb-ctl bus align                 # delay every output to meet the slowest
         bb-ctl bus A1 delay 234          # or by hand, 0 .. 500 ms
         bb-ctl strip 0 delay 40
-        bb-ctl status                    # the LATENCY and DELAY columns
+        bb-ctl status                    # the LATENCY, DELAY and ARRIVES columns
 
 ## Loudness
 
@@ -697,6 +781,9 @@ the meters keep moving, and the audio simply goes somewhere else:
 - **A strip feeds a bus with no output device.** An A bus with nothing assigned
   publishes no node, so everything routed into it is discarded without a word.
 - **A strip or bus names a device that is not connected.**
+- **A bus is held back further than anything needs**, because it was aligned
+  against a device that has since been unplugged or replaced. Offers to clear
+  the output delays.
 - **AUX is routed to the stream bus**, so everyone on the call hears themselves
   echoed back — and the people hearing it are the only ones who can tell. Offers
   to turn that route off.
@@ -1247,6 +1334,10 @@ freshly installed `99-bb-stream.conf` has no effect until you log out and back i
     ./build/bb-ctl vban out 1 host 192.168.1.20 && ./build/bb-ctl vban out 1 on
     ./build/bb-ctl vban apply
 
+    ./build/bb-ctl timing                       # the whole alignment picture, in words
+    ./build/bb-ctl bus align                    # hold the quick outputs back
+    ./build/bb-ctl click on                     # tick them so you can hear it
+
     ./build/bb-ctl eq list                      # built-in and saved profiles
     ./build/bb-ctl eq load A1 "Bass Boost"      # a built-in, a saved one, or a file
     ./build/bb-ctl eq load A2 ~/Downloads/HD650.txt
@@ -1275,7 +1366,7 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_autotune     # 20 note-snapping assertions
     ./build/test_pitch        # 22 pitch detection assertions, 85-300 Hz
     ./build/test_surround     # 32 bus-mode assertions: layouts, matrices, crossover
-    ./build/test_delay        # 26 delay-line and output-alignment assertions
+    ./build/test_delay        # 75 delay, alignment, stale-delay and test-tick assertions
     ./build/test_loudness     # 24 BS.1770 assertions, incl. EBU 3341 compliance
     ./build/test_fader        # fader value, clamping, paging and fine drag
     ./build/test_contrast     # the colour contract, over all ten palettes

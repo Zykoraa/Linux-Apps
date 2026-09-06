@@ -177,6 +177,16 @@ QColor dimOn(const Theme& t, const QColor& bg)
     return bbcolor::ensureContrast(t.textDim, bg, bbcolor::kTextFloor);
 }
 
+QColor alignDeviceColour(const Theme& t, bool included)
+{
+    return included ? t.busA : bbcolor::mix(t.busA, t.well, 0.62);
+}
+
+QColor alignDelayColour(const Theme& t, bool included)
+{
+    return bbcolor::mix(alignDeviceColour(t, included), t.well, 0.55);
+}
+
 QString buildStyleSheet(const Theme& t)
 {
     auto c = [](const QColor& x) { return x.name(QColor::HexRgb); };
@@ -263,6 +273,28 @@ QString buildStyleSheet(const Theme& t)
                      "QFrame[role=\"offer\"] QLabel{background:transparent;color:%3;"
                      "font-size:%4px;font-weight:bold;}")
                 .arg(c(a)).arg(radCtl()).arg(c(onFill(a))).arg(fsBody());
+    }
+    {
+        // The alignment verdict. Three states rather than two, because "close
+        // enough to fuse into one sound" and "a quarter of a second apart" are
+        // not the same problem and should not look the same. Tinted rather than
+        // filled: it carries two lines of prose and sits above a table, so a
+        // solid block of colour would shout down the thing it is describing.
+        s += QString("QFrame[role=\"verdict\"]{background:%1;border-radius:%2px;}")
+                .arg(c(t.panel)).arg(radCtl());
+        struct Sev { const char* key; QColor col; };
+        for (const Sev& v : { Sev{ "good", t.accent }, Sev{ "warn", t.solo },
+                              Sev{ "bad", t.mute } }) {
+            const QColor edge = bbcolor::fitFill(v.col, bbcolor::kTextFloor);
+            s += QString("QFrame[role=\"verdict\"][sev=\"%1\"]{background:%2;"
+                         "border-left:%3px solid %4;border-radius:%5px;}")
+                    .arg(v.key, c(bbcolor::mix(v.col, t.panel, 0.86)))
+                    .arg(px(3)).arg(c(edge)).arg(radCtl());
+        }
+        s += QString("QFrame[role=\"verdict\"] QLabel{background:transparent;"
+                     "color:%1;font-size:%2px;}").arg(c(t.text)).arg(fsCaption());
+        s += QString("QFrame[role=\"verdict\"] QLabel[role=\"verdicttop\"]"
+                     "{font-size:%1px;font-weight:bold;}").arg(fsBody());
     }
 
     // --- text -------------------------------------------------------------

@@ -17,6 +17,7 @@
 #include "spectrum.h"
 #include "surround.h"
 #include "delay.h"
+#include "click.h"
 #include "loudness.h"
 #include "voicefx.h"
 
@@ -38,6 +39,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <ctime>
 #include <string>
 #include <map>
 #include <thread>
@@ -335,6 +337,12 @@ struct Engine {
     float duck_env = 0.0f;                 // 0..1
     SmoothGain duck_gain[kStrips];
 
+    // The timing-test click. One phase for every bus, so a tick leaves them all
+    // on the same sample and the only difference left to hear is the one being
+    // measured.
+    ClickTrain click;
+    time_t     click_since = 0;            // when the mask last went non-zero
+
     // scratch
     float stripout[kStrips][kMaxChunk * kChan];   // per-strip post-DSP output
     float sbuf[kMaxChunk * kChan];
@@ -566,6 +574,11 @@ void Engine::mix_chunk(uint32_t n)
         }
     }
 
+    // The timing-test click, if one is running. Read once for the whole cycle
+    // so every bus ticks off the same mask and the same phase.
+    const int click_mask = s->click_mask.load(std::memory_order_relaxed);
+    click.set_running(click_mask != 0);
+
     // Bus stage: EQ -> mono -> gain -> limiter.
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];
@@ -606,6 +619,14 @@ void Engine::mix_chunk(uint32_t n)
             if (pk[c] >= 0.999f) s->meters.bus_clip[b].store(1, std::memory_order_relaxed);
         }
 
+        // The test tick goes in after the fader and the limiter but before the
+        // delay, so it travels exactly the path being aligned - and a bus you
+        // have turned down still ticks, which is rather the point of being able
+        // to test one. It lands after the peak meters and before the loudness
+        // meter; a 3 ms tick at -20 dBFS every 700 ms is 0.4% duty and moves
+        // LUFS by hundredths, so it is not worth a second code path.
+        if (b < kPhysBuses && (click_mask & (1 << b))) click.mix(acc[b], n);
+
         // Alignment goes last, after the limiter, so the delay carries exactly
         // what the device will receive. This is the one that matters for
         // listening: two outputs almost never have the same latency, and only a
@@ -624,6 +645,7 @@ void Engine::mix_chunk(uint32_t n)
         bus_ring[b].drop_to(kResyncQuanta * n);
         bus_ring[b].write(acc[b], n);
     }
+    click.advance(n);
 
     // Spectrum tap: whichever single signal an open EQ editor asked for. Buses
     // are tapped post-EQ, strips post-processing, so what is drawn is what the
@@ -1296,6 +1318,21 @@ void Engine::poll_control()
         if (!ep_out[b].target.empty()) connect_endpoint(this, &ep_out[b]);
     }
 
+    // A click train left running is miserable, and the GUI that started it can
+    // die, hang or be killed with the dialog open. Time it out here rather than
+    // trusting the other end to clear it.
+    {
+        const int mask = shm->click_mask.load(std::memory_order_relaxed);
+        const time_t now = time(nullptr);
+        if (!mask) click_since = 0;
+        else if (!click_since) click_since = now;
+        else if (now - click_since >= kClickMaxSec) {
+            shm->click_mask.store(0, std::memory_order_relaxed);
+            click_since = 0;
+            std::fprintf(stderr, "[bb] timing click stopped after %d s\n", kClickMaxSec);
+        }
+    }
+
     const uint32_t cs = shm->cmd_seq.load(std::memory_order_acquire);
     if (cs != cmd_seen) {
         cmd_seen = cs;
@@ -1451,6 +1488,7 @@ int main(int argc, char** argv)
         g_eng.duck_gain[i].snap(1.0f);
     }
     for (int b = 0; b < kBuses; ++b) g_eng.bdsp[b].configure(g_eng.sr);
+    g_eng.click.configure(g_eng.sr);
     for (int b = 0; b < kPhysBuses; ++b) {
         int m = g_eng.shm->bus[b].mode.load();
         g_eng.ep_out[b].mode = (m >= 0 && m < kBusModeCount) ? m : kBusNormal;

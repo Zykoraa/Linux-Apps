@@ -65,6 +65,13 @@ QColor                onFill(const QColor& fill);
 // same card, which is what tests/test_contrast.cpp checks.
 QColor                busChipColour(const Theme& t, int bus);
 QColor                dimOn(const Theme& t, const QColor& bg);
+// The two tones an alignment bar is drawn in: what the device costs, and what
+// the mixer added on top. Both derived from one colour rather than taken from
+// two theme roles, because several palettes give busA and accent the same
+// value - and a bar whose halves are the same colour is one bar, which is the
+// whole thing it exists not to be. tests/test_contrast.cpp holds them apart.
+QColor                alignDeviceColour(const Theme& t, bool included = true);
+QColor                alignDelayColour (const Theme& t, bool included = true);
 
 const QVector<Theme>& builtinThemes();
 const Theme&          theme();                 // current

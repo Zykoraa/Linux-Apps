@@ -75,6 +75,14 @@ static void bar(float lin)
 static const char* kStripName[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX" };
 static const char* kBusName[kBuses]    = { "A1", "A2", "A3", "B1", "B2" };
 
+// "  16.0 ms" or "       -", the same width either way, so a column of them
+// still reads as a column when a device has not reported.
+static void fmt_ms(char* out, size_t n, float ms)
+{
+    if (ms < 0.0f) std::snprintf(out, n, "%9s", "-");
+    else           std::snprintf(out, n, "%6.1f ms", ms);
+}
+
 static void usage()
 {
     std::printf(
@@ -108,6 +116,9 @@ static void usage()
       "  strip <i> delay <ms>        hold this strip back, 0 .. 500\n"
       "  bus <b> delay <ms>          hold this bus back, 0 .. 500\n"
       "  bus align                   delay every output to meet the slowest\n"
+      "  bus align clear             take it back: every output straight through\n"
+      "  timing                      the whole alignment picture, in words\n"
+      "  click on [A1 A2 A3] | off   tick the outputs so you can hear the timing\n"
       "  loudness reset              start the integrated measurement again\n"
       "  bus <b> mode <name|n>       A1..A3 only: Normal, TV mix, Repeat,\n"
       "                              Up-mix 2.1/4.1/5.1/7.1, Centre only,\n"
@@ -431,23 +442,29 @@ int main(int argc, char** argv)
             }
             std::printf("\n");
         }
-        std::printf("\n%-12s %7s %5s %5s %5s  %-12s %8s %8s %7s %7s  device\n",
+        std::printf("\n%-12s %7s %5s %5s %5s  %-12s %8s %8s %8s %7s %7s  device\n",
                     "BUS", "GAIN", "MUTE", "MONO", "EQ", "MODE",
-                    "LATENCY", "DELAY", "LUFS-S", "LUFS-I");
+                    "LATENCY", "DELAY", "ARRIVES", "LUFS-S", "LUFS-I");
         for (int b = 0; b < kBuses; ++b) {
             BusParams& p = s->bus[b];
             // B1 and B2 are what other applications record from, so they have
             // no mode to show rather than a mode that is always Normal.
             const char* mode = b < kPhysBuses ? bus_layout(p.mode.load()).name : "-";
-            char lat[16] = "       -";
+            char lat[16] = "       -", arr[16] = "       -";
             if (b < kPhysBuses) {
                 const float v = s->out_latency_ms[b].load();
                 if (v >= 0.0f) std::snprintf(lat, sizeof(lat), "%6.1fms", v);
+                // What the listener actually gets: the device plus whatever the
+                // mixer is holding it back by. This is the column that has to
+                // read the same across outputs, and the one nobody could see
+                // without adding the other two up in their head.
+                const float a = arrival_ms(v, p.delay_ms.load());
+                if (a >= 0.0f) std::snprintf(arr, sizeof(arr), "%6.1fms", a);
             }
-            std::printf("%-12s %6.1f  %5d %5d %5d  %-12s %8s %6.1fms %7.1f %7.1f  %s\n",
+            std::printf("%-12s %6.1f  %5d %5d %5d  %-12s %8s %6.1fms %8s %7.1f %7.1f  %s\n",
                 (lok && lbus[b][0]) ? lbus[b] : kBusName[b], p.gain_db.load(),
                 p.mute.load(), p.mono.load(), p.eq.on.load(), mode,
-                lat, p.delay_ms.load(),
+                lat, p.delay_ms.load(), arr,
                 s->meters.bus_lufs_s[b].load(), s->meters.bus_lufs_i[b].load(),
                 b < kPhysBuses ? (out[b][0] ? out[b] : "(unassigned)") : "(virtual source)");
         }
@@ -554,6 +571,20 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (cmd == "bus" && argc == 4 && std::string(argv[2]) == "align"
+                    && std::string(argv[3]) == "clear") {
+        int n = 0;
+        for (int b = 0; b < kPhysBuses; ++b) {
+            const float d = s->bus[b].delay_ms.load();
+            if (d <= 0.0f) continue;
+            s->bus[b].delay_ms.store(0.0f);
+            std::printf("A%d  was held back %.1f ms, now straight through\n", b + 1, d);
+            ++n;
+        }
+        if (!n) std::printf("no output was being held back\n");
+        return 0;
+    }
+
     if (cmd == "bus" && argc == 3 && std::string(argv[2]) == "align") {
         char hw[kHwStrips][kNameLen], obo[kPhysBuses][kNameLen];
         uint32_t rseq = 0;
@@ -583,9 +614,168 @@ int main(int argc, char** argv)
             else if (lat[b] < 0.0f)
                 std::printf("A%d  latency unknown          delay unchanged\n", b + 1);
             else
-                std::printf("A%d  latency %7.1f ms     delay %7.1f ms\n",
-                            b + 1, lat[b], want[b]);
+                std::printf("A%d  latency %7.1f ms     delay %7.1f ms     arrives %7.1f ms\n",
+                            b + 1, lat[b], want[b], lat[b] + want[b]);
         }
+        {
+            const float spread = arrival_spread_ms(lat, want, kPhysBuses, inc);
+            if (spread >= 0.0f)
+                std::printf("\nEverything counted now arrives within %.1f ms of the "
+                            "slowest. `bb-ctl click on` to hear it.\n", spread);
+        }
+        return 0;
+    }
+
+    // The whole alignment picture in words, for when the GUI is not up. Same
+    // arithmetic and the same verdict the dialog leads with, so the two cannot
+    // drift apart into two different answers.
+    if (cmd == "timing" && argc == 2) {
+        char hw[kHwStrips][kNameLen], obo[kPhysBuses][kNameLen];
+        char hwd[kHwStrips][kNameLen], obod[kPhysBuses][kNameLen];
+        uint32_t rseq = 0;
+        bool rok = false;
+        for (int t = 0; t < 16 && !rok; ++t)
+            rok = routing_read(s->routing, rseq, hw, obo, hwd, obod);
+
+        float lat[kPhysBuses], del[kPhysBuses];
+        bool  inc[kPhysBuses];
+        std::printf("OUTPUTS - what you hear\n");
+        for (int b = 0; b < kPhysBuses; ++b) {
+            lat[b] = s->out_latency_ms[b].load();
+            del[b] = s->bus[b].delay_ms.load();
+            const char* node = rok ? obo[b] : "";
+            const char* desc = rok && obod[b][0] ? obod[b] : node;
+            inc[b] = node[0] && std::strcmp(node, kStreamSinkName) != 0;
+            const bool bt = std::strstr(node, "bluez") != nullptr;
+            const float a = arrival_ms(lat[b], del[b]);
+
+            char dv[16], ar[16];
+            fmt_ms(dv, sizeof(dv), lat[b]);
+            fmt_ms(ar, sizeof(ar), a);
+            std::printf("  A%d  %-30.30s  device %s  + delay %6.1f ms  = %s",
+                        b + 1, node[0] ? desc : "(unassigned)", dv, del[b], ar);
+            if (!inc[b] && node[0]) std::printf("   not counted (capture only)");
+            else if (bt)            std::printf("   Bluetooth");
+            std::printf("\n");
+        }
+
+        int early = -1, late = -1;
+        const float spread = arrival_spread_ms(lat, del, kPhysBuses, inc, &early, &late);
+
+        // Checked before the gap, and it wins: a delay left over from a device
+        // that is gone reads as an ordinary gap, and "align" is the wrong
+        // answer to it.
+        float want[kPhysBuses];
+        const float excess = excess_delay_ms(lat, del, kPhysBuses, inc, want);
+        int worst = -1;
+        for (int b = 0; b < kPhysBuses; ++b) {
+            if (!inc[b] || lat[b] < 0.0f) continue;
+            if (worst < 0 || del[b] - want[b] > del[worst] - want[worst]) worst = b;
+        }
+
+        std::printf("\n");
+        if (excess > 1.0f && worst >= 0) {
+            std::printf("  A%d is held back %.1f ms more than anything needs - that is\n"
+                        "  why it sounds late. Alignment pads an output to meet the\n"
+                        "  slowest device in the set; unplug that device and the padding\n"
+                        "  stays behind.\n"
+                        "  Run `bb-ctl bus align clear` to put every output straight\n"
+                        "  through, or `bb-ctl bus align` to redo it for what is plugged\n"
+                        "  in now.\n", worst + 1, excess);
+        } else if (spread < 0.0f) {
+            std::printf("  Only one counted output has a reported latency, so there is\n"
+                        "  nothing to line it up against.\n");
+        } else if (gap_verdict(spread) == kGapTogether) {
+            std::printf("  Everything counted arrives together, within %.1f ms.\n", spread);
+        } else {
+            std::printf("  A%d is %.1f ms ahead of A%d - you would hear that as %s.\n"
+                        "  Run `bb-ctl bus align` to hold A%d back to meet it.\n",
+                        early + 1, spread, late + 1, gap_sounds_like(gap_verdict(spread)),
+                        early + 1);
+        }
+
+        std::printf("\nINPUTS - what the mixer hears\n");
+        for (int i = 0; i < kHwStrips; ++i) {
+            const char* node = rok ? hw[i] : "";
+            const char* desc = rok && hwd[i][0] ? hwd[i] : node;
+            // A virtual cable has no description of its own; name it the way
+            // the mixer's own device list does rather than by its node name.
+            char cable[kNameLen];
+            if (node[0] && std::strncmp(node, kCablePrefix, std::strlen(kCablePrefix)) == 0) {
+                std::snprintf(cable, sizeof(cable), "BetterBanana Cable %d",
+                              atoi(node + std::strlen(kCablePrefix)) + 1);
+                desc = cable;
+            }
+            const float l = s->in_latency_ms[i].load();
+            const float d = s->strip[i].delay_ms.load();
+            char dv[16], ar[16];
+            fmt_ms(dv, sizeof(dv), l);
+            fmt_ms(ar, sizeof(ar), arrival_ms(l, d));
+            std::printf("  %d   %-30.30s  device %s  + delay %6.1f ms  = %s\n",
+                        i + 1, node[0] ? desc : "(unassigned)", dv, d, ar);
+        }
+
+        float slowest = -1.0f;
+        for (int b = 0; b < kPhysBuses; ++b)
+            if (inc[b]) { const float a = arrival_ms(lat[b], del[b]);
+                          if (a > slowest) slowest = a; }
+        if (slowest >= 0.0f)
+            std::printf("\nCounted outputs land %.1f ms after an application plays a sound,\n"
+                        "and a video player is told nothing about it - it only sees the\n"
+                        "mixer's own virtual sink. Give it the figure back:\n"
+                        "    mpv --audio-delay=%.3f      (negative delays the video)\n"
+                        "    VLC  Tools -> Track synchronisation -> %.0f ms\n",
+                        slowest, -slowest / 1000.0, -slowest);
+        return 0;
+    }
+
+    // The tick. Runs on every output that `bus align` would count, from one
+    // shared clock: one tick means they agree, two means they do not.
+    if (cmd == "click" && argc >= 3) {
+        const std::string what = argv[2];
+        if (what == "off") {
+            s->click_mask.store(0);
+            std::printf("tick stopped\n");
+            return 0;
+        }
+        if (what != "on") { usage(); return 1; }
+
+        char hw[kHwStrips][kNameLen], obo[kPhysBuses][kNameLen];
+        uint32_t rseq = 0;
+        bool rok = false;
+        for (int t = 0; t < 16 && !rok; ++t) rok = routing_read(s->routing, rseq, hw, obo);
+
+        int mask = 0, n = 0;
+        if (argc > 3) {
+            // An explicit list, for testing one pair - or a bus the automatic
+            // choice leaves out, like the screen-share sink.
+            for (int i = 3; i < argc; ++i) {
+                const int b = bus_index(argv[i]);
+                if (b < 0 || b >= kPhysBuses) {
+                    std::fprintf(stderr, "bb-ctl: click takes A1..A3, not '%s'\n", argv[i]);
+                    return 1;
+                }
+                if (!(mask & (1 << b))) { mask |= 1 << b; ++n; }
+            }
+        } else {
+            for (int b = 0; b < kPhysBuses; ++b) {
+                if (!rok || !obo[b][0]) continue;
+                // Same rule as aligning: the screen-share sink is heard by
+                // people somewhere else, and they did not ask for a tick.
+                if (std::strcmp(obo[b], kStreamSinkName) == 0) continue;
+                mask |= 1 << b;
+                ++n;
+            }
+        }
+        if (!mask) {
+            std::fprintf(stderr, "bb-ctl: no A bus has an output device to tick.\n");
+            return 1;
+        }
+        s->click_mask.store(mask);
+        std::printf("ticking on %d output%s every %.0f ms. One tick means they agree;\n"
+                    "a flam means they do not - `bb-ctl bus A1 delay <ms>` to close it.\n"
+                    "Stops on `bb-ctl click off`, or by itself after %d s.\n",
+                    n, n == 1 ? "" : "s", (double)kClickPeriodMs, kClickMaxSec);
         return 0;
     }
 

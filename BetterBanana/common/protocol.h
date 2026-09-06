@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 11;
+constexpr uint32_t kVersion    = 12;
 constexpr const char* kShmName = "/betterbanana.state";
 
 // The null sink a screen share transmits. Audio played into it is inaudible in
@@ -261,6 +261,12 @@ enum Command : int32_t {
     kCmdClearClip, kCmdResetLoudness
 };
 
+// The timing-test click. Period is deliberately longer than Delay::kMaxMs: at
+// 500 ms of alignment delay a shorter one would wrap, and two outputs half a
+// period apart sound exactly like two outputs perfectly aligned.
+constexpr float kClickPeriodMs = 700.0f;
+constexpr int   kClickMaxSec   = 180;
+
 enum RecState : int32_t { kRecIdle = 0, kRecRecording, kRecPlaying };
 
 // The tape deck: records one bus to WAV, and plays a WAV back into the matrix
@@ -339,6 +345,18 @@ struct Shared {
     af  in_latency_ms [kHwStrips];
     af  out_latency_ms[kPhysBuses];
 
+    // The timing test click. Bit b plays a tick on physical bus b, every
+    // kClickPeriodMs, until the bit is cleared - injected after the bus fader
+    // and the limiter but BEFORE the alignment delay, so it travels exactly
+    // the path being measured and a bus you have turned down still ticks.
+    //
+    // A train rather than a one-shot, because the useful test is not "did it
+    // click" but "is it one click or two": two outputs a quarter of a second
+    // apart flam, and you can hear the flam close up as you turn the delay.
+    // The engine clears this itself after kClickMaxSec, so a GUI that dies
+    // mid-test cannot leave a tick running in someone's headphones.
+    ai  click_mask;
+
     StripParams strip[kStrips];
     BusParams   bus[kBuses];
     Meters      meters;
@@ -410,6 +428,7 @@ inline void set_defaults(Shared* s)
     s->dsp_load.store(0);
     for (int i = 0; i < kHwStrips;  ++i) s->in_latency_ms[i].store(-1.0f);
     for (int b = 0; b < kPhysBuses; ++b) s->out_latency_ms[b].store(-1.0f);
+    s->click_mask.store(0);
     for (int b = 0; b < kBuses; ++b) {
         s->meters.bus_lufs_s[b].store(-70.0f);
         s->meters.bus_lufs_i[b].store(-70.0f);

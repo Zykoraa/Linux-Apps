@@ -1,9 +1,11 @@
 // Time alignment: the delay line, and the arithmetic that decides how much
 // delay each output needs so they all arrive together.
 #include "../engine/delay.h"
+#include "../engine/click.h"
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <vector>
 
 using namespace bb;
@@ -173,6 +175,270 @@ int main()
         chk(align_delays(lat, out, 2), "a huge gap still aligns");
         near(out[0], Delay::kMaxMs, 1e-6, "clamped to what the delay line can hold");
         near(out[1], 0.0, 1e-6, "and the slowest is still undelayed");
+    }
+
+    // --- what the listener actually gets ----------------------------------
+    {
+        near(arrival_ms(32.0f, 234.0f), 266.0, 1e-4, "arrival is the two numbers added");
+        near(arrival_ms(266.0f, 0.0f), 266.0, 1e-4, "with no delay it is just the device");
+        chk(arrival_ms(-1.0f, 100.0f) < 0.0f,
+            "an unreported device has no arrival time, not a 100 ms one");
+        near(arrival_ms(10.0f, -5.0f), 10.0, 1e-4, "a negative delay is not subtracted");
+    }
+    {
+        // The real machine: a USB interface at 32 ms and Galaxy Buds at 266.
+        const float lat[3] = { 32.0f, 266.0f, 20.0f };
+        float del[3] = { 0.0f, 0.0f, 0.0f };
+        const bool all[3] = { true, true, true };
+        int early = -9, late = -9;
+        near(arrival_spread_ms(lat, del, 3, all, &early, &late), 246.0, 1e-4,
+             "the spread is between the earliest and the latest, not the first two");
+        chk(early == 2 && late == 1, "and it names which two");
+
+        // Aligning has to close it.
+        chk(align_delays(lat, del, 3, all), "aligns");
+        near(arrival_spread_ms(lat, del, 3, all), 0.0, 1e-3,
+             "after aligning there is nothing left to close");
+    }
+    {
+        const float lat[2] = { 32.0f, -1.0f };
+        float del[2] = { 0.0f, 0.0f };
+        chk(arrival_spread_ms(lat, del, 2) < 0.0f,
+            "one usable output has nothing to disagree with, so there is no spread");
+    }
+    {
+        // Excluding the slowest changes the answer - this is the screen-share
+        // sink case that made the include mask necessary in the first place.
+        const float lat[3] = { 32.0f, 266.0f, 20.0f };
+        float del[3] = { 0.0f, 0.0f, 0.0f };
+        const bool inc[3] = { true, false, true };
+        near(arrival_spread_ms(lat, del, 3, inc), 12.0, 1e-4,
+             "an unticked output is not part of the spread");
+    }
+    {
+        // A delay already set counts towards the arrival, so an aligned pair
+        // reads as aligned rather than as its raw latencies.
+        const float lat[2] = { 32.0f, 266.0f };
+        float del[2] = { 234.0f, 0.0f };
+        near(arrival_spread_ms(lat, del, 2), 0.0, 1e-4,
+             "the spread is between arrivals, not between device latencies");
+    }
+    {
+        chk(gap_verdict(0.0f)   == kGapTogether, "no gap is no gap");
+        chk(gap_verdict(0.4f)   == kGapTogether, "under a millisecond fuses");
+        chk(gap_verdict(5.0f)   == kGapColour,   "a few ms combs rather than echoes");
+        chk(gap_verdict(29.0f)  == kGapColour,   "still one event just under 30 ms");
+        chk(gap_verdict(45.0f)  == kGapSlap,     "40-something ms is a slap");
+        chk(gap_verdict(234.0f) == kGapEcho,     "a Bluetooth headset against a DAC "
+                                                 "is two distinct sounds");
+        chk(gap_verdict(-3.0f)  == kGapTogether, "a negative gap is not an echo");
+    }
+
+    // --- a delay nothing justifies any more --------------------------------
+    {
+        // The real one, from the machine this was built on: aligned against
+        // Bluetooth earbuds at 303 ms, then the earbuds were unplugged and
+        // everything moved to the interface. The 282 ms stayed behind, and
+        // every sound was a quarter of a second late with nothing on screen
+        // saying why.
+        const float lat[3] = { 16.0f, -1.0f, 0.0f };
+        const float del[3] = { 282.0f, 0.0f, 0.0f };
+        const bool  inc[3] = { true, true, false };
+        float want[3];
+        near(excess_delay_ms(lat, del, 3, inc, want), 282.0, 1e-4,
+             "a delay left over from a device that is gone is all excess");
+        near(want[0], 0.0, 1e-4, "and what alignment wants today is nothing");
+    }
+    {
+        // A genuine alignment is not an excess.
+        const float lat[3] = { 16.0f, 303.0f, 0.0f };
+        const float del[3] = { 287.0f, 0.0f, 0.0f };
+        const bool  inc[3] = { true, true, false };
+        float want[3];
+        near(excess_delay_ms(lat, del, 3, inc, want), 0.0, 1e-4,
+             "a delay that meets the slowest device is not excess");
+        near(want[0], 287.0, 1e-4, "and it is exactly what alignment wants");
+    }
+    {
+        // Half the story: the device is still there but has become quicker,
+        // which is what a Bluetooth codec change does.
+        const float lat[2] = { 16.0f, 200.0f };
+        const float del[2] = { 287.0f, 0.0f };
+        const bool  inc[2] = { true, true };
+        float want[2];
+        near(excess_delay_ms(lat, del, 2, inc, want), 103.0, 1e-4,
+             "a device that got quicker leaves the difference as excess");
+    }
+    {
+        // An unassigned bus carrying a delay is not making anything late, so it
+        // is not worth complaining about.
+        const float lat[2] = { -1.0f, 20.0f };
+        const float del[2] = { 400.0f, 0.0f };
+        const bool  inc[2] = { true, true };
+        float want[2];
+        near(excess_delay_ms(lat, del, 2, inc, want), 0.0, 1e-4,
+             "a bus with no reported device is left alone");
+        near(want[0], 400.0, 1e-4, "and its delay is reported back unchanged");
+    }
+    {
+        // Excluded outputs are nobody's problem either.
+        const float lat[2] = { 16.0f, 20.0f };
+        const float del[2] = { 300.0f, 0.0f };
+        const bool  inc[2] = { false, true };
+        float want[2];
+        near(excess_delay_ms(lat, del, 2, inc, want), 0.0, 1e-4,
+             "an unticked output is not counted as late");
+    }
+    {
+        // Nothing known at all: no claim either way.
+        const float lat[2] = { -1.0f, -1.0f };
+        const float del[2] = { 100.0f, 100.0f };
+        const bool  inc[2] = { true, true };
+        float want[2];
+        near(excess_delay_ms(lat, del, 2, inc, want), 0.0, 1e-4,
+             "with no latencies known it accuses nothing");
+    }
+
+    // --- taking an alignment back -----------------------------------------
+    {
+        const float before[3] = { 0.0f, 0.0f, 0.0f };
+        const float after [3] = { 287.0f, 0.0f, 0.0f };
+        chk(align_undo_available(before, after, after, 3),
+            "straight after an align, undo is on offer");
+
+        const float nudged[3] = { 290.0f, 0.0f, 0.0f };
+        chk(!align_undo_available(before, after, nudged, 3),
+            "a delay moved by hand since means undo would restore the wrong thing");
+
+        const float rounding[3] = { 287.02f, 0.0f, 0.0f };
+        chk(align_undo_available(before, after, rounding, 3),
+            "but a hundredth of a millisecond is float noise, not an edit");
+
+        const float same[3] = { 0.0f, 0.0f, 0.0f };
+        chk(!align_undo_available(same, same, same, 3),
+            "an align that changed nothing has nothing to undo");
+
+        // Undoing back to a non-zero state is the whole reason this is not
+        // simply a "set everything to zero" button.
+        const float had[3]  = { 40.0f, 0.0f, 0.0f };
+        const float set[3]  = { 287.0f, 0.0f, 0.0f };
+        chk(align_undo_available(had, set, set, 3),
+            "an align over an existing delay can be taken back to it");
+    }
+
+    // --- the timing-test click --------------------------------------------
+    {
+        ClickTrain c;
+        c.configure(kSr);
+        near(c.period(), kClickPeriodMs * 0.001f * kSr, 1.0,
+             "the period is what the protocol says");
+        chk(c.period() > (int)(Delay::kMaxMs * 0.001f * kSr),
+            "and is longer than the delay line, so a full delay cannot alias one "
+            "tick onto the next");
+        chk(!c.running(), "starts silent");
+
+        std::vector<float> buf(512 * 2, 0.0f);
+        c.mix(buf.data(), 512);
+        chk(buf[0] == 0.0f && buf[1000] == 0.0f, "and adds nothing while it is off");
+    }
+    {
+        // One tick per period, in the same place on every bus.
+        ClickTrain c;
+        c.configure(kSr);
+        c.set_running(true);
+        const int block = 256;
+        const int total = c.period() * 2 + block;
+        std::vector<float> a(block * 2), b(block * 2);
+        int ticks = 0, firstAt = -1, maxAt = -1;
+        float peak = 0.0f;
+        bool sameOnBoth = true, stereo = true;
+        for (int off = 0; off < total; off += block) {
+            std::fill(a.begin(), a.end(), 0.0f);
+            std::fill(b.begin(), b.end(), 0.0f);
+            c.mix(a.data(), block);
+            c.mix(b.data(), block);          // a second bus, same cycle
+            bool inThis = false;
+            for (int i = 0; i < block; ++i) {
+                if (a[i * 2] != b[i * 2]) sameOnBoth = false;
+                if (a[i * 2] != a[i * 2 + 1]) stereo = false;
+                const float v = std::fabs(a[i * 2]);
+                if (v > peak) { peak = v; maxAt = off + i; }
+                if (v > 1e-6f) {
+                    inThis = true;
+                    if (firstAt < 0) firstAt = off + i;
+                }
+            }
+            if (inThis) ++ticks;
+            c.advance(block);
+        }
+        chk(sameOnBoth, "every bus gets the identical tick from the shared phase");
+        chk(stereo, "and it is centred, not on one side");
+        chk(firstAt >= 0 && firstAt < c.burst(),
+            "the first tick lands immediately, not half a period later");
+        chk(ticks >= 2, "it repeats");
+        near(peak, ClickTrain::kPeak, ClickTrain::kPeak * 0.05,
+             "at the level it advertises");
+        chk(maxAt > 0 && maxAt < c.burst(),
+            "the loudest sample is inside the burst, in its windowed middle");
+    }
+    {
+        // The tick has to be an even multiple of nothing in particular, but it
+        // does have to start and end at silence - a rectangular gate would
+        // click at both edges, which is the last thing a test for double
+        // arrivals needs.
+        ClickTrain c;
+        c.configure(kSr);
+        c.set_running(true);
+        std::vector<float> buf(2048 * 2, 0.0f);
+        c.mix(buf.data(), 2048);
+        near(buf[0], 0.0, 1e-6, "the burst starts at zero");
+        near(buf[(size_t)(c.burst() - 1) * 2], 0.0, 2e-3, "and ends there");
+        for (int i = c.burst(); i < 2048; ++i)
+            if (buf[(size_t)i * 2] != 0.0f) { chk(false, "silence after the burst"); break; }
+    }
+    {
+        // Restarting begins the train again rather than resuming a free-running
+        // phase, so pressing the button always ticks now.
+        ClickTrain c;
+        c.configure(kSr);
+        c.set_running(true);
+        c.advance(1000);
+        chk(c.phase() == 1000, "the phase runs while it is on");
+        c.set_running(false);
+        c.advance(1000);
+        chk(c.phase() == 0, "and is parked while it is off");
+        c.set_running(true);
+        chk(c.phase() == 0, "so a restart begins on a tick");
+    }
+    {
+        // The delay line has to carry the tick, or the test would be measuring a
+        // path the audio does not take. Measured as the difference between two
+        // runs rather than against zero: the tick fades in from silence, so
+        // whichever threshold spots it is a few samples late in both, and the
+        // subtraction removes that instead of hiding it in a tolerance.
+        auto first_tick = [&](float delayMs) {
+            ClickTrain c;
+            c.configure(kSr);
+            c.set_running(true);
+            Delay d;
+            d.configure(kSr);
+            d.set_ms(delayMs);
+            const int block = 512, frames = 24000;
+            std::vector<float> buf((size_t)block * 2);
+            for (int off = 0; off < frames; off += block) {
+                std::fill(buf.begin(), buf.end(), 0.0f);
+                c.mix(buf.data(), block);
+                c.advance(block);
+                d.process(buf.data(), block);
+                for (int i = 0; i < block; ++i)
+                    if (std::fabs(buf[(size_t)i * 2]) > 1e-4f) return off + i;
+            }
+            return -1;
+        };
+        const int dry = first_tick(0.0f), wet = first_tick(100.0f);
+        chk(dry >= 0 && wet >= 0, "the tick comes out of the delay line");
+        near(wet - dry, 100.0 * 0.001 * kSr, 1.0,
+             "a hundred milliseconds later, which is what the test is for");
     }
 
     std::printf("%d/%d checks passed\n", g_total - g_fail, g_total);

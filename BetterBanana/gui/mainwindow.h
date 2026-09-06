@@ -4,6 +4,7 @@
 
 #include "../common/protocol.h"
 #include "widgets.h"
+#include "dialogbits.h"
 
 #include <QElapsedTimer>
 #include "knob.h"
@@ -25,6 +26,7 @@ class QSpinBox;
 class QCheckBox;
 class QTimer;
 class QGridLayout;
+class QFrame;
 
 // One input strip: 3 hardware, then VAIO and AUX.
 class StripWidget : public QWidget {
@@ -259,6 +261,29 @@ private:
 // somewhere else. They are all cheap to test and impossible to guess at.
 class MainWindow;
 
+// One row of the alignment table, drawn to scale: how long the device takes,
+// how much the mixer is holding it back on top of that, and where the sum lands
+// against every other row. The table has always had the two numbers; a reader
+// had to add them, then compare the sums across four rows, to answer the only
+// question anybody actually has - do these arrive together?
+class AlignBarCell : public QWidget {
+public:
+    explicit AlignBarCell(QWidget* parent = nullptr);
+
+    // All the cells share one scale and one target line, set by the dialog, so
+    // the bars can be read across rows.
+    void setScale(float fullMs, float targetMs);
+    void setValues(float latencyMs, float delayMs, bool included);
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+
+private:
+    float m_full = 300.0f, m_target = -1.0f;
+    float m_lat = -1.0f, m_delay = 0.0f;
+    bool  m_inc = true;
+};
+
 // Time alignment. Two output devices almost never have the same latency, and
 // PipeWire already knows the figure for each of them - for a Bluetooth sink it
 // is the codec and link delay, which nothing else can see - so this reads them
@@ -267,25 +292,60 @@ class AlignDialog : public QDialog {
     Q_OBJECT
 public:
     explicit AlignDialog(bb::Shared* shm, QWidget* parent = nullptr);
+    ~AlignDialog() override;
 
 private slots:
     void refresh();
 
 private:
     void alignOutputs();
+    void undoOrClear();
+    // True while the delays are still exactly what the last align in this
+    // window wrote, so the button can offer to put back what was there before
+    // rather than only offering zero.
+    bool undoAvailable() const;
+    void setClickRunning(bool on);
+    void rememberAlignment();           // what the latencies were when aligned
+    void forgetAlignment();             // ... and what to forget when it is undone
+    int  driftedBus() const;            // -1, or a bus whose device has moved
 
     bb::Shared* m_shm;
     struct Row {
         QLabel* dev = nullptr;
+        QLabel* kind = nullptr;         // "Bluetooth" chip, when it is one
         QLabel* lat = nullptr;
         class QDoubleSpinBox* delay = nullptr;
-        QCheckBox* inc = nullptr;   // outputs only: include this one in an align
-        QString    lastDev;         // so a device CHANGE can reset the tick
+        QLabel* arrive = nullptr;
+        AlignBarCell* bar = nullptr;
+        QCheckBox* inc = nullptr;       // outputs only: include this in an align
+        QString    lastDev;             // so a device CHANGE can reset the tick
+        QString    node;                // current node name, for the drift watch
+        bool       bt = false;
     };
     Row m_in [bb::kHwStrips];
     Row m_out[bb::kPhysBuses];
-    QLabel* m_note = nullptr;
+
+    QFrame*  m_verdict = nullptr;       // the headline: together, or how far off
+    QLabel*  m_verdictText = nullptr;
+    QLabel*  m_verdictSub = nullptr;
+    QFrame*  m_driftOffer = nullptr;    // a Bluetooth device changed its figure
+    QLabel*  m_driftText = nullptr;
+    QLabel*  m_scaleCap = nullptr;
+    QLabel*  m_costText = nullptr;      // what aligning costs you against video
+    QLabel*  m_clickHint = nullptr;
+    QPushButton* m_clickBtn = nullptr;
+    QPushButton* m_alignBtn = nullptr;
+    QPushButton* m_clearBtn = nullptr;
+    bbdlg::StatusStrip* m_status = nullptr;
+    // Aligning is easy to do and was impossible to take back. Both halves are
+    // kept: what the delays were before, and what the align wrote, so the
+    // button can tell whether it is still looking at its own work.
+    float m_beforeAlign[bb::kPhysBuses] = {};
+    float m_afterAlign [bb::kPhysBuses] = {};
+    bool  m_haveUndo = false;
     QTimer* m_timer = nullptr;
+    QTimer* m_clickStop = nullptr;      // matches the engine's own dead-man
+    bool    m_clicking = false;
 };
 
 class DiagnoseDialog : public QDialog {
@@ -318,6 +378,12 @@ public:
     void openAlignDialog();
     // Public because a diagnostic finding offers it as its fix.
     void restartEngine();
+
+private:
+    void engineVersionChanged();
+    // Bluetooth renegotiates its codec on every reconnect, so an alignment can
+    // come undone while nobody is looking at the dialog that made it.
+    void watchAlignment();
 
 private slots:
     void tick();
@@ -411,6 +477,9 @@ private:
     // Set while restartEngine() is bouncing the engine: the heartbeat is
     // expected to stop, so the alarm and the undo recorder both stand down.
     bool     m_restarting = false;
+    bool     m_versionLost = false;      // engine came back as a different build
+    float    m_outLatSeen[bb::kPhysBuses] = { -1.0f, -1.0f, -1.0f };
+    int      m_alignTicks = 0;
     QLabel*  m_alert = nullptr;   // the banner across the top when it is not
     QString  m_statusColour;      // so a theme change repaints it and a tick does not
 
@@ -420,7 +489,7 @@ private:
     // settled state is what can be offered back.
     int        m_enginePid = 0;
     QByteArray m_recovered;
-    class QFrame* m_offer = nullptr;
+    QFrame* m_offer = nullptr;
     QLabel*       m_offerText = nullptr;
 
     QVector<QByteArray> m_undo, m_redo;

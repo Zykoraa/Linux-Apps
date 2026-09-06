@@ -148,6 +148,29 @@ int main(int argc, char** argv)
                     t.name + QString(": bus%1 vs bus%2 dE=%3").arg(b).arg(o)
                                  .arg(bbcolor::deltaE(chip, busChipColour(t, o)), 0, 'f', 1));
         }
+        // --- the alignment bar ------------------------------------------
+        // Its two segments say two different things - what the device costs,
+        // and what the mixer added on top - so a palette that renders them the
+        // same colour turns the whole graphic into one meaningless bar. That
+        // happened: several themes give busA and accent the same value, and
+        // nothing anywhere noticed until a screenshot was read pixel by pixel.
+        {
+            const QColor dev = alignDeviceColour(t);
+            const QColor add = alignDelayColour(t);
+            chk(bbcolor::deltaE(dev, add) >= 10.0,
+                "the two halves of an alignment bar are distinguishable",
+                t.name + QString(": %1 vs %2 dE=%3")
+                             .arg(dev.name(QColor::HexRgb), add.name(QColor::HexRgb))
+                             .arg(bbcolor::deltaE(dev, add), 0, 'f', 1));
+            // And both have to be visible against the trough they sit in, or
+            // the shorter one reads as an empty bar.
+            for (const QColor& c : { dev, add })
+                chk(bbcolor::deltaE(c, t.well) >= 12.0,
+                    "an alignment bar segment stands out from its trough",
+                    t.name + QString(": %1 on %2 dE=%3")
+                                 .arg(c.name(QColor::HexRgb), t.well.name(QColor::HexRgb))
+                                 .arg(bbcolor::deltaE(c, t.well), 0, 'f', 1));
+        }
     }
 
     // --- the helpers themselves ------------------------------------------

@@ -117,4 +117,127 @@ inline bool align_delays(const float* latency_ms, float* delay_ms_out, int n,
     return true;
 }
 
+// --- what the listener actually gets --------------------------------------
+//
+// The table used to show a device's latency and the delay set against it as two
+// separate numbers, and left the addition to the reader. The sum is the whole
+// point: it is when the sound reaches you, it is the number that has to match
+// across outputs, and it is the number to type into a video player.
+inline float arrival_ms(float latency_ms, float delay_ms)
+{
+    if (!(latency_ms >= 0.0f)) return -1.0f;
+    return latency_ms + (delay_ms > 0.0f ? delay_ms : 0.0f);
+}
+
+// The spread between the earliest and latest thing you can hear, which is what
+// says whether aligning has anything left to do. Returns -1 when fewer than two
+// outputs are usable - one output is always in perfect agreement with itself.
+// `early`/`late` name which two, so the verdict can say so.
+inline float arrival_spread_ms(const float* latency_ms, const float* delay_ms, int n,
+                               const bool* include = nullptr,
+                               int* early = nullptr, int* late = nullptr)
+{
+    int lo = -1, hi = -1, usable = 0;
+    float loV = 0.0f, hiV = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (include && !include[i]) continue;
+        const float a = arrival_ms(latency_ms[i], delay_ms[i]);
+        if (a < 0.0f) continue;
+        ++usable;
+        if (lo < 0 || a < loV) { lo = i; loV = a; }
+        if (hi < 0 || a > hiV) { hi = i; hiV = a; }
+    }
+    if (early) *early = lo;
+    if (late)  *late  = hi;
+    // Two entries with the same arrival are a spread of zero, which is the
+    // answer this whole dialog is trying to reach - not a missing one. Count
+    // them rather than asking whether the earliest and latest are the same row.
+    if (usable < 2) return -1.0f;
+    return hiV - loV;
+}
+
+// How much of each output's delay nothing currently justifies.
+//
+// This is the failure that aligning creates and never cleans up. The delay is
+// written to meet the slowest device in the set; unplug that device - swap
+// Bluetooth earbuds for wired headphones - and the padding stays behind on
+// every other output. Everything is then a quarter of a second late for a
+// reason nothing on screen explains, and the mixer looks perfectly healthy
+// while it happens.
+//
+// `want_out` must have room for n, and comes back holding the delay alignment
+// would write today. The return value is the worst excess over that.
+//
+// A bus whose device has not reported a latency is left alone: it is either
+// unassigned or unknown, and in neither case is it making anything late.
+inline float excess_delay_ms(const float* latency_ms, const float* delay_ms, int n,
+                             const bool* include, float* want_out)
+{
+    for (int i = 0; i < n; ++i) want_out[i] = delay_ms[i];
+    align_delays(latency_ms, want_out, n, include);
+
+    float worst = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if ((include && !include[i]) || latency_ms[i] < 0.0f) {
+            want_out[i] = delay_ms[i];          // nothing to say about this one
+            continue;
+        }
+        const float ex = delay_ms[i] - want_out[i];
+        if (ex > worst) worst = ex;
+    }
+    return worst;
+}
+
+// Whether "undo the alignment" is still an honest thing for a button to say.
+//
+// Two conditions, and both matter. The delays have to be exactly what the align
+// wrote, because the moment somebody nudges one by hand the button would be
+// promising to restore a state that is no longer the one it replaced. And the
+// align has to have actually changed something, or "undo" would do nothing and
+// look broken.
+inline bool align_undo_available(const float* before, const float* after,
+                                 const float* now, int n)
+{
+    bool changed = false;
+    for (int i = 0; i < n; ++i) {
+        if (std::fabs(now[i] - after[i]) > 0.05f) return false;
+        if (std::fabs(after[i] - before[i]) > 0.05f) changed = true;
+    }
+    return changed;
+}
+
+// What a gap between two arrivals sounds like. The millisecond figure on its
+// own means nothing to most people - 30 ms and 300 ms are both "a bit" - and
+// the four bands below are where the ear's behaviour actually changes.
+enum GapVerdict {
+    kGapTogether = 0,   // one sound, and no clue there were ever two
+    kGapColour,         // still one sound, but hollow: two copies comb-filter
+    kGapSlap,           // a thickening or slap, on the edge of separating
+    kGapEcho            // two distinct sounds
+};
+
+// Fusion is gradual, not switched, so these are the middles of the transitions
+// rather than anything the ear does sharply. Under a millisecond two arrivals
+// are a phase difference; up to about 30 ms the precedence effect still fuses
+// them into one event while comb filtering colours it; past 50 ms speech starts
+// to separate, and by 60 ms almost anyone hears two.
+inline GapVerdict gap_verdict(float gap_ms)
+{
+    const float g = gap_ms < 0.0f ? 0.0f : gap_ms;
+    if (g < 1.0f)  return kGapTogether;
+    if (g < 30.0f) return kGapColour;
+    if (g < 60.0f) return kGapSlap;
+    return kGapEcho;
+}
+
+inline const char* gap_sounds_like(GapVerdict v)
+{
+    switch (v) {
+    case kGapTogether: return "one sound";
+    case kGapColour:   return "one sound, but hollow and phasey";
+    case kGapSlap:     return "a slap, on the edge of splitting in two";
+    default:           return "two distinct sounds - an echo";
+    }
+}
+
 } // namespace bb

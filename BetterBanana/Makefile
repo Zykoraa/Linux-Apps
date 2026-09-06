@@ -23,7 +23,7 @@ BUILD    := build
 HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset.h \
             engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
             engine/pitchtrack.h engine/autotune.h engine/surround.h \
-            engine/delay.h engine/loudness.h
+            engine/delay.h engine/loudness.h engine/click.h
 GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
             gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
             gui/dialogbits.h
