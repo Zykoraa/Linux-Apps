@@ -33,7 +33,7 @@ jobs:
         run: pacman -Syu --noconfirm --needed base-devel git sudo
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Create non-root build user
         run: |
@@ -54,14 +54,14 @@ jobs:
           echo "Built $f"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: glory-injector-pkg
           path: ${{ steps.pkg.outputs.file }}
 
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.pkg.outputs.file }}
           fail_on_unmatched_files: true
