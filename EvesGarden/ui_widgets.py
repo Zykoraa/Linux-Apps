@@ -727,8 +727,28 @@ def _g_leaf(c, cx, cy, s, col, w):
     return items
 
 
+def _g_download(c, cx, cy, s, col, w):
+    """An arrow into a tray. The row's Download button, without the word."""
+    return [c.create_line(_pts([(12, 4), (12, 14.5)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND),
+            c.create_line(_pts([(7.5, 10.5), (12, 15), (16.5, 10.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND),
+            c.create_line(_pts([(6, 19), (18, 19)], cx, cy, s), fill=col,
+                          width=w, capstyle=tk.ROUND)]
+
+
+def _g_check(c, cx, cy, s, col, w):
+    """A tick: this one is already in the library."""
+    return [c.create_line(_pts([(6, 12.5), (10.5, 17), (18, 7.5)], cx, cy, s),
+                          fill=col, width=w, capstyle=tk.ROUND,
+                          joinstyle=tk.ROUND)]
+
+
 GLYPHS = {
     "close": _g_close,
+    "download": _g_download,
+    "check": _g_check,
     "search": _g_search,
     "leaf": _g_leaf,
     "play": _g_play,
@@ -1282,7 +1302,12 @@ class InWindowOptionMenu(ctk.CTkOptionMenu):
             return
 
         top = self.winfo_toplevel()
-        rows_shown = min(len(values), self.MAX_VISIBLE)
+        # How many rows the window itself has room for, not just how many we
+        # would like to show. A tiling compositor is free to hand the app a
+        # window shorter than the list, and then no position fits it: the
+        # last themes hung off the bottom where they could not be reached.
+        room = max(1, (top.winfo_height() - 24) // self.ROW_H)
+        rows_shown = max(1, min(len(values), self.MAX_VISIBLE, room))
         width = max(self.winfo_width(), 140)
         height = rows_shown * self.ROW_H + 12
         # CTk insists a frame's size is fixed at construction, not in place().
@@ -1300,6 +1325,10 @@ class InWindowOptionMenu(ctk.CTkOptionMenu):
         if y + height > top.winfo_height() and y - height - self.winfo_height() > 0:
             # No room below: hang it above the button instead of off the edge.
             y = y - height - self.winfo_height() - 4
+        # And when it fits neither way -- a long list in a short window --
+        # slide it back on screen rather than letting the last rows hang off
+        # the bottom where they cannot be reached.
+        y = max(4, min(y, max(4, top.winfo_height() - height - 4)))
         x = max(4, min(x, max(4, top.winfo_width() - width - 8)))
 
         panel.place(x=x, y=y)
@@ -1314,7 +1343,7 @@ class InWindowOptionMenu(ctk.CTkOptionMenu):
         self._close_on_next_click = True
 
     def _panel_body(self, panel, values, width, rows_shown):
-        scrolling = len(values) > self.MAX_VISIBLE
+        scrolling = len(values) > rows_shown
         if scrolling:
             body = ctk.CTkScrollableFrame(panel, fg_color="transparent",
                                           corner_radius=0)
