@@ -38,7 +38,12 @@ if getattr(sys, "frozen", False):
 # wrapper is gone rather than kept as a no-op.
 import customtkinter as ctk
 
-import pystray
+# pystray is imported inside _start_tray_icon rather than here. Importing it
+# picks a backend eagerly, and the xorg backend opens a display at import
+# time -- so on a machine with no X server the import itself raises
+# Xlib.error.DisplayNameError and takes the whole module with it. That makes
+# the pure layout helpers in here unimportable on a headless box, which is
+# where the tests run.
 from PIL import Image, ImageDraw
 import threading
 
@@ -3029,6 +3034,15 @@ class App(ctk.CTk):
         it is answered by waiting for the icon's setup callback, which only
         fires once the icon is really visible.
         """
+        # No display means no tray, and pystray says so by raising out of
+        # the import. That is the same answer as "no tray host answered",
+        # so it is reported the same way: None, and the caller iconifies.
+        try:
+            import pystray
+        except Exception as e:
+            print(f"No system tray available: {e}")
+            return None
+
         # Was a glyph drawn with ImageDraw.text onto a black square, which
         # came out as an unreadable smudge at tray size.
         image = app_icon.icon_image(64)

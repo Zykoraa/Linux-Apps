@@ -3436,3 +3436,32 @@ class RadioFavourites(unittest.TestCase):
         keep = self.store()
         self.assertFalse(keep.add({"name": "Broken"}))
         self.assertEqual(keep.all(), [])
+
+
+class HeadlessImport(unittest.TestCase):
+    """gui must import with no display, because this file imports it.
+
+    The layout helpers tested above live in gui.py, so every test that calls
+    one imports the whole module. That module used to import pystray at the
+    top, and pystray chooses a backend eagerly -- the xorg one opens a
+    display while it is being imported. On a machine with an X server that
+    is invisible. On CI there is none, so the import raised
+    DisplayNameError and thirteen pure-logic tests died on it.
+
+    A display cannot be un-set once this process has one, so the check runs
+    in a subprocess with the display stripped out of the environment.
+    """
+
+    def test_gui_imports_with_no_display(self):
+        import subprocess
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        done = subprocess.run(
+            [sys.executable, "-c", "import gui"],
+            cwd=root, env=env, capture_output=True, text=True)
+        self.assertEqual(
+            done.returncode, 0,
+            "gui.py does not import without a display, so the headless "
+            "tests that use it cannot run on CI:\n" + done.stderr[-2000:])
