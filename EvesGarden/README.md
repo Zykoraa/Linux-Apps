@@ -98,13 +98,32 @@ duration and penalised for `live`, `karaoke`, `remix`, `full album` and the
 like, so you get the right version rather than the first hit. Downloads run
 three at a time with per-track state, cancel, and retry-failed.
 
+**Browsing an artist** — a search answers with artists as well as songs, and
+either the artist or the credit under a track opens their discography:
+albums, singles and compilations, newest first, with reissues and alternate
+editions folded into one row. Take a whole album in a click, or open it and
+pick individual tracks. Works without a Spotify account — the keyless
+provider browses too, so this is not gated behind setup.
+
 **Playback** — a serial cascade of RBJ peaking biquads for the EQ (unity at
 0 dB, so "flat" really is flat), soft-clipping to round off peaks, volume,
 seek, shuffle, repeat, and resume where you left off. Audio goes out through
 PortAudio, so PipeWire, PulseAudio and bare ALSA all work.
 
-**Presentation** — 18 themes, 32 visualiser modes with 13 colour palettes,
+**Presentation** — 18 themes, 9 visualiser modes with 13 colour palettes,
 synced lyrics, and album-art-derived accent colours with a contrast check.
+
+**The spectrum** — the visualiser is the backdrop to Now Playing rather than
+a page of its own, drawn on the same canvas as the blurred cover and the
+cards, in a band along the bottom so it never becomes a wall of colour with
+the title inside it. It reads 64 bands rather than 16: a 2048-sample chunk
+gives about a thousand usable FFT bins, and all but sixteen of them used to
+be thrown away one step after being computed.
+
+**Lyrics** follow the song and centre the line being sung, gliding rather
+than jumping, and hand the pane back to you for a few seconds whenever you
+scroll it yourself. Words with no timings drift with the song instead of
+sitting still until they have run off the bottom.
 
 ## Where it keeps things
 
@@ -214,9 +233,11 @@ PNGs, the `.ico` and the base64 copy embedded in `app_icon.py`.
 | `library_index.py` | SQLite index over the tags |
 | `library_view.py` | Songs / Albums / Artists browser |
 | `downloader.py` | Spotify metadata, YouTube sourcing, tagging |
+| `discover.py` | Search, artist and album browsing, preview streams |
+| `metadata.py` | The keyless catalogue, used when Spotify is not set up |
 | `download_manager.py` | Download queue with per-track state |
 | `player_engine.py` | Decoding, EQ, playback |
-| `visualizers.py` | 32 visualiser modes and 13 palettes |
+| `visualizers.py` | 9 visualiser modes and 13 palettes |
 | `mpris.py` | The player on D-Bus: media keys, panels, `playerctl` |
 | `linux_window.py` | Frameless window that the window manager still owns |
 | `recycle.py` | Trashing files, per the freedesktop spec |
@@ -234,6 +255,12 @@ into the modules it changed -- `mpris.py` on why claiming the media keys is
 the wrong shape here, `linux_window.py` on why `overrideredirect` is a
 different and much stronger thing on X11, `recycle.py` on why the Windows
 fallback would have deleted your music.
+
+Dropdowns are drawn inside the window rather than as `tkinter.Menu` popups.
+A Tk menu is a separate X11 override-redirect window, and a Wayland
+compositor is free to put one wherever it likes: Hyprland centres them on
+the monitor, which left the list about 965px away from the clicks that
+worked. `ui_widgets.InWindowOptionMenu` has the detail.
 
 Credentials are never compiled into the binary. A client secret inside an
 executable can be read straight back out of the archive, so each person

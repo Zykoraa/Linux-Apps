@@ -1215,3 +1215,171 @@ def compose_stage(art, width, height, cover_size, cover_xy, tint="#000000",
     y = int(cover_xy[1] - (plate.size[1] - cover_size) / 2)
     stage.alpha_composite(plate, (x, y))
     return stage.convert("RGB")
+
+
+# ---------------------------------------------------------------- dropdowns
+
+class InWindowOptionMenu(ctk.CTkOptionMenu):
+    """A CTkOptionMenu whose list opens inside the window.
+
+    CustomTkinter opens its list as a `tkinter.Menu`, which on X11 is a
+    separate override-redirect window positioned in root coordinates. A
+    Wayland compositor is under no obligation to honour that position, and
+    Hyprland does not: it centres the popup on the monitor. Measured here,
+    the button drew exactly where X reported it while its list drew 965px
+    right and 430px down of where it was asked to go -- so the list you can
+    see is not where the clicks land, and the clicks that do work are on an
+    invisible strip back at the button.
+
+    No arithmetic in the app can correct that, because the position being
+    ignored is the one it would be correcting. Drawn inside the app's own
+    toplevel there is no second window for the compositor to place, so it
+    lands where it is put -- on Hyprland, on X11, and on everything else.
+
+    Only the list is replaced. The button keeps CTk's drawing, and selection
+    still goes through `_dropdown_callback`, so `variable`, `command`, `set`
+    and `get` behave exactly as before.
+    """
+
+    # Beyond this many rows the list scrolls rather than growing past the
+    # window: eighteen themes will not fit under the button on a laptop.
+    MAX_VISIBLE = 12
+    ROW_H = 30
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._panel = None
+        self._panel_rows = []
+        self._outside_bind = None
+        self._escape_bind = None
+
+    def _list_colour(self, attribute):
+        """The colour the caller asked for, off the menu CTk built for it."""
+        value = getattr(self._dropdown_menu, attribute, None)
+        return value if value else self._text_color
+
+    # ------------------------------------------------------------- opening
+
+    def _clicked(self, event=0):
+        """Toggle the list.
+
+        CTk's own version talks to the `tkinter.Menu` it opened, which this
+        widget never opens, so its bookkeeping would leave the panel stuck
+        open on a second click.
+        """
+        if self._panel is not None:
+            self.close_dropdown()
+            return
+        if self._state is not tk.DISABLED and self._values:
+            self._open_dropdown_menu()
+
+    def _open_dropdown_menu(self):
+        if self._panel is not None:
+            self.close_dropdown()
+            return
+        values = list(self._values or [])
+        if not values:
+            return
+
+        top = self.winfo_toplevel()
+        rows_shown = min(len(values), self.MAX_VISIBLE)
+        width = max(self.winfo_width(), 140)
+        height = rows_shown * self.ROW_H + 12
+        # CTk insists a frame's size is fixed at construction, not in place().
+        panel = ctk.CTkFrame(top, corner_radius=8, border_width=1,
+                             width=width, height=height,
+                             fg_color=self._list_colour("_fg_color"),
+                             border_color=self._button_color)
+        panel.pack_propagate(False)
+        self._panel_body(panel, values, width, rows_shown)
+
+        # Both widgets live in the same toplevel, so this difference is exact
+        # and owes nothing to where the compositor thinks the window is.
+        x = self.winfo_rootx() - top.winfo_rootx()
+        y = self.winfo_rooty() - top.winfo_rooty() + self.winfo_height() + 2
+        if y + height > top.winfo_height() and y - height - self.winfo_height() > 0:
+            # No room below: hang it above the button instead of off the edge.
+            y = y - height - self.winfo_height() - 4
+        x = max(4, min(x, max(4, top.winfo_width() - width - 8)))
+
+        panel.place(x=x, y=y)
+        panel.lift()
+        self._panel = panel
+
+        # A click anywhere else, or Escape, puts it away -- the two things a
+        # menu is expected to do that a plain frame does not do by itself.
+        self._outside_bind = top.bind("<Button-1>", self._maybe_close, add="+")
+        self._escape_bind = top.bind("<Escape>",
+                                     lambda _e: self.close_dropdown(), add="+")
+        self._close_on_next_click = True
+
+    def _panel_body(self, panel, values, width, rows_shown):
+        scrolling = len(values) > self.MAX_VISIBLE
+        if scrolling:
+            body = ctk.CTkScrollableFrame(panel, fg_color="transparent",
+                                          corner_radius=0)
+            body.pack(fill="both", expand=True, padx=2, pady=4)
+        else:
+            body = ctk.CTkFrame(panel, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=2, pady=4)
+
+        self._panel_rows = []
+        for value in values:
+            chosen = value == self._current_value
+            row = ctk.CTkButton(
+                body, text=value, height=self.ROW_H - 2, anchor="w",
+                corner_radius=6, font=self._font,
+                fg_color=self._button_color if chosen else "transparent",
+                text_color=self._list_colour("_text_color"),
+                hover_color=self._list_colour("_hover_color"),
+                command=lambda v=value: self._choose(v))
+            row.pack(fill="x", padx=2, pady=1)
+            self._panel_rows.append(row)
+        return body
+
+    # ------------------------------------------------------------- closing
+
+    def _choose(self, value):
+        self.close_dropdown()
+        self._dropdown_callback(value)
+
+    def _maybe_close(self, event):
+        """Close unless the click landed inside the list."""
+        panel = self._panel
+        if panel is None:
+            return
+        try:
+            widget = event.widget
+            while widget is not None:
+                if widget is panel or widget is self:
+                    return
+                widget = getattr(widget, "master", None)
+        except Exception:
+            pass
+        self.close_dropdown()
+
+    def close_dropdown(self):
+        panel, self._panel = self._panel, None
+        self._panel_rows = []
+        if panel is None:
+            return
+        try:
+            top = self.winfo_toplevel()
+            if self._outside_bind is not None:
+                top.unbind("<Button-1>", self._outside_bind)
+            if self._escape_bind is not None:
+                top.unbind("<Escape>", self._escape_bind)
+        except Exception:
+            pass
+        self._outside_bind = self._escape_bind = None
+        try:
+            panel.destroy()
+        except Exception:
+            pass
+
+    def is_open(self):
+        return self._panel is not None
+
+    def destroy(self):
+        self.close_dropdown()
+        super().destroy()
