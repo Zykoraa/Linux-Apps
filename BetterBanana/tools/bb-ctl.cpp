@@ -923,10 +923,16 @@ int main(int argc, char** argv)
             const int i = atoi(argv[3]) - 1;
             if (i < 0 || i >= kHwStrips) { routing_write_end(s->routing); std::fprintf(stderr, "in 1..3\n"); return 1; }
             std::snprintf(s->routing.hw_in[i], kNameLen, "%s", name);
+            // Asking for a route is a request to rebuild the link, not just to
+            // record a name: the name may already be the one stored while the
+            // stream sits on some other node. Bump so the engine relinks even
+            // when nothing about the string changed.
+            ++s->routing.hw_in_gen[i];
         } else if (dir == "out") {
             const int b = bus_index(argv[3]);
             if (b < 0 || b >= kPhysBuses) { routing_write_end(s->routing); std::fprintf(stderr, "out A1..A3\n"); return 1; }
             std::snprintf(s->routing.bus_out[b], kNameLen, "%s", name);
+            ++s->routing.bus_out_gen[b];
         } else { routing_write_end(s->routing); usage(); return 1; }
         routing_write_end(s->routing);
         return 0;

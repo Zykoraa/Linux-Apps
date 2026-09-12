@@ -603,6 +603,12 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         std::memcpy(s->routing.bus_out,      out,  sizeof(out));
         std::memcpy(s->routing.hw_in_desc,   hwd,  sizeof(hwd));
         std::memcpy(s->routing.bus_out_desc, outd, sizeof(outd));
+        // Loading a preset is a request for the graph to match it, so every
+        // endpoint it describes relinks even where the name is unchanged.
+        // Reloading a preset is then a way to repair routing, which is what it
+        // already looked like it did.
+        for (int i = 0; i < kHwStrips;  ++i) ++s->routing.hw_in_gen[i];
+        for (int b = 0; b < kPhysBuses; ++b) ++s->routing.bus_out_gen[b];
         routing_write_end(s->routing);
     }
     s->vban.seq.fetch_add(1, std::memory_order_release);

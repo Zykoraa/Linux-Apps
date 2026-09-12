@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 12;
+constexpr uint32_t kVersion    = 13;
 constexpr const char* kShmName = "/betterbanana.state";
 
 // The null sink a screen share transmits. Audio played into it is inaudible in
@@ -253,6 +253,15 @@ struct Routing {
     // not, and lets the engine re-find a device whose node.name has moved.
     char hw_in_desc  [kHwStrips][kNameLen];
     char bus_out_desc[kPhysBuses][kNameLen];
+    // Bumped by whoever asks for a route explicitly. An unchanged device name is
+    // not proof the link is live: a stream naming a target that is not in the
+    // graph yet gets handed to the default device instead, and the engine has no
+    // way to notice from the name alone. Without these, re-issuing the very
+    // route that is already recorded - the obvious way to repair a strip
+    // pointing at the wrong source - was silently a no-op, and only routing to
+    // "-" and back rebuilt the stream.
+    uint32_t hw_in_gen  [kHwStrips];
+    uint32_t bus_out_gen[kPhysBuses];
 };
 
 enum Command : int32_t {
@@ -404,7 +413,9 @@ inline bool routing_read(const Routing& r, uint32_t& seen,
                          char hw[kHwStrips][kNameLen],
                          char out[kPhysBuses][kNameLen],
                          char hwd[kHwStrips][kNameLen] = nullptr,
-                         char outd[kPhysBuses][kNameLen] = nullptr)
+                         char outd[kPhysBuses][kNameLen] = nullptr,
+                         uint32_t hwg[kHwStrips] = nullptr,
+                         uint32_t outg[kPhysBuses] = nullptr)
 {
     const uint32_t s0 = r.seq.load(std::memory_order_acquire);
     if (s0 & 1u) return false;
@@ -412,6 +423,8 @@ inline bool routing_read(const Routing& r, uint32_t& seen,
     std::memcpy(out, r.bus_out, sizeof(char) * kPhysBuses * kNameLen);
     if (hwd)  std::memcpy(hwd,  r.hw_in_desc,   sizeof(char) * kHwStrips  * kNameLen);
     if (outd) std::memcpy(outd, r.bus_out_desc, sizeof(char) * kPhysBuses * kNameLen);
+    if (hwg)  std::memcpy(hwg,  r.hw_in_gen,    sizeof(uint32_t) * kHwStrips);
+    if (outg) std::memcpy(outg, r.bus_out_gen,  sizeof(uint32_t) * kPhysBuses);
     const uint32_t s1 = r.seq.load(std::memory_order_acquire);
     if (s0 != s1) return false;
     seen = s1;
@@ -468,6 +481,8 @@ inline void set_defaults(Shared* s)
     std::memset(s->routing.bus_out, 0, sizeof(s->routing.bus_out));
     std::memset(s->routing.hw_in_desc, 0, sizeof(s->routing.hw_in_desc));
     std::memset(s->routing.bus_out_desc, 0, sizeof(s->routing.bus_out_desc));
+    std::memset(s->routing.hw_in_gen, 0, sizeof(s->routing.hw_in_gen));
+    std::memset(s->routing.bus_out_gen, 0, sizeof(s->routing.bus_out_gen));
     routing_write_end(s->routing);
 
     s->spec.source.store(kSpecNone);

@@ -308,6 +308,10 @@ struct Engine {
 
     float sr = (float)kRate;
     uint32_t routing_seen = 0;
+    // Last explicit-route request counter seen per endpoint, so a re-issued
+    // route rebuilds the stream instead of comparing equal and being dropped.
+    uint32_t hw_gen_seen[kHwStrips]   = {};
+    uint32_t bus_gen_seen[kPhysBuses] = {};
     uint32_t cmd_seen = 0;
     bool in_mix = false;
 
@@ -1235,8 +1239,9 @@ void Engine::poll_control()
 {
     char hw[kHwStrips][kNameLen], out[kPhysBuses][kNameLen];
     char hwd[kHwStrips][kNameLen], outd[kPhysBuses][kNameLen];
+    uint32_t hwg[kHwStrips] = {}, outg[kPhysBuses] = {};
     uint32_t seq = 0;
-    if (routing_read(shm->routing, seq, hw, out, hwd, outd) && seq != routing_seen) {
+    if (routing_read(shm->routing, seq, hw, out, hwd, outd, hwg, outg) && seq != routing_seen) {
         routing_seen = seq;
         // Re-point anything whose node.name has moved since the preset was saved.
         for (int i = 0; i < kHwStrips; ++i) {
@@ -1260,7 +1265,11 @@ void Engine::poll_control()
 
         for (int i = 0; i < kHwStrips; ++i) {
             std::string t = hw[i];
-            if (t != ep_in[i].target) {
+            // An explicit route asks for the link to be rebuilt even when the
+            // name is the one already stored - see Routing::hw_in_gen.
+            const bool asked = (hwg[i] != hw_gen_seen[i]);
+            hw_gen_seen[i] = hwg[i];
+            if (t != ep_in[i].target || asked) {
                 ep_in[i].target = t;
                 const bool is_cable = t.rfind(kCablePrefix, 0) == 0;
                 std::fprintf(stderr, "[bb] HW IN %d -> %s\n", i + 1,
@@ -1287,7 +1296,9 @@ void Engine::poll_control()
         }
         for (int b = 0; b < kPhysBuses; ++b) {
             std::string t = out[b];
-            if (t != ep_out[b].target) {
+            const bool asked = (outg[b] != bus_gen_seen[b]);
+            bus_gen_seen[b] = outg[b];
+            if (t != ep_out[b].target || asked) {
                 ep_out[b].target = t;
                 std::fprintf(stderr, "[bb] BUS A%d -> %s\n", b + 1, t.empty() ? "(none)" : t.c_str());
                 if (t.empty()) {

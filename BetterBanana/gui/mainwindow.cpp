@@ -4328,10 +4328,20 @@ void MainWindow::applyDeviceEq(int bus, const QString& device)
 void MainWindow::writeRouting()
 {
     routing_write_begin(m_shm->routing);
-    for (int i = 0; i < kHwStrips; ++i)
-        snprintf(m_shm->routing.hw_in[i], kNameLen, "%s", m_hwIn[i].toUtf8().constData());
-    for (int b = 0; b < kPhysBuses; ++b)
-        snprintf(m_shm->routing.bus_out[b], kNameLen, "%s", m_busOut[b].toUtf8().constData());
+    // Only the endpoints whose device actually changed get their request counter
+    // bumped: the engine rebuilds a stream for every bump, and this writes all
+    // six every time, so bumping unconditionally would drop audio on five
+    // strips to change one.
+    for (int i = 0; i < kHwStrips; ++i) {
+        const QByteArray want = m_hwIn[i].toUtf8();
+        if (want != QByteArray(m_shm->routing.hw_in[i])) ++m_shm->routing.hw_in_gen[i];
+        snprintf(m_shm->routing.hw_in[i], kNameLen, "%s", want.constData());
+    }
+    for (int b = 0; b < kPhysBuses; ++b) {
+        const QByteArray want = m_busOut[b].toUtf8();
+        if (want != QByteArray(m_shm->routing.bus_out[b])) ++m_shm->routing.bus_out_gen[b];
+        snprintf(m_shm->routing.bus_out[b], kNameLen, "%s", want.constData());
+    }
     routing_write_end(m_shm->routing);
 }
 
