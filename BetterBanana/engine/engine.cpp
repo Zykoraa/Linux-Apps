@@ -909,6 +909,14 @@ static bool connect_endpoint(Engine* E, Endpoint* e)
         PW_KEY_NODE_DESCRIPTION,    e->desc.c_str(),
         PW_KEY_NODE_GROUP,          "betterbanana",
         PW_KEY_NODE_ALWAYS_PROCESS, "true",
+        // WirePlumber keys its saved stream volumes on the first of
+        // application.id / application.name / media.name / node.name that a node
+        // carries, so the application.name above collapses every endpoint into a
+        // single stored entry: the strips and cables all came back at whichever
+        // fader happened to move last. Fader state belongs to the preset, so opt
+        // out of WirePlumber's restore rather than fight it for ownership.
+        "state.restore-props",      "false",
+        "state.restore-target",     "false",
         nullptr);
 
     const bool virtual_dev = (e->kind == kEpVirtSink || e->kind == kEpVirtSource ||
