@@ -1,0 +1,8 @@
+nodeLinker: hoisted
+allowBuilds:
+  "@vencord/venmic": true
+  electron: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - electron
+  - '@vencord/*'

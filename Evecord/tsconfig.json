@@ -1,0 +1,23 @@
+{
+    "compilerOptions": {
+        "lib": ["DOM", "DOM.Iterable", "ESNext"],
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "target": "ESNext",
+        "strict": true,
+        "noImplicitAny": false,
+        "noEmit": true,
+        "jsx": "preserve",
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "allowImportingTsExtensions": false,
+        "paths": {
+            "@shared/*": ["./src/shared/*"],
+            "@main/*": ["./src/main/*"],
+            "@preload/*": ["./src/preload/*"],
+            "@renderer/*": ["./src/renderer/*"]
+        },
+        "types": ["node", "@vencord/types"]
+    },
+    "include": ["src/**/*"]
+}

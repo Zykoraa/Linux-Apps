@@ -1,0 +1,26 @@
+:root {
+    color-scheme: dark;
+    --bg: #0e1a12;
+    --panel: #142519;
+    --fg: #dcefe2;
+    --muted: #8fa898;
+    --accent: #9ce3b4;
+    --accent-ink: #0e1a12;
+    --line: rgb(156 227 180 / 0.18);
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: system-ui, "Inter", "Noto Sans", "Cantarell", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+a {
+    color: var(--accent);
+}

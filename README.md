@@ -44,6 +44,25 @@ Needs `python3`, `tk`, `ffmpeg` and `portaudio` -- the installer names the
 package for your distribution if anything is missing. Then launch **Eve's
 Garden** from your app menu, or run `evesgarden`.
 
+## Evecord
+
+Discord with Vencord built in, as its own app, modelled on Vesktop. Screen share
+carries audio: pick apps or a mixer bus (BetterBanana's stream bus works), and it
+goes out with the stream. It loads your own Vencord build, userplugins included,
+when `~/Projects/Vencord/dist` has one, and offers a reload when you rebuild it.
+Voice runs on Chromium's WebRTC instead of Discord's native engine. →
+[full documentation](Evecord/)
+
+**Any distro (user install, no root):**
+
+```sh
+git clone https://github.com/Zykoraa/Linux-Apps.git
+cd Linux-Apps/Evecord && ./install.sh
+```
+
+Needs `node` 22+ and `pnpm`. Then launch **Evecord** from your app menu, or run
+`evecord`.
+
 ## Glory Injector
 
 A themed shared-object (`.so`) injector with a Tk GUI: pick a running process
@@ -93,4 +112,6 @@ Installing BetterBanana from a clone installs this too, and its
 ---
 
 Each app builds independently — see its own README. Everything here is MIT
-licensed; see [LICENSE](LICENSE).
+licensed (see [LICENSE](LICENSE)) except Evecord, which is GPL-3.0-or-later like
+the Vesktop and Vencord code it is modelled on and runs (see
+[Evecord/LICENSE](Evecord/LICENSE)).

@@ -1,0 +1,223 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Welcome to Evecord</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' evecord:; style-src 'self' 'unsafe-inline' evecord:; script-src 'self' 'unsafe-inline'" />
+    <link rel="stylesheet" href="common.css" />
+    <style>
+        body {
+            padding: 28px 32px;
+            box-sizing: border-box;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        header img {
+            width: 56px;
+            height: 56px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 22px;
+        }
+
+        header p,
+        .note {
+            margin: 2px 0 0;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            flex: 1;
+        }
+
+        fieldset {
+            margin: 0;
+            padding: 12px 14px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--panel);
+            display: grid;
+            gap: 10px;
+        }
+
+        legend {
+            padding: 0 6px;
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--accent);
+        }
+
+        label {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        label small {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        label[hidden] {
+            display: none;
+        }
+
+        input[type="checkbox"],
+        input[type="radio"] {
+            accent-color: var(--accent);
+            margin-top: 2px;
+        }
+
+        .branches {
+            display: flex;
+            gap: 18px;
+        }
+
+        code {
+            font-size: 12px;
+            overflow-wrap: anywhere;
+        }
+
+        .actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: auto;
+        }
+
+        button {
+            padding: 9px 18px;
+            border-radius: 8px;
+            border: 1px solid var(--line);
+            background: transparent;
+            color: var(--fg);
+            font: inherit;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        button[type="submit"] {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: var(--accent-ink);
+        }
+
+        button:focus-visible,
+        input:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <img src="../icon.png" alt="" />
+        <div>
+            <h1>Evecord</h1>
+            <p>Discord with Vencord, made for this desktop. A few choices before it starts.</p>
+        </div>
+    </header>
+
+    <form>
+        <fieldset>
+            <legend>Vencord</legend>
+            <div class="note" id="vencord-source"></div>
+            <label id="import-settings-row">
+                <input type="checkbox" name="importVencordSettings" checked />
+                <span>Copy my Vencord settings from the Discord app<small>Plugins, their options and QuickCSS, from ~/.config/Vencord/settings.</small></span>
+            </label>
+            <label id="import-themes-row">
+                <input type="checkbox" name="importThemes" checked />
+                <span>Copy my themes too<small>From ~/.config/Vencord/themes.</small></span>
+            </label>
+        </fieldset>
+
+        <fieldset>
+            <legend>Discord</legend>
+            <div class="branches">
+                <label><input type="radio" name="discordBranch" value="stable" checked /> Stable</label>
+                <label><input type="radio" name="discordBranch" value="ptb" /> PTB</label>
+                <label><input type="radio" name="discordBranch" value="canary" /> Canary</label>
+            </div>
+        </fieldset>
+
+        <fieldset>
+            <legend>Behaviour</legend>
+            <label>
+                <input type="checkbox" name="closeToTray" checked />
+                <span>Closing the window keeps Evecord in the tray<small>Quit from the tray menu or with Ctrl+Q.</small></span>
+            </label>
+            <label>
+                <input type="checkbox" name="richPresence" checked />
+                <span>Rich Presence<small>Show the game or app you are using, via arRPC.</small></span>
+            </label>
+            <label>
+                <input type="checkbox" name="autostart" />
+                <span>Start Evecord when I log in</span>
+            </label>
+        </fieldset>
+
+        <div class="actions">
+            <button type="button" id="quit">Not now</button>
+            <button type="submit">Start Evecord</button>
+        </div>
+    </form>
+
+    <script>
+        const info = EvecordSetup.info();
+        const form = document.querySelector("form");
+
+        const source = document.getElementById("vencord-source");
+        if (info.localVencord) {
+            source.textContent = "Using your Vencord checkout, userplugins included: ";
+            const code = document.createElement("code");
+            code.textContent = info.localVencord;
+            source.append(code);
+        } else {
+            source.textContent = "No local Vencord build found; the official release will be downloaded.";
+        }
+
+        // Only offer imports that have something to import.
+        if (!info.hasDiscordVencordSettings) {
+            document.getElementById("import-settings-row").hidden = true;
+            form.importVencordSettings.checked = false;
+        }
+        if (!info.hasDiscordVencordThemes) {
+            document.getElementById("import-themes-row").hidden = true;
+            form.importThemes.checked = false;
+        }
+
+        document.getElementById("quit").addEventListener("click", () => window.close());
+
+        form.addEventListener("submit", e => {
+            e.preventDefault();
+            EvecordSetup.done({
+                discordBranch: form.discordBranch.value,
+                importVencordSettings: form.importVencordSettings.checked,
+                importThemes: form.importThemes.checked,
+                closeToTray: form.closeToTray.checked,
+                autostart: form.autostart.checked,
+                richPresence: form.richPresence.checked
+            });
+        });
+    </script>
+</body>
+</html>
