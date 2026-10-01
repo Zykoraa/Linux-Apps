@@ -20,6 +20,7 @@
 #include "click.h"
 #include "loudness.h"
 #include "voicefx.h"
+#include "nodes.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -280,11 +281,9 @@ struct Engine {
     spa_hook      registry_listener = {};
     spa_source*   timer = nullptr;
 
-    // node.name -> node.description for every live node. Node names encode the
-    // USB port, so they move when hardware is replugged; the description lets
-    // a saved preset find the device again.
-    std::map<std::string, std::string> node_desc;
-    std::map<uint32_t, std::string>    node_by_id;
+    // Every live node by id, with the description and media class that let a
+    // saved preset find its device again - see nodes.h.
+    NodeMap nodes;
 
     Shared*  shm = nullptr;
     int      shm_fd = -1;
@@ -376,18 +375,14 @@ static void on_registry_global(void* data, uint32_t id, uint32_t /*permissions*/
     const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
     if (!name) return;
     const char* desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+    const char* cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
     Engine* e = static_cast<Engine*>(data);
-    e->node_desc[name] = desc ? desc : "";
-    e->node_by_id[id] = name;
+    e->nodes[id] = { name, desc ? desc : "", cls ? cls : "" };
 }
 
 static void on_registry_global_remove(void* data, uint32_t id)
 {
-    Engine* e = static_cast<Engine*>(data);
-    auto it = e->node_by_id.find(id);
-    if (it == e->node_by_id.end()) return;
-    e->node_desc.erase(it->second);
-    e->node_by_id.erase(it);
+    static_cast<Engine*>(data)->nodes.erase(id);
 }
 
 static const pw_registry_events kRegistryEvents = {
@@ -397,20 +392,16 @@ static const pw_registry_events kRegistryEvents = {
 };
 
 // If the saved node.name is gone but we know what the device was called, look
-// for a live node advertising the same description.
-static std::string resolve_device(Engine* e, const std::string& name, const char* desc)
+// for a live device of the same direction advertising the same description.
+static std::string resolve_device(Engine* e, const std::string& name, const char* desc,
+                                  Direction dir)
 {
-    if (name.empty()) return name;
     if (name.rfind(kCablePrefix, 0) == 0) return name;      // virtual cable
-    if (e->node_desc.count(name)) return name;              // still present
-    if (!desc || !*desc) return name;
-    for (const auto& kv : e->node_desc)
-        if (kv.second == desc) {
-            std::fprintf(stderr, "[bb] '%s' is gone; matched '%s' by description \"%s\"\n",
-                         name.c_str(), kv.first.c_str(), desc);
-            return kv.first;
-        }
-    return name;
+    const std::string r = resolve_node(e->nodes, name, desc ? desc : "", dir);
+    if (r != name)
+        std::fprintf(stderr, "[bb] '%s' is gone; matched '%s' by description \"%s\"\n",
+                     name.c_str(), r.c_str(), desc);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,11 +1236,11 @@ void Engine::poll_control()
         routing_seen = seq;
         // Re-point anything whose node.name has moved since the preset was saved.
         for (int i = 0; i < kHwStrips; ++i) {
-            const std::string r = resolve_device(this, hw[i], hwd[i]);
+            const std::string r = resolve_device(this, hw[i], hwd[i], Direction::Capture);
             if (r != hw[i]) std::snprintf(hw[i], kNameLen, "%s", r.c_str());
         }
         for (int b = 0; b < kPhysBuses; ++b) {
-            const std::string r = resolve_device(this, out[b], outd[b]);
+            const std::string r = resolve_device(this, out[b], outd[b], Direction::Playback);
             if (r != out[b]) std::snprintf(out[b], kNameLen, "%s", r.c_str());
         }
         // Recompute cable assignment from scratch: a cable feeds at most one
@@ -1283,10 +1274,10 @@ void Engine::poll_control()
                 } else {
                     shm->in_latency_ms[i].store(-1.0f, std::memory_order_relaxed);
                     connect_endpoint(this, &ep_in[i]);
-                    auto it = node_desc.find(t);
-                    if (it != node_desc.end() && it->second != hwd[i]) {
+                    const NodeInfo* n = find_node(nodes, t);
+                    if (n && n->desc != hwd[i]) {
                         routing_write_begin(shm->routing);
-                        std::snprintf(shm->routing.hw_in_desc[i], kNameLen, "%s", it->second.c_str());
+                        std::snprintf(shm->routing.hw_in_desc[i], kNameLen, "%s", n->desc.c_str());
                         std::snprintf(shm->routing.hw_in[i], kNameLen, "%s", t.c_str());
                         routing_write_end(shm->routing);
                         routing_seen = shm->routing.seq.load(std::memory_order_acquire);
@@ -1309,10 +1300,10 @@ void Engine::poll_control()
                     // one's figure across; the two are rarely the same.
                     shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
                     connect_endpoint(this, &ep_out[b]);
-                    auto it = node_desc.find(t);
-                    if (it != node_desc.end() && it->second != outd[b]) {
+                    const NodeInfo* n = find_node(nodes, t);
+                    if (n && n->desc != outd[b]) {
                         routing_write_begin(shm->routing);
-                        std::snprintf(shm->routing.bus_out_desc[b], kNameLen, "%s", it->second.c_str());
+                        std::snprintf(shm->routing.bus_out_desc[b], kNameLen, "%s", n->desc.c_str());
                         std::snprintf(shm->routing.bus_out[b], kNameLen, "%s", t.c_str());
                         routing_write_end(shm->routing);
                         routing_seen = shm->routing.seq.load(std::memory_order_acquire);

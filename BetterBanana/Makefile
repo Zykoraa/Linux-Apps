@@ -23,7 +23,7 @@ BUILD    := build
 HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset.h \
             engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
             engine/pitchtrack.h engine/autotune.h engine/surround.h \
-            engine/delay.h engine/loudness.h engine/click.h
+            engine/delay.h engine/loudness.h engine/click.h engine/nodes.h
 GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
             gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
             gui/dialogbits.h
@@ -77,7 +77,7 @@ gui:    $(BUILD)/bb-gui
 tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_preset $(BUILD)/test_spectrum $(BUILD)/test_voicefx \
         $(BUILD)/test_pitch $(BUILD)/test_autotune $(BUILD)/test_surround \
-        $(BUILD)/test_delay $(BUILD)/test_loudness \
+        $(BUILD)/test_delay $(BUILD)/test_loudness $(BUILD)/test_nodes \
         $(BUILD)/test_contrast \
         $(BUILD)/test_widgets
 ctl:    $(BUILD)/bb-ctl
@@ -130,6 +130,9 @@ $(BUILD)/test_delay: tests/test_delay.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_loudness: tests/test_loudness.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/test_nodes: tests/test_nodes.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_surround: tests/test_surround.cpp $(HDRS) | $(BUILD)
@@ -253,7 +256,7 @@ install-system: engine gui ctl
 # is deliberately not part of this: it needs a running engine and it moves the
 # caller's applications around for half a minute.
 UNIT := test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
-        test_delay test_loudness test_preset test_spectrum test_surround \
+        test_delay test_loudness test_nodes test_preset test_spectrum test_surround \
         test_voicefx test_widgets
 
 # QT_QPA_PLATFORM=offscreen for all of them: three of these link Qt and would
