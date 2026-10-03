@@ -35,6 +35,14 @@ AUX_STRIP = 4
 # The VAIO strip is the virtual sink applications play into.
 VAIO_STRIP = 3
 ROUTING_RE = re.compile(r"\bA1([-*])\s+A2([-*])\s+A3([-*])\s+B1[-*]\s+B2[-*]")
+# What follows GAIN MUTE MONO EQ in a bus row: MODE (one or more words, "-" for the
+# B buses), LATENCY ("12.3ms" or "-"), DELAY ("0.0ms"), ARRIVES ("12.3ms" or "-"),
+# LUFS-S, LUFS-I, then the device, which may itself contain spaces
+# ("(virtual source)"). The timing columns have fixed shapes, so the lazy MODE
+# group stops exactly where LATENCY starts, even for "TV mix" or "Up-mix 2.1".
+BUS_TAIL_RE = re.compile(
+    r"^(?P<mode>.+?)\s+(?:\d+(?:\.\d+)?ms|-)\s+-?\d+(?:\.\d+)?ms\s+(?:\d+(?:\.\d+)?ms|-)"
+    r"\s+\S+\s+\S+\s+(?P<device>.+)$")
 UNSET = ("(unassigned)", "-", "")
 
 
@@ -55,6 +63,19 @@ def run(*args):
     return subprocess.run(args, capture_output=True, text=True, timeout=15).stdout
 
 
+def bus_device(rest):
+    """The device column, given the fields after GAIN MUTE MONO EQ.
+
+    bb-ctl grew MODE, LATENCY, DELAY, ARRIVES and LUFS columns between EQ and the
+    device. Treating everything after EQ as the device made every bus read as
+    "Normal 0.0ms ... betterbanana_stream", so no bus ever matched the stream sink.
+    A row without those columns (an older bb-ctl) is still taken whole.
+    """
+    tail = " ".join(rest).strip()
+    m = BUS_TAIL_RE.match(tail)
+    return m.group("device").strip() if m else tail
+
+
 def parse_bus_row(line):
     """Device and label from one bus row, or None.
 
@@ -70,7 +91,7 @@ def parse_bus_row(line):
                 int(f[i + j])
         except ValueError:
             continue
-        return " ".join(f[i + 4:]).strip(), " ".join(f[:i]).strip()
+        return bus_device(f[i + 4:]), " ".join(f[:i]).strip()
     return None
 
 
