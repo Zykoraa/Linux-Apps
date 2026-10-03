@@ -14,11 +14,18 @@ Voicemeeter-style mixer, and neither is obvious from the Discord UI.
    "bus -> discord_capture" picks an instance by luck. Audio can be perfectly
    routed and still be inaudible because it landed on an idle instance.
 
-This daemon fixes both. Every couple of seconds it:
+3. DOUBLED AUDIO. Sharing the entire screen makes Discord capture every
+   application's playback stream itself, one discord_capture per app. An app
+   that also reaches the stream bus is then heard twice, slightly apart, and
+   its audio cuts out whenever the app pauses or reopens its own stream.
+
+This daemon fixes all three. Every couple of seconds it:
 
   * drops links into discord_capture from any bus the AUX strip feeds (fixes 1),
   * attaches your dedicated stream bus to EVERY discord_capture instance,
     addressed by port id rather than by name (fixes 2),
+  * once a stream bus exists, drops every other link into discord_capture,
+    so the stream carries exactly what the stream bus carries (fixes 3),
   * re-creates the stream bus if it vanished. A null sink with nothing playing
     gets suspended as idle, which tears down BetterBanana's output node for that
     bus; the stream then goes silent until something restarts the chain.
@@ -37,6 +44,8 @@ strips you want streamed to it, leaving AUX off it:
 Environment:
     BB_GUARD_STREAM_SINK  sink that marks the stream bus   (default betterbanana_stream)
     BB_GUARD_BLOCK        override auto-detected bus block list, e.g. "bb_a1 bb_a2"
+    BB_GUARD_EXCLUSIVE    0 keeps Discord's own app capture alongside the
+                          stream bus                       (default 1)
     BB_GUARD_INTERVAL     poll seconds                     (default 2)
     BB_GUARD_BBCTL        path to bb-ctl                   (default ~/.local/bin/bb-ctl)
 """
@@ -48,6 +57,7 @@ import time
 
 STREAM_SINK = os.environ.get("BB_GUARD_STREAM_SINK", "betterbanana_stream")
 BLOCK_OVERRIDE = os.environ.get("BB_GUARD_BLOCK", "").split()
+EXCLUSIVE = os.environ.get("BB_GUARD_EXCLUSIVE", "1") != "0"
 INTERVAL = float(os.environ.get("BB_GUARD_INTERVAL", "2"))
 BBCTL = os.environ.get("BB_GUARD_BBCTL", os.path.expanduser("~/.local/bin/bb-ctl"))
 
@@ -210,18 +220,31 @@ def tick():
         blocked = set(aux_buses)
     blocked.discard(stream_bus)
 
-    existing = links()
+    existing = sorted(set(links()))  # pw-link -l lists every link from both ends
     cap_ids = {i for ids in cap.values() for i in ids}
 
     blocked_ids = set()
     for bus in blocked:
         for c in CHANNELS:
             blocked_ids.update(outputs.get(f"{bus}:output_{c}", []))
+    stream_ids = set()
+    if stream_bus:
+        for c in CHANNELS:
+            stream_ids.update(outputs.get(f"{stream_bus}:output_{c}", []))
+    port_names = {pid: name for name, ids in outputs.items() for pid in ids}
+
     for lid, o, i in existing:
-        if o in blocked_ids and i in cap_ids:
-            run("pw-link", "-d", str(lid))
-            print(f"bb-stream-guard: dropped link {lid} (bus carrying AUX -> {TARGET})",
-                  flush=True)
+        if i not in cap_ids:
+            continue
+        if o in blocked_ids:
+            why = "bus carrying AUX"
+        elif EXCLUSIVE and stream_ids and o not in stream_ids:
+            # Discord's own per-app capture: the stream bus already carries it.
+            why = f"{port_names.get(o, o)}, not the stream bus"
+        else:
+            continue
+        run("pw-link", "-d", str(lid))
+        print(f"bb-stream-guard: dropped link {lid} ({why} -> {TARGET})", flush=True)
 
     if not stream_bus:
         return  # no stream bus configured; echo protection only
