@@ -117,6 +117,8 @@ static void usage()
       "  bus <b> prefader <0|1> [--keep-sends]\n"
       "                              take strips at their send level instead of\n"
       "                              through their faders; sends start at the faders\n"
+      "  bus <b> autolevel on|off | target <LUFS> | boost <dB> | cut <dB>\n"
+      "                              ride the bus to a steady loudness (default -16)\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
       "  strip <i> delay <ms>        hold this strip back, 0 .. 500\n"
       "  bus <b> delay <ms>          hold this bus back, 0 .. 500\n"
@@ -551,6 +553,15 @@ int main(int argc, char** argv)
             }
             std::printf("\n");
         }
+        static const char* const al_state[] = { "off", "tracking", "holding (too quiet to judge)",
+                                                "holding (ducker active)", "at its limit" };
+        for (int b = 0; b < kBuses; ++b) {
+            if (!s->bus[b].al_on.load()) continue;
+            const int st = clampi(s->meters.bus_al_state[b].load(), 0, 4);
+            std::printf("\nAUTO-LEVEL %-3s target %.1f LUFS  limits +%.0f/-%.0f dB  now %+.1f dB  %s\n",
+                kBusName[b], s->bus[b].al_target.load(), s->bus[b].al_max_boost.load(),
+                s->bus[b].al_max_cut.load(), s->meters.bus_al_db[b].load(), al_state[st]);
+        }
         return 0;
     }
 
@@ -869,6 +880,18 @@ int main(int argc, char** argv)
         else if (w == "prefader") {
             const bool keep = argc >= 6 && std::string(argv[5]) == "--keep-sends";
             set_prefader(s, b, atoi(argv[4]) != 0, keep);
+        }
+        else if (w == "autolevel") {
+            const std::string what = argv[4];
+            if      (what == "on"  || what == "1") p.al_on.store(1);
+            else if (what == "off" || what == "0") p.al_on.store(0);
+            else if (what == "target" && argc >= 6)
+                p.al_target.store(clampf(atof(argv[5]), kAlTargetMin, kAlTargetMax));
+            else if (what == "boost" && argc >= 6)
+                p.al_max_boost.store(clampf(atof(argv[5]), 0.0f, kAlRangeMax));
+            else if (what == "cut" && argc >= 6)
+                p.al_max_cut.store(clampf(atof(argv[5]), 0.0f, kAlRangeMax));
+            else { usage(); return 1; }
         }
         else if (w == "mode") {
             if (b >= kPhysBuses) {

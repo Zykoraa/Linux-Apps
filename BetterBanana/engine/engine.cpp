@@ -22,6 +22,7 @@
 #include "voicefx.h"
 #include "nodes.h"
 #include "matrix.h"
+#include "autolevel.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -237,6 +238,7 @@ struct StripDsp {
 
 struct BusDsp {
     EqChain    eq;
+    AutoLevel  al;                  // after the EQ, before the fader
     SmoothGain gain[kChan];
     PeakMeter  meter[kChan];
     Delay      delay;
@@ -249,10 +251,18 @@ struct BusDsp {
             meter[c].configure(sr);
         }
         eq.configure(sr);
+        al.configure(sr);
         delay.configure(sr);
         loud.configure(sr);
     }
-    void update(const BusParams& p, float sr) { eq.update(p.eq, sr); }
+    void update(const BusParams& p, float sr)
+    {
+        eq.update(p.eq, sr);
+        al.set(p.al_target.load(std::memory_order_relaxed),
+               p.al_max_boost.load(std::memory_order_relaxed),
+               p.al_max_cut.load(std::memory_order_relaxed));
+        al.set_enabled(p.al_on.load(std::memory_order_relaxed) != 0);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -613,11 +623,22 @@ void Engine::mix_chunk(uint32_t n)
     const int click_mask = s->click_mask.load(std::memory_order_relaxed);
     click.set_running(click_mask != 0);
 
-    // Bus stage: EQ -> mono -> gain -> limiter.
+    // Bus stage: mono -> EQ -> auto-level -> gain -> limiter.
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];
         BusDsp& d = bdsp[b];
         d.update(p, sr);
+
+        // Auto-level holds while the ducker is pulling down something on this
+        // bus: ducked music is quieter on purpose, and riding it back up would
+        // undo the ducker within a few seconds of talking.
+        bool ducking = false;
+        if (duck_env > 0.05f)
+            for (int i = 0; i < kStrips && !ducking; ++i)
+                ducking = s->strip[i].bus_on[b].load(std::memory_order_relaxed) &&
+                          s->strip[i].duck_depth_db.load(std::memory_order_relaxed) < 0.0f;
+        d.al.set_hold(ducking);
+        const bool al_live = d.al.live();
 
         const bool eq_on = p.eq.on.load(std::memory_order_relaxed) != 0;
         const bool mono  = p.mono.load(std::memory_order_relaxed) != 0;
@@ -629,10 +650,12 @@ void Engine::mix_chunk(uint32_t n)
         for (uint32_t f = 0; f < n; ++f) {
             float L = acc[b][f * kChan], R = acc[b][f * kChan + 1];
             if (mono) { const float m = 0.5f * (L + R); L = R = m; }
+            if (eq_on) { L = d.eq.process(0, L); R = d.eq.process(1, R); }
+            // One gain for both channels, so the stereo image cannot wander.
+            if (al_live) { const float ag = d.al.frame(L, R); L *= ag; R *= ag; }
             float ch[kChan] = { L, R };
             for (int c = 0; c < kChan; ++c) {
                 float x = ch[c];
-                if (eq_on) x = d.eq.process(c, x);
                 x *= d.gain[c].next();
                 // Safety limiter: transparent below -3 dBFS, soft-knee above,
                 // asymptotic to full scale so a hot matrix can never wrap.
@@ -652,6 +675,9 @@ void Engine::mix_chunk(uint32_t n)
             s->meters.bus_out[b][c].store(d.meter[c].peak, std::memory_order_relaxed);
             if (pk[c] >= 0.999f) s->meters.bus_clip[b].store(1, std::memory_order_relaxed);
         }
+        s->meters.bus_al_db[b].store(d.al.gain_db(), std::memory_order_relaxed);
+        s->meters.bus_al_state[b].store(al_live ? d.al.state() : (int)kAlOff,
+                                        std::memory_order_relaxed);
 
         // The test tick goes in after the fader and the limiter but before the
         // delay, so it travels exactly the path being aligned - and a bus you
