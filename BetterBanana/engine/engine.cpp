@@ -1159,6 +1159,12 @@ static bool connect_endpoint(Engine* E, Endpoint* e)
         PW_KEY_NODE_DESCRIPTION,    e->desc.c_str(),
         PW_KEY_NODE_GROUP,          "betterbanana",
         PW_KEY_NODE_ALWAYS_PROCESS, "true",
+        // Ask for small blocks ourselves. Without this the graph runs at
+        // PipeWire's default of 1024 frames - 21 ms a block, and the mixer
+        // holds about two - unless some other application happens to want
+        // less. Discord's voice engine does, so monitoring your own mic felt
+        // tight during a call and laggy outside one. 256 at 48 kHz is 5.3 ms.
+        PW_KEY_NODE_LATENCY,        "256/48000",
         // WirePlumber keys its saved stream volumes on the first of
         // application.id / application.name / media.name / node.name that a node
         // carries, so the application.name above collapses every endpoint into a
