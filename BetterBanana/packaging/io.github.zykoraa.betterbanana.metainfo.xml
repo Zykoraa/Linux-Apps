@@ -114,6 +114,26 @@
   </recommends>
 
   <releases>
+    <release version="0.3.0" date="2026-10-04">
+      <description>
+        <p>
+          Streaming. Every strip gets a STREAM send: the fader sets what you
+          hear, the send what the people watching your screen share hear, so
+          music can sit low in your headphones and still reach the stream at
+          full level. An optional auto-level holds the stream at a steady
+          loudness.
+        </p>
+        <p>
+          Setting up a Discord screen share is one click (Engine, Discord
+          stream). The engine creates the stream sink itself, with no log-out,
+          and keeps Discord's capture on the stream bus alone, reacting to the
+          audio graph as it changes: callers never hear themselves, and nothing
+          reaches the stream twice. The mixer also asks for small audio blocks
+          itself, so monitoring your own microphone stays tight whether or not
+          another application is running.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-09-02">
       <description>
         <p>
