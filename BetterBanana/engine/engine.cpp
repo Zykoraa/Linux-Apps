@@ -295,7 +295,28 @@ struct Engine {
     pw_core*      core = nullptr;
     pw_registry*  registry = nullptr;
     spa_hook      registry_listener = {};
+    spa_hook      core_listener = {};
     spa_source*   timer = nullptr;
+
+    // The registry's first snapshot is only complete once a core sync comes
+    // back; nothing decides "that node does not exist" before then.
+    int           sync_seq = -1;
+    bool          synced = false;
+
+    // The screen-share sink (kStreamSinkName), created by the engine rather
+    // than by a PipeWire config file, so it exists without a log-out and goes
+    // away with the engine. See stream_sink_tick().
+    pw_proxy*     sink_proxy = nullptr;
+    spa_hook      sink_listener = {};
+    uint32_t      sink_id = SPA_ID_INVALID;     // our node's global id, once bound
+    bool          sink_dead = false;            // errored or removed: drop the proxy
+    double        sink_retry_at = 0.0;
+    double        sink_backoff = 1.0;
+    uint32_t      sink_seen = SPA_ID_INVALID;   // the sink node buses were last wired to
+    // A bus pointed at the stream sink is not connected until the sink exists,
+    // and carries node.dont-fallback: otherwise the session manager links it to
+    // the default device, and the viewers' mix plays in your headphones.
+    bool          bus_waiting[kPhysBuses] = {};
 
     // Every live node by id, with the description and media class that let a
     // saved preset find its device again - see nodes.h.
@@ -383,6 +404,7 @@ struct Engine {
     void ensure_ring(Ring& r, uint32_t n);
     void poll_control();
     void poll_spectrum();
+    void stream_sink_tick();
 };
 
 static Engine g_eng;
@@ -397,8 +419,10 @@ static void on_registry_global(void* data, uint32_t id, uint32_t /*permissions*/
     if (!name) return;
     const char* desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
     const char* cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    const char* ser = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
     Engine* e = static_cast<Engine*>(data);
-    e->nodes[id] = { name, desc ? desc : "", cls ? cls : "" };
+    e->nodes[id] = { name, desc ? desc : "", cls ? cls : "",
+                     ser ? std::strtoull(ser, nullptr, 10) : 0 };
 }
 
 static void on_registry_global_remove(void* data, uint32_t id)
@@ -411,6 +435,56 @@ static const pw_registry_events kRegistryEvents = {
     .global = on_registry_global,
     .global_remove = on_registry_global_remove,
 };
+
+static void on_core_done(void* data, uint32_t id, int seq)
+{
+    Engine* e = static_cast<Engine*>(data);
+    if (id == PW_ID_CORE && seq == e->sync_seq) e->synced = true;
+}
+
+static void on_core_error(void* data, uint32_t id, int /*seq*/, int res, const char* message)
+{
+    Engine* e = static_cast<Engine*>(data);
+    if (e->sink_proxy && id == pw_proxy_get_id(e->sink_proxy)) {
+        std::fprintf(stderr, "[bb] stream sink: %s (%s)\n", message ? message : "error",
+                     spa_strerror(res));
+        e->sink_dead = true;
+    }
+}
+
+static const pw_core_events kCoreEvents = {
+    .version = PW_VERSION_CORE_EVENTS,
+    .done = on_core_done,
+    .error = on_core_error,
+};
+
+// Events on our stream sink. Nothing is destroyed in here - the proxy is
+// dropped on the next control tick, outside its own callbacks.
+static void on_sink_bound_props(void* data, uint32_t global_id, const spa_dict* /*props*/)
+{
+    static_cast<Engine*>(data)->sink_id = global_id;
+}
+static void on_sink_removed(void* data) { static_cast<Engine*>(data)->sink_dead = true; }
+static void on_sink_error(void* data, int /*seq*/, int res, const char* message)
+{
+    std::fprintf(stderr, "[bb] stream sink: %s (%s)\n", message ? message : "error",
+                 spa_strerror(res));
+    static_cast<Engine*>(data)->sink_dead = true;
+}
+
+static const pw_proxy_events kSinkProxyEvents = {
+    .version = PW_VERSION_PROXY_EVENTS,
+    .removed = on_sink_removed,
+    .error = on_sink_error,
+    .bound_props = on_sink_bound_props,
+};
+
+static double now_s()
+{
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return double(t.tv_sec) + 1e-9 * double(t.tv_nsec);
+}
 
 // If the saved node.name is gone but we know what the device was called, look
 // for a live device of the same direction advertising the same description.
@@ -983,6 +1057,11 @@ static bool connect_endpoint(Engine* E, Endpoint* e)
                               e->kind == kEpCableSink);
     if (virtual_dev) pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
     if (!e->target.empty()) pw_properties_set(props, PW_KEY_TARGET_OBJECT, e->target.c_str());
+    // A bus feeding the stream sink must never be "helpfully" re-pointed at the
+    // default device while the sink is missing: that plays the viewers' mix
+    // into whoever is wearing the headphones.
+    if (e->kind == kEpHwOut && e->target == kStreamSinkName)
+        pw_properties_set(props, "node.dont-fallback", "true");
 
     e->stream = pw_stream_new(E->core, e->desc.c_str(), props);
     if (!e->stream) return false;
@@ -1357,9 +1436,18 @@ void Engine::poll_control()
             if (t != ep_out[b].target || asked) {
                 ep_out[b].target = t;
                 std::fprintf(stderr, "[bb] BUS A%d -> %s\n", b + 1, t.empty() ? "(none)" : t.c_str());
+                bus_waiting[b] = false;
                 if (t.empty()) {
                     if (ep_out[b].stream) { pw_stream_destroy(ep_out[b].stream); ep_out[b].stream = nullptr; }
                     shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
+                } else if (t == kStreamSinkName && !find_node(nodes, t)) {
+                    // Not there yet (the engine creates it): wait for it rather
+                    // than connect and risk a fallback. stream_sink_tick wires
+                    // the bus the moment the sink appears.
+                    if (ep_out[b].stream) { pw_stream_destroy(ep_out[b].stream); ep_out[b].stream = nullptr; }
+                    shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
+                    bus_waiting[b] = true;
+                    std::fprintf(stderr, "[bb] BUS A%d waits for %s\n", b + 1, kStreamSinkName);
                 } else {
                     // Re-read for the new device rather than carrying the old
                     // one's figure across; the two are rarely the same.
@@ -1390,8 +1478,10 @@ void Engine::poll_control()
         ep_out[b].upmix.configure(sr);
         std::fprintf(stderr, "[bb] BUS A%d mode -> %s (%d ch)\n",
                      b + 1, bus_layout(want).name, bus_layout(want).channels);
-        if (!ep_out[b].target.empty()) connect_endpoint(this, &ep_out[b]);
+        if (!ep_out[b].target.empty() && !bus_waiting[b]) connect_endpoint(this, &ep_out[b]);
     }
+
+    stream_sink_tick();
 
     // A click train left running is miserable, and the GUI that started it can
     // die, hang or be killed with the dialog open. Time it out here rather than
@@ -1476,6 +1566,110 @@ void Engine::poll_spectrum()
     for (int k = 0; k < kSpecBins; ++k)
         shm->spec.bin_db[k].store(spec_an.disp[k], std::memory_order_relaxed);
     shm->spec.seq.fetch_add(1, std::memory_order_release);
+}
+
+// Keeps exactly one stream sink in the graph and the stream bus wired to it.
+//
+// The engine creates the sink itself unless a node of that name already
+// exists - which is what an older install's 99-bb-stream.conf provides, so
+// upgrading never produces two sinks with one name (target resolution between
+// those is a coin toss). If one appears from elsewhere while we own ours, ours
+// goes. If ours is removed or fails, it is recreated with backoff.
+void Engine::stream_sink_tick()
+{
+    // Which A bus is the stream bus: the one whose output is the sink.
+    int sbus = -1;
+    for (int b = 0; b < kPhysBuses && sbus < 0; ++b)
+        if (ep_out[b].target == kStreamSinkName) sbus = b;
+    shm->stream.bus.store(sbus, std::memory_order_relaxed);
+
+    if (!synced) return;
+    const double now = now_s();
+
+    if (sink_dead && sink_proxy) {
+        spa_hook_remove(&sink_listener);
+        pw_proxy_destroy(sink_proxy);
+        sink_proxy = nullptr;
+        sink_id = SPA_ID_INVALID;
+        sink_retry_at = now + sink_backoff;
+        sink_backoff = std::min(sink_backoff * 2.0, 30.0);
+    }
+    sink_dead = false;
+
+    // The live sink node, and whether it is somebody else's.
+    uint32_t live = SPA_ID_INVALID;
+    bool external = false;
+    for (const auto& kv : nodes) {
+        if (kv.second.name != kStreamSinkName || kv.second.media_class != "Audio/Sink") continue;
+        if (sink_proxy && kv.first == sink_id) { live = kv.first; continue; }
+        // While ours is still being created its node can show up before we
+        // learn its id; do not mistake it for a stranger and destroy it.
+        if (sink_proxy && sink_id == SPA_ID_INVALID) continue;
+        external = true;
+        if (live == SPA_ID_INVALID) live = kv.first;
+    }
+
+    if (sink_proxy && external) {
+        std::fprintf(stderr, "[bb] another %s appeared - removing ours\n", kStreamSinkName);
+        spa_hook_remove(&sink_listener);
+        pw_proxy_destroy(sink_proxy);
+        sink_proxy = nullptr;
+        sink_id = SPA_ID_INVALID;
+    }
+
+    if (external) {
+        shm->stream.sink_state.store(kSinkExternal, std::memory_order_relaxed);
+    } else if (sink_proxy) {
+        shm->stream.sink_state.store(sink_id != SPA_ID_INVALID && nodes.count(sink_id)
+                                         ? kSinkOwned : kSinkCreating,
+                                     std::memory_order_relaxed);
+    } else if (now >= sink_retry_at) {
+        auto* p = pw_properties_new(
+            PW_KEY_FACTORY_NAME,     "support.null-audio-sink",
+            PW_KEY_NODE_NAME,        kStreamSinkName,
+            PW_KEY_NODE_DESCRIPTION, "BetterBanana Stream Bus (capture only - do not select)",
+            PW_KEY_MEDIA_CLASS,      "Audio/Sink",
+            "audio.position",        "[ FL FR ]",
+            // Tells the mixer this is a capture point, not an output to pick.
+            "betterbanana.capture-only", "true",
+            // Load-bearing: a suspended null sink takes the bus node with it.
+            "session.suspend-timeout-seconds", "0",
+            // Lives exactly as long as the engine's connection, even on SIGKILL.
+            PW_KEY_OBJECT_LINGER,    "false",
+            nullptr);
+        sink_proxy = static_cast<pw_proxy*>(pw_core_create_object(
+            core, "adapter", PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, &p->dict, 0));
+        pw_properties_free(p);
+        if (sink_proxy) {
+            pw_proxy_add_listener(sink_proxy, &sink_listener, &kSinkProxyEvents, this);
+            std::fprintf(stderr, "[bb] creating %s\n", kStreamSinkName);
+            shm->stream.sink_state.store(kSinkCreating, std::memory_order_relaxed);
+        } else {
+            sink_retry_at = now + sink_backoff;
+            sink_backoff = std::min(sink_backoff * 2.0, 30.0);
+            shm->stream.sink_state.store(kSinkFailed, std::memory_order_relaxed);
+        }
+    } else {
+        shm->stream.sink_state.store(kSinkAbsent, std::memory_order_relaxed);   // backing off
+    }
+    if (live != SPA_ID_INVALID && !external && sink_proxy) sink_backoff = 1.0;
+
+    // Wire the stream bus to the sink: any bus that was waiting, and every bus
+    // pointed at it whenever the sink node itself is a new one (recreated, or
+    // ours replacing an old external one).
+    // sink_seen is kept while the sink is gone, so its replacement counts as
+    // new and the bus is rebuilt onto it rather than left on a dead target.
+    if (live == SPA_ID_INVALID) return;
+    const bool fresh = live != sink_seen;
+    for (int b = 0; b < kPhysBuses; ++b) {
+        if (ep_out[b].target != kStreamSinkName) continue;
+        if (!bus_waiting[b] && !(fresh && sink_seen != SPA_ID_INVALID)) continue;
+        bus_waiting[b] = false;
+        std::fprintf(stderr, "[bb] BUS A%d -> %s (sink is up)\n", b + 1, kStreamSinkName);
+        shm->out_latency_ms[b].store(-1.0f, std::memory_order_relaxed);
+        connect_endpoint(this, &ep_out[b]);
+    }
+    sink_seen = live;
 }
 
 static void on_timer(void* data, uint64_t /*expirations*/)
@@ -1583,6 +1777,8 @@ int main(int argc, char** argv)
     g_eng.registry = pw_core_get_registry(g_eng.core, PW_VERSION_REGISTRY, 0);
     pw_registry_add_listener(g_eng.registry, &g_eng.registry_listener,
                              &kRegistryEvents, &g_eng);
+    pw_core_add_listener(g_eng.core, &g_eng.core_listener, &kCoreEvents, &g_eng);
+    g_eng.sync_seq = pw_core_sync(g_eng.core, PW_ID_CORE, 0);
 
     static const char* hw_desc[kHwStrips] = { "Hardware Input 1", "Hardware Input 2", "Hardware Input 3" };
     for (int i = 0; i < kHwStrips; ++i) {
@@ -1651,6 +1847,10 @@ int main(int argc, char** argv)
     for (int c = 0; c < kCables; ++c) if (g_eng.cable_ep[c].stream) pw_stream_destroy(g_eng.cable_ep[c].stream);
     for (int i = 0; i < kStrips; ++i) if (g_eng.ep_in[i].stream)  pw_stream_destroy(g_eng.ep_in[i].stream);
     for (int b = 0; b < kBuses;  ++b) if (g_eng.ep_out[b].stream) pw_stream_destroy(g_eng.ep_out[b].stream);
+    if (g_eng.sink_proxy) {
+        spa_hook_remove(&g_eng.sink_listener);
+        pw_proxy_destroy(g_eng.sink_proxy);
+    }
     if (g_eng.core) pw_core_disconnect(g_eng.core);
     if (g_eng.ctx)  pw_context_destroy(g_eng.ctx);
     pw_main_loop_destroy(g_eng.loop);

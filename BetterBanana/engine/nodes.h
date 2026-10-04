@@ -27,6 +27,9 @@ struct NodeInfo {
     std::string name;
     std::string desc;
     std::string media_class;
+    // object.serial: unlike the id it is never reused, and it is what other
+    // nodes name when they point at this one (target.object).
+    uint64_t    serial = 0;
 };
 
 using NodeMap = std::map<uint32_t, NodeInfo>;

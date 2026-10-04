@@ -117,6 +117,9 @@ static void usage()
       "  bus <b> prefader <0|1> [--keep-sends]\n"
       "                              take strips at their send level instead of\n"
       "                              through their faders; sends start at the faders\n"
+      "  stream [status]             the screen-share stream, as key/value lines\n"
+      "  stream guard off|echo|on    what the engine lets into Discord's capture:\n"
+      "                              nothing changed / callers kept out / stream bus only\n"
       "  bus <b> autolevel on|off | target <LUFS> | boost <dB> | cut <dB>\n"
       "                              ride the bus to a steady loudness (default -16)\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
@@ -562,6 +565,40 @@ int main(int argc, char** argv)
                 kBusName[b], s->bus[b].al_target.load(), s->bus[b].al_max_boost.load(),
                 s->bus[b].al_max_cut.load(), s->meters.bus_al_db[b].load(), al_state[st]);
         }
+        return 0;
+    }
+
+    // The screen-share stream, as stable "key value" lines: the one place a
+    // script should read stream state from, rather than scraping the tables.
+    if (cmd == "stream" && (argc == 2 || (argc == 3 && std::string(argv[2]) == "status"))) {
+        static const char* const sink[]  = { "absent", "creating", "owned", "external", "failed" };
+        static const char* const mode[]  = { "off", "echo", "on" };
+        static const char* const guard[] = { "off", "idle", "echo-only", "own-capture",
+                                             "fallback", "bus-missing" };
+        const int b = stream_bus(s);
+        std::printf("sink %s\n", sink[clampi(s->stream.sink_state.load(), 0, 4)]);
+        std::printf("bus %s\n", b >= 0 ? kBusName[b] : "none");
+        std::printf("guard_mode %s\n", mode[clampi(s->stream_guard_mode.load(), 0, 2)]);
+        std::printf("guard %s\n", guard[clampi(s->stream.guard_state.load(), 0, 5)]);
+        std::printf("captures %d\n", s->stream.captures.load());
+        std::printf("links_made %u\n", s->stream.links_made.load());
+        std::printf("echo_dropped %u\n", s->stream.echo_dropped.load());
+        std::printf("dup_dropped %u\n", s->stream.dup_dropped.load());
+        std::printf("relink_fights %u\n", s->stream.relink_fights.load());
+        if (b >= 0) {
+            std::printf("prefader %d\n", s->bus[b].prefader.load());
+            std::printf("autolevel %s\n", s->bus[b].al_on.load() ? "on" : "off");
+            std::printf("autolevel_db %+.1f\n", s->meters.bus_al_db[b].load());
+            std::printf("lufs_s %.1f\n", s->meters.bus_lufs_s[b].load());
+        }
+        return 0;
+    }
+    if (cmd == "stream" && argc >= 4 && std::string(argv[2]) == "guard") {
+        const std::string m = argv[3];
+        if      (m == "off")  s->stream_guard_mode.store(kGuardModeOff);
+        else if (m == "echo") s->stream_guard_mode.store(kGuardModeEcho);
+        else if (m == "on")   s->stream_guard_mode.store(kGuardModeOn);
+        else { std::fprintf(stderr, "stream guard off|echo|on\n"); return 1; }
         return 0;
     }
 
