@@ -217,7 +217,7 @@ install-system: engine gui ctl
 	install -Dm755 $(BUILD)/bb-engine $(BINDIR)/bb-engine
 	install -Dm755 $(BUILD)/bb-gui    $(BINDIR)/bb-gui
 	install -Dm755 $(BUILD)/bb-ctl    $(BINDIR)/bb-ctl
-	install -Dm755 -t $(BINDIR) tools/bb-stream-guard tools/bb-health \
+	install -Dm755 -t $(BINDIR) tools/bb-health \
 	                            tools/bb-stream-setup tools/bb-autoeq
 	install -Dm644 packaging/betterbanana.svg \
 	  $(ICONDIR)/scalable/apps/betterbanana.svg
@@ -235,9 +235,9 @@ install-system: engine gui ctl
 	  $(DATADIR)/mime/packages/betterbanana.xml
 	install -Dm644 LICENSE $(DATADIR)/licenses/betterbanana/LICENSE
 	@# Every unit runs the binary out of ~/.local/bin, which is where the
-	@# per-user installer puts it; all three need repointing, not just the
+	@# per-user installer puts it; both need repointing, not just the
 	@# engine's.
-	for u in engine stream-guard health; do \
+	for u in engine health; do \
 	  install -Dm644 packaging/betterbanana-$$u.service \
 	    $(UNITDIR)/betterbanana-$$u.service; \
 	  sed -i 's|%h/.local/bin/|$(PREFIX)/bin/|' \

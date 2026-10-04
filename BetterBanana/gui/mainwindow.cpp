@@ -1606,7 +1606,7 @@ void AppsDialog::rebuild(bool playback, const QVector<StreamInfo>& streams,
         // does not exist -- and one stray click there would save a rule saying
         // so. Two ways in: the session manager is not routing the stream at all
         // (source/sink is PW_ID_ANY, as for Discord's screen-share capture,
-        // which bb-stream-guard wires by port id), or the target is real but
+        // which the engine's stream guard wires by port id), or the target is real but
         // deliberately absent from the list, like the capture-only stream bus.
         // Name the actual state instead, on an entry that carries no id, so
         // picking it moves nothing and remembers nothing.

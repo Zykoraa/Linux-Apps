@@ -1215,8 +1215,8 @@ you record *from* are `bb_b1` and `bb_b2`.
 ### Screen sharing on Discord
 
 Sharing your screen while running a mixer breaks in two ways that are invisible
-from Discord's UI. `bb-stream-guard` — installed and enabled for you — fixes
-both, but it is worth knowing what it is doing.
+from Discord's UI. The engine's stream guard fixes both, reacting to changes in
+the audio graph as they happen, but it is worth knowing what it is doing.
 
 **Everyone hears themselves.** Discord's screen-share capture auto-links to
 every `bb_a*` output bus it can find. Your monitoring buses carry the AUX strip,
@@ -1276,12 +1276,22 @@ the meantime — which would play the viewers' mix in your headphones.
 | A3 | apps and music, no AUX | your viewers |
 
 The guard discovers the stream bus rather than assuming it: whichever bus you
-have assigned to `betterbanana_stream` is the one it feeds to Discord, and everything
-else, other buses and Discord's own app capture alike, is kept out. If you never set one up it still runs, and still stops the buses
-carrying AUX from reaching Discord — so the echo cannot happen either way.
+have assigned to `betterbanana_stream` is the one it feeds to Discord, and
+everything else, other buses and Discord's own app capture alike, is kept out.
+If you never set one up it still runs, and still stops the buses carrying AUX
+from reaching Discord — so the echo cannot happen either way.
 
-    systemctl --user status betterbanana-stream-guard
-    journalctl --user -u betterbanana-stream-guard -f
+`bb-ctl stream` says what it is doing right now — whether Discord is capturing,
+whether the bus went into Discord's own capture of it or (sharing one window)
+into all of them, and how many links it has made and removed. Every change it
+makes is in the engine's log, and `bb-ctl stream guard echo` or `off` dials it
+back if you ever want Discord left alone:
+
+    bb-ctl stream
+    journalctl --user -u betterbanana-engine -f | grep guard
+
+(Older versions ran this as a separate python service, `bb-stream-guard`,
+polling every two seconds. The installer disables and removes it.)
 
 Two things that look like routing faults and are not:
 

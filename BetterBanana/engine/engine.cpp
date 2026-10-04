@@ -23,6 +23,7 @@
 #include "nodes.h"
 #include "matrix.h"
 #include "autolevel.h"
+#include "streamguard.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -44,7 +45,10 @@
 #include <cmath>
 #include <ctime>
 #include <string>
+#include <deque>
 #include <map>
+#include <memory>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <algorithm>
@@ -318,6 +322,45 @@ struct Engine {
     // the default device, and the viewers' mix plays in your headphones.
     bool          bus_waiting[kPhysBuses] = {};
 
+    // The stream guard (engine/streamguard.h). The registry keeps this view of
+    // the graph current; guard_work() plans from it and applies the plan.
+    std::map<uint32_t, PortInfo>    ports;
+    std::map<uint32_t, LinkInfo>    links;
+    std::map<uint32_t, std::string> capture_target;     // capture node -> target.object
+    // Capture nodes are bound to read target.object, which their registry
+    // global does not carry. Until it arrives the guard waits (briefly): with
+    // the target unknown it would take the window-share fallback and feed the
+    // bus into every capture - the chamber, for a fraction of a second.
+    struct BoundCapture {
+        Engine*   e = nullptr;
+        uint32_t  id = 0;
+        pw_proxy* proxy = nullptr;
+        spa_hook  hook = {};
+        double    since = 0.0;
+    };
+    std::map<uint32_t, std::unique_ptr<BoundCapture>> bound_caps;
+    // A link asked for but not yet in the registry. Without remembering it, a
+    // plan made in the gap would ask again, and two links from the bus into one
+    // capture is the very doubling the guard exists to prevent.
+    struct PendingLink {
+        Engine*   e = nullptr;
+        pw_proxy* proxy = nullptr;
+        spa_hook  hook = {};
+        uint32_t  out = 0, in = 0;
+        double    expires = 0.0;
+        bool      done = false;
+    };
+    std::vector<std::unique_ptr<PendingLink>> pending_make;
+    std::map<uint32_t, double> pending_drop;            // link id -> give up at
+    // Drops per (source node, capture node), to notice the session manager
+    // putting a link straight back - and to stop turning that into a busy loop.
+    std::map<std::pair<uint32_t, uint32_t>, std::deque<double>> drop_hist;
+    spa_source* guard_timer = nullptr;
+    bool        guard_armed = false;
+    double      guard_safety_at = 0.0;
+    int         guard_sig = -1;
+    int         guard_logged_state = -1;
+
     // Every live node by id, with the description and media class that let a
     // saved preset find its device again - see nodes.h.
     NodeMap nodes;
@@ -405,29 +448,102 @@ struct Engine {
     void poll_control();
     void poll_spectrum();
     void stream_sink_tick();
+    void schedule_guard();
+    void guard_work();
 };
 
 static Engine g_eng;
 static volatile sig_atomic_t g_run = 1;
 
+static double now_s();
+
+// A capture node's info: the target.object that says which stream it records.
+static void on_capture_info(void* data, const pw_node_info* info)
+{
+    auto* bc = static_cast<Engine::BoundCapture*>(data);
+    if (!info || !(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) || !info->props) return;
+    const char* t = spa_dict_lookup(info->props, PW_KEY_TARGET_OBJECT);
+    bc->e->capture_target[bc->id] = t ? t : "";
+    bc->e->schedule_guard();
+}
+
+static const pw_node_events kCaptureEvents = {
+    .version = PW_VERSION_NODE_EVENTS,
+    .info = on_capture_info,
+};
+
+static uint32_t dict_u32(const spa_dict* d, const char* key)
+{
+    const char* v = spa_dict_lookup(d, key);
+    return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 0;
+}
+
 static void on_registry_global(void* data, uint32_t id, uint32_t /*permissions*/,
                                const char* type, uint32_t /*version*/,
                                const spa_dict* props)
 {
-    if (!props || std::strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+    if (!props) return;
+    Engine* e = static_cast<Engine*>(data);
+
+    if (std::strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
+        const char* dir = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION);
+        const char* mon = spa_dict_lookup(props, PW_KEY_PORT_MONITOR);
+        e->ports[id] = { dict_u32(props, PW_KEY_NODE_ID),
+                         dir && std::strcmp(dir, "in") == 0,
+                         mon && std::strcmp(mon, "true") == 0,
+                         port_channel(spa_dict_lookup(props, PW_KEY_AUDIO_CHANNEL),
+                                      spa_dict_lookup(props, PW_KEY_PORT_NAME)) };
+        e->schedule_guard();
+        return;
+    }
+    if (std::strcmp(type, PW_TYPE_INTERFACE_Link) == 0) {
+        const LinkInfo l = { dict_u32(props, PW_KEY_LINK_OUTPUT_PORT),
+                             dict_u32(props, PW_KEY_LINK_INPUT_PORT) };
+        e->links[id] = l;
+        for (auto& pl : e->pending_make)
+            if (pl->out == l.out_port && pl->in == l.in_port) pl->done = true;
+        e->schedule_guard();
+        return;
+    }
+    if (std::strcmp(type, PW_TYPE_INTERFACE_Node) != 0) return;
+
     const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
     if (!name) return;
     const char* desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
     const char* cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
     const char* ser = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
-    Engine* e = static_cast<Engine*>(data);
     e->nodes[id] = { name, desc ? desc : "", cls ? cls : "",
                      ser ? std::strtoull(ser, nullptr, 10) : 0 };
+
+    if (std::strcmp(name, kCaptureName) == 0 && !e->bound_caps.count(id)) {
+        auto* proxy = static_cast<pw_proxy*>(
+            pw_registry_bind(e->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0));
+        if (proxy) {
+            auto bc = std::make_unique<Engine::BoundCapture>();
+            bc->e = e; bc->id = id; bc->proxy = proxy; bc->since = now_s();
+            pw_node_add_listener(reinterpret_cast<pw_node*>(proxy), &bc->hook,
+                                 &kCaptureEvents, bc.get());
+            e->bound_caps[id] = std::move(bc);
+        }
+    }
+    e->schedule_guard();
 }
 
 static void on_registry_global_remove(void* data, uint32_t id)
 {
-    static_cast<Engine*>(data)->nodes.erase(id);
+    Engine* e = static_cast<Engine*>(data);
+    e->nodes.erase(id);
+    e->ports.erase(id);
+    e->links.erase(id);
+    e->pending_drop.erase(id);
+    e->capture_target.erase(id);
+    auto it = e->bound_caps.find(id);
+    if (it != e->bound_caps.end()) {
+        spa_hook_remove(&it->second->hook);
+        pw_proxy_destroy(it->second->proxy);
+        e->bound_caps.erase(it);
+    }
+    e->schedule_guard();
 }
 
 static const pw_registry_events kRegistryEvents = {
@@ -1483,6 +1599,22 @@ void Engine::poll_control()
 
     stream_sink_tick();
 
+    // The guard runs on graph events; also when what it was told changes (the
+    // mode, the stream bus, where AUX goes), and every few seconds regardless.
+    {
+        int aux = 0;
+        for (int b = 0; b < kPhysBuses; ++b)
+            if (shm->strip[kStrips - 1].bus_on[b].load(std::memory_order_relaxed)) aux |= 1 << b;
+        const int sig = shm->stream_guard_mode.load(std::memory_order_relaxed) * 1000
+                      + (shm->stream.bus.load(std::memory_order_relaxed) + 1) * 10 + aux;
+        const double now = now_s();
+        if (sig != guard_sig || now >= guard_safety_at) {
+            guard_sig = sig;
+            guard_safety_at = now + 5.0;
+            schedule_guard();
+        }
+    }
+
     // A click train left running is miserable, and the GUI that started it can
     // die, hang or be killed with the dialog open. Time it out here rather than
     // trusting the other end to clear it.
@@ -1672,6 +1804,159 @@ void Engine::stream_sink_tick()
     sink_seen = live;
 }
 
+// ---------------------------------------------------------------------------
+// Stream guard: apply plan_guard() (engine/streamguard.h) to the live graph.
+// Runs on the main loop, debounced: any registry change arms a 100 ms one-shot,
+// and a burst of changes is handled in one pass.
+// ---------------------------------------------------------------------------
+static void on_link_error(void* data, int /*seq*/, int res, const char* message)
+{
+    auto* pl = static_cast<Engine::PendingLink*>(data);
+    std::fprintf(stderr, "[bb] guard: link failed: %s (%s)\n", message ? message : "error",
+                 spa_strerror(res));
+    pl->done = true;
+}
+
+// Deliberately no "bound" handler: the link only counts as made once its
+// global is in the registry, and so in `links`. Clearing the pending entry any
+// earlier opens exactly the gap a duplicate gets made in.
+static const pw_proxy_events kLinkProxyEvents = {
+    .version = PW_VERSION_PROXY_EVENTS,
+    .error = on_link_error,
+};
+
+void Engine::schedule_guard()
+{
+    if (guard_armed || !guard_timer) return;
+    guard_armed = true;
+    timespec val{0, 100 * 1000 * 1000}, itv{0, 0};
+    pw_loop_update_timer(pw_main_loop_get_loop(loop), guard_timer, &val, &itv, false);
+}
+
+void Engine::guard_work()
+{
+    guard_armed = false;
+    const double now = now_s();
+
+    // Link proxies: linger keeps the link, so the proxy can go once the link
+    // is in the registry (or it failed, or it is long overdue).
+    for (auto it = pending_make.begin(); it != pending_make.end();) {
+        PendingLink& pl = **it;
+        if (pl.done || now > pl.expires) {
+            spa_hook_remove(&pl.hook);
+            pw_proxy_destroy(pl.proxy);
+            it = pending_make.erase(it);
+        } else ++it;
+    }
+    for (auto it = pending_drop.begin(); it != pending_drop.end();)
+        it = now > it->second ? pending_drop.erase(it) : std::next(it);
+
+    if (!synced) return;
+
+    // A capture whose target has not arrived yet: give it a moment.
+    for (const auto& [id, bc] : bound_caps)
+        if (!capture_target.count(id) && now - bc->since < 1.0) { schedule_guard(); return; }
+
+    Graph g;
+    g.nodes = nodes;
+    g.ports = ports;
+    g.links = links;
+    g.capture_target = capture_target;
+    for (const auto& [lid, t] : pending_drop) g.links.erase(lid);
+    // Links already asked for count as present; they are numbered where no
+    // real link id reaches, so they can never be dropped by mistake.
+    constexpr uint32_t kPendingBase = 0xF0000000u;
+    uint32_t fake = kPendingBase;
+    for (const auto& pl : pending_make) g.links[fake++] = { pl->out, pl->in };
+
+    GuardInput in;
+    in.mode = shm->stream_guard_mode.load(std::memory_order_relaxed);
+    in.stream_bus = shm->stream.bus.load(std::memory_order_relaxed);
+    for (int b = 0; b < kPhysBuses; ++b)
+        in.aux_on[b] = shm->strip[kStrips - 1].bus_on[b].load(std::memory_order_relaxed) != 0;
+
+    const GuardPlan plan = plan_guard(g, in);
+    shm->stream.guard_state.store(plan.state, std::memory_order_relaxed);
+    shm->stream.captures.store(plan.captures, std::memory_order_relaxed);
+    if (plan.state != guard_logged_state) {
+        static const char* const names[] = { "off", "idle", "echo protection only (no stream bus)",
+            "stream bus -> Discord's own capture of it",
+            "Discord is not capturing the stream bus (window share?) - feeding every capture",
+            "stream bus assigned but its node is not up" };
+        if (plan.state >= 0 && plan.state <= kGuardBusMissing)
+            std::fprintf(stderr, "[bb] guard: %s\n", names[plan.state]);
+        guard_logged_state = plan.state;
+    }
+
+    auto port_name = [&](uint32_t pid) {
+        const auto pi = ports.find(pid);
+        if (pi == ports.end()) return std::to_string(pid);
+        const auto ni = nodes.find(pi->second.node);
+        return (ni != nodes.end() ? ni->second.name : std::to_string(pi->second.node))
+               + ":" + pi->second.channel;
+    };
+
+    bool deferred = false;
+    for (const auto& [lid, why] : plan.drop) {
+        if (lid >= kPendingBase) continue;
+        const LinkInfo& l = g.links.at(lid);
+        const auto po = ports.find(l.out_port), pi = ports.find(l.in_port);
+        const auto key = std::make_pair(po != ports.end() ? po->second.node : 0u,
+                                        pi != ports.end() ? pi->second.node : 0u);
+        // At most one drop a second per pair: if something keeps putting a
+        // link back, keep removing it - the echo matters more - but do not let
+        // reacting to every event turn that into a busy loop.
+        auto& h = drop_hist[key];
+        while (!h.empty() && now - h.front() > 30.0) h.pop_front();
+        if (!h.empty() && now - h.back() < 1.0) { deferred = true; continue; }
+        h.push_back(now);
+        if (h.size() == 10) {
+            shm->stream.relink_fights.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr, "[bb] guard: %s keeps being linked back into Discord\n",
+                         port_name(l.out_port).c_str());
+        }
+        pw_registry_destroy(registry, lid);
+        pending_drop[lid] = now + 2.0;
+        (why == kDropEcho ? shm->stream.echo_dropped : shm->stream.dup_dropped)
+            .fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[bb] guard: dropped link %u (%s -> %s, %s)\n", lid,
+                     port_name(l.out_port).c_str(), kCaptureName,
+                     why == kDropEcho ? "carries AUX" : "not the stream bus");
+    }
+
+    for (const auto& [out, inp] : plan.make) {
+        const auto po = ports.find(out), pi = ports.find(inp);
+        if (po == ports.end() || pi == ports.end()) continue;
+        const std::string on = std::to_string(po->second.node), op = std::to_string(out);
+        const std::string inn = std::to_string(pi->second.node), ip = std::to_string(inp);
+        auto* props = pw_properties_new(
+            PW_KEY_LINK_OUTPUT_NODE, on.c_str(),  PW_KEY_LINK_OUTPUT_PORT, op.c_str(),
+            PW_KEY_LINK_INPUT_NODE,  inn.c_str(), PW_KEY_LINK_INPUT_PORT,  ip.c_str(),
+            // Outlives its proxy; it goes away with either end anyway.
+            PW_KEY_OBJECT_LINGER, "true",
+            nullptr);
+        auto* proxy = static_cast<pw_proxy*>(pw_core_create_object(
+            core, "link-factory", PW_TYPE_INTERFACE_Link, PW_VERSION_LINK, &props->dict, 0));
+        pw_properties_free(props);
+        if (!proxy) continue;
+        auto pl = std::make_unique<PendingLink>();
+        pl->e = this; pl->proxy = proxy; pl->out = out; pl->in = inp;
+        pl->expires = now + 2.0;
+        pw_proxy_add_listener(proxy, &pl->hook, &kLinkProxyEvents, pl.get());
+        pending_make.push_back(std::move(pl));
+        shm->stream.links_made.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[bb] guard: attached %s -> %s port %u\n",
+                     port_name(out).c_str(), kCaptureName, inp);
+    }
+
+    if (deferred || !pending_make.empty() || !pending_drop.empty()) schedule_guard();
+}
+
+static void on_guard_timer(void* data, uint64_t /*expirations*/)
+{
+    static_cast<Engine*>(data)->guard_work();
+}
+
 static void on_timer(void* data, uint64_t /*expirations*/)
 {
     static_cast<Engine*>(data)->poll_control();
@@ -1827,6 +2112,8 @@ int main(int argc, char** argv)
 
     // The analyser needs a faster tick than device polling does, and costs
     // nothing while no editor is asking for a signal.
+    g_eng.guard_timer = pw_loop_add_timer(pw_main_loop_get_loop(g_eng.loop), on_guard_timer, &g_eng);
+
     g_eng.spec_timer = pw_loop_add_timer(pw_main_loop_get_loop(g_eng.loop), on_spec_timer, &g_eng);
     timespec sval{0, 50 * 1000 * 1000}, sitv{0, 50 * 1000 * 1000};
     pw_loop_update_timer(pw_main_loop_get_loop(g_eng.loop), g_eng.spec_timer, &sval, &sitv, false);
@@ -1851,6 +2138,10 @@ int main(int argc, char** argv)
         spa_hook_remove(&g_eng.sink_listener);
         pw_proxy_destroy(g_eng.sink_proxy);
     }
+    for (auto& [id, bc] : g_eng.bound_caps) { spa_hook_remove(&bc->hook); pw_proxy_destroy(bc->proxy); }
+    g_eng.bound_caps.clear();
+    for (auto& pl : g_eng.pending_make) { spa_hook_remove(&pl->hook); pw_proxy_destroy(pl->proxy); }
+    g_eng.pending_make.clear();
     if (g_eng.core) pw_core_disconnect(g_eng.core);
     if (g_eng.ctx)  pw_context_destroy(g_eng.ctx);
     pw_main_loop_destroy(g_eng.loop);

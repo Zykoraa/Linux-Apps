@@ -16,7 +16,6 @@ ICON_SIZES="16 24 32 48 64 128 256"
 mkdir -p "$BIN" "$APPS" "$ICONS/scalable/apps" "$UNITS" \
          "$SHARE/mime/packages" "$SHARE/metainfo"
 install -m755 "$ROOT/build/bb-engine" "$ROOT/build/bb-gui" "$ROOT/build/bb-ctl" "$BIN/"
-install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
 install -m755 "$ROOT/tools/bb-health" "$BIN/bb-health"
 install -m755 "$ROOT/tools/bb-stream-setup" "$BIN/bb-stream-setup"
 install -m755 "$ROOT/tools/bb-autoeq" "$BIN/bb-autoeq"
@@ -25,7 +24,7 @@ install -m755 "$ROOT/tools/bb-autoeq" "$BIN/bb-autoeq"
 # opens it, so a BetterBanana install that skipped it would leave that menu
 # dead-ending on "not installed". Installing from a repo clone puts it next to
 # us, and it costs nothing extra: one script, and python3 is already required
-# here by bb-health and bb-stream-guard. A dist tarball ships BetterBanana
+# here by bb-health and bb-stream-setup. A dist tarball ships BetterBanana
 # alone, so this stays conditional.
 MICGAIN="$ROOT/../mic-gain/mic-gain"
 if [ -f "$MICGAIN" ]; then
@@ -57,7 +56,6 @@ install -m644 "$ROOT/packaging/betterbanana.xml"            "$SHARE/mime/package
 # itself; install overwrites the file first, so re-running never double-prefixes.
 sed -i "s|^Exec=bb-gui|Exec=$BIN/bb-gui|" "$APPS/betterbanana.desktop"
 install -m644 "$ROOT/packaging/betterbanana-engine.service" "$UNITS/betterbanana-engine.service"
-install -m644 "$ROOT/packaging/betterbanana-stream-guard.service" "$UNITS/betterbanana-stream-guard.service"
 install -m644 "$ROOT/packaging/betterbanana-health.service" "$UNITS/betterbanana-health.service"
 
 # The stream sink used to come from a PipeWire config file, which only took
@@ -76,25 +74,29 @@ command -v gtk-update-icon-cache >/dev/null && \
   gtk-update-icon-cache -f -t "$ICONS" 2>/dev/null || true
 command -v update-mime-database >/dev/null && update-mime-database "$SHARE/mime" || true
 
+# The stream guard used to be a python service polling every two seconds; the
+# engine does that job itself now, on graph events. Retire the old one so the
+# two never fight over the same links.
+if [ -f "$UNITS/betterbanana-stream-guard.service" ]; then
+    systemctl --user disable --now betterbanana-stream-guard.service 2>/dev/null || true
+    rm -f "$UNITS/betterbanana-stream-guard.service"
+fi
+rm -f "$BIN/bb-stream-guard"
+
 systemctl --user daemon-reload
 systemctl --user enable betterbanana-engine.service
-# Safe to run unconditionally: with no stream bus configured it only stops
-# Discord's screen-share capture from picking up buses carrying the AUX strip,
-# which is what makes callers hear themselves echoed inside your stream.
-systemctl --user enable betterbanana-stream-guard.service
 # Watchdog: the engine can lose every node while still reporting healthy, and
 # nothing else in the system notices.
 systemctl --user enable betterbanana-health.service
 # Restart rather than just start: installing replaces the binary's inode, so a
 # service that is already running would keep executing the previous build.
 systemctl --user restart betterbanana-engine.service
-systemctl --user restart betterbanana-stream-guard.service
 systemctl --user restart betterbanana-health.service
 
 echo
 echo "Installed to $BIN"
 echo "Engine:         systemctl --user status betterbanana-engine"
-echo "Stream guard:   systemctl --user status betterbanana-stream-guard"
+echo "Stream:         bb-ctl stream"
 echo "Watchdog:       systemctl --user status betterbanana-health"
 echo "$micgain_note"
 echo "Make sure $BIN is on your PATH."
