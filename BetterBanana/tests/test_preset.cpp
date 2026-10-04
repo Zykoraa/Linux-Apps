@@ -58,6 +58,7 @@ static void scramble(Shared* s)
         p.duck_key.store(i == 0);
         p.duck_depth_db.store(-4.0f * i);
         for (int b = 0; b < kBuses; ++b) p.bus_on[b].store((i + b) & 1);
+        for (int b = 0; b < kBuses; ++b) p.send_db[b].store(-2.5f * i - b);
         p.eq.on.store(i != 3);
         p.eq.preamp_db.store(-2.5f - i);
         for (int k = 0; k < kEqBands; ++k) {
@@ -99,6 +100,11 @@ static void scramble(Shared* s)
         p.mono.store(b == 4);
         p.mode.store((b + 1) % kBusModeCount);
         p.delay_ms.store(3.5f * b);
+        p.prefader.store(b == 2);
+        p.al_on.store(b == 2 || b == 4);
+        p.al_target.store(-20.0f + b);
+        p.al_max_boost.store(10.0f + b);
+        p.al_max_cut.store(6.0f + b);
         p.eq.on.store(b != 2);
         p.eq.preamp_db.store(-1.5f * b);
         for (int k = 0; k < kEqBands; ++k) {
@@ -113,6 +119,7 @@ static void scramble(Shared* s)
     s->duck_threshold_db.store(-27.5f);
     s->duck_attack_ms.store(18.0f);
     s->duck_release_ms.store(410.0f);
+    s->stream_guard_mode.store(kGuardModeEcho);
     s->rec.source_bus.store(3);
     s->rec.gain_db.store(-4.5f);
     s->rec.loop.store(1);
@@ -211,6 +218,19 @@ int main()
     chk(blank->strip[2].fx.tune_on.load() == 1, "and whether correction is on");
     chk(blank->strip[2].fx.on.load() == 0, "a voice changer left off stays off");
     chk(blank->strip[3].fx.downsample.load() == 4, "the crusher's decimation round trips");
+    near(blank->strip[3].send_db[1].load(), -8.5, 1e-3, "a pre-fader send round trips");
+    near(blank->strip[0].send_db[0].load(), 0.0, 1e-3, "including a unity one");
+    chk(blank->bus[2].prefader.load() == 1 && blank->bus[1].prefader.load() == 0,
+        "the pre-fader flag round trips");
+    chk(blank->bus[4].al_on.load() == 1 && blank->bus[0].al_on.load() == 0,
+        "the auto-level switch round trips");
+    near(blank->bus[3].al_target.load(), -17.0, 1e-3, "and its target");
+    near(blank->bus[3].al_max_boost.load(), 13.0, 1e-3, "and its boost limit");
+    near(blank->bus[3].al_max_cut.load(), 9.0, 1e-3, "and its cut limit");
+    chk(blank->stream_guard_mode.load() == kGuardModeEcho, "the stream guard mode round trips");
+    chk(clamp_send(-200.0) == kSendOffDb && clamp_send(40.0) == kSendMaxDb,
+        "a send outside its range is clamped on load");
+    chk(clamp_send(std::nan("")) == kSendOffDb, "and a NaN one is off, not unity");
 
     // --- files are written whole or not at all ------------------------------
     const std::string path = std::string(dir) + "/state.bbp";
@@ -299,6 +319,40 @@ int main()
             "and puts the bus back to stereo rather than leaving it in surround");
         chk(old8->bus[0].delay_ms.load() == 0.0f,
             "and clears an alignment it does not describe");
+    }
+
+    // --- a preset older than the sends must sound exactly as it did -----------
+    // v9 had no pre-fader buses: if a leftover prefader flag survived a load, a
+    // strip's fader would stop reaching that bus and an old mix would change.
+    {
+        auto old9 = std::make_unique<Shared>();
+        set_defaults(old9.get());
+        old9->bus[2].prefader.store(1);
+        old9->bus[2].al_on.store(1);
+        old9->bus[2].al_target.store(-9.0f);
+        old9->strip[1].send_db[2].store(-7.0f);
+        old9->stream_guard_mode.store(kGuardModeOff);
+        chk(preset_deserialize(old9.get(), "betterbanana-preset 9\nbus.2.gain 0.000\n"),
+            "a preset from before the sends loads");
+        chk(old9->bus[2].prefader.load() == 0, "and turns a pre-fader bus back to post-fader");
+        chk(old9->bus[2].al_on.load() == 0, "and switches auto-level off");
+        near(old9->bus[2].al_target.load(), kAlDefaultTarget, 1e-6, "with its default target");
+        near(old9->strip[1].send_db[2].load(), 0.0, 1e-6, "and puts sends back to unity");
+        chk(old9->stream_guard_mode.load() == kGuardModeOn, "and the guard back to on");
+    }
+
+    // --- per-device memory leaves the mix alone ------------------------------
+    // Sends belong to the mix, like bus assignment: plugging a microphone into
+    // a strip must not change what the stream hears from it.
+    {
+        auto d = std::make_unique<Shared>();
+        set_defaults(d.get());
+        d->strip[0].send_db[2].store(-11.0f);
+        const std::string snap = strip_serialize(d->strip[0]);
+        chk(snap.find(".send") == std::string::npos, "a strip snapshot carries no sends");
+        d->strip[0].send_db[2].store(-3.0f);
+        chk(strip_deserialize(d->strip[0], snap), "and applying one");
+        near(d->strip[0].send_db[2].load(), -3.0, 1e-6, "leaves the send as it was");
     }
 
     // --- standing the watchdog down -------------------------------------------

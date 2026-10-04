@@ -22,6 +22,8 @@
 
 namespace bb {
 
+// 10 added the pre-fader sends (strip.N.send, bus.N.prefader), the bus
+// auto-level and the stream guard mode.
 // 9 added the strip and bus delays, so an alignment survives a restart.
 // 8 added the bus mode, so a bus that drives a surround card comes back as one.
 // 7 added pitch correction to the voice changer. 6 added its reverb. 5 added its independent formant control,
@@ -30,7 +32,19 @@ namespace bb {
 // been written. 2 added the per-band filter type / bypass flag and the bus EQ
 // preamp. All still load: every field a file omits is reset to its default
 // rather than left over from whatever was loaded before.
-constexpr int kPresetVersion = 9;
+constexpr int kPresetVersion = 10;
+
+inline float clamp_send(double db)
+{
+    if (!(db > kSendOffDb)) return kSendOffDb;     // also catches NaN
+    return db > kSendMaxDb ? kSendMaxDb : (float)db;
+}
+
+inline float clamp_range(double v, float lo, float hi, float dflt)
+{
+    if (!(v == v)) return dflt;                    // NaN
+    return v < lo ? lo : v > hi ? hi : (float)v;
+}
 
 // The delay line has a fixed ceiling; a preset must not be able to ask for more
 // than it can hold, whether by hand-editing or by coming from a future version.
@@ -280,6 +294,9 @@ inline std::string preset_serialize(const Shared* s)
         for (int b = 0; b < kBuses; ++b) detail::addf(out, " %d", p.bus_on[b].load());
         out += "\n";
         detail::addf(out, "strip.%d.duck %d %.3f\n", i, p.duck_key.load(), p.duck_depth_db.load());
+        detail::addf(out, "strip.%d.send", i);
+        for (int b = 0; b < kBuses; ++b) detail::addf(out, " %.3f", p.send_db[b].load());
+        out += "\n";
         detail::write_eq(out, "strip", i, p.eq);
         detail::write_fx(out, "strip." + std::to_string(i) + ".fx", p.fx);
         if (i < kHwStrips) {
@@ -295,6 +312,9 @@ inline std::string preset_serialize(const Shared* s)
         detail::addf(out, "bus.%d.mono %d\n", b, p.mono.load());
         detail::addf(out, "bus.%d.mode %d\n", b, p.mode.load());
         detail::addf(out, "bus.%d.delay %.3f\n", b, p.delay_ms.load());
+        detail::addf(out, "bus.%d.prefader %d\n", b, p.prefader.load());
+        detail::addf(out, "bus.%d.autolevel %d %.3f %.3f %.3f\n", b, p.al_on.load(),
+                     p.al_target.load(), p.al_max_boost.load(), p.al_max_cut.load());
         // "bus.N.eq" is the v1/v2 spelling of the block's on/off flag; it stays
         // so an old preset and a new one mean the same thing.
         detail::addf(out, "bus.%d.eq %d\n", b, p.eq.on.load());
@@ -312,6 +332,7 @@ inline std::string preset_serialize(const Shared* s)
     detail::addf(out, "duck %d %.3f %.3f %.3f\n", s->duck_enabled.load(),
                  s->duck_threshold_db.load(), s->duck_attack_ms.load(),
                  s->duck_release_ms.load());
+    detail::addf(out, "stream.guard %d\n", s->stream_guard_mode.load());
     detail::addf(out, "rec.source_bus %d\n", s->rec.source_bus.load());
     detail::addf(out, "rec.gain %.3f\n", s->rec.gain_db.load());
     detail::addf(out, "rec.loop %d\n", s->rec.loop.load());
@@ -359,6 +380,8 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
     bool bus_delay_seen[kBuses] = {}, str_delay_seen[kStrips] = {};
     bool str_band_seen[kStrips][kEqBands] = {}, str_eq_seen[kStrips] = {}, str_pre_seen[kStrips] = {};
     bool str_fx_seen[kStrips] = {};
+    bool str_send_seen[kStrips] = {}, bus_pf_seen[kBuses] = {}, bus_al_seen[kBuses] = {};
+    bool guard_seen = false;
 
     // VBAN entries and labels are written as they are parsed, so keep those
     // seqlocks held open for the whole pass; a reader simply retries.
@@ -487,6 +510,14 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
             const int got = sscanf(val, "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]);
             for (int x = 0; x < got && x < kBuses; ++x) s->strip[i].bus_on[x].store(v[x] ? 1 : 0);
         }
+        else if (keyed("strip.", ".send", i) && i < kStrips) {
+            float v[kBuses] = {};
+            const int got = sscanf(val, "%f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4]);
+            for (int x = 0; x < got && x < kBuses; ++x) s->strip[i].send_db[x].store(clamp_send(v[x]));
+            // A short line leaves the rest at unity rather than at a leftover.
+            for (int x = got < 0 ? 0 : got; x < kBuses; ++x) s->strip[i].send_db[x].store(0.0f);
+            str_send_seen[i] = true;
+        }
         else if (keyed("strip.", ".devicedesc", i) && i < kHwStrips) {
             snprintf(hwd[i], kNameLen, "%s", val); touched_routing = true;
         }
@@ -518,6 +549,21 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
             s->bus[i].delay_ms.store(clamp_delay(atof(val)));
             bus_delay_seen[i] = true;
         }
+        else if (keyed("bus.", ".prefader", i) && i < kBuses) {
+            s->bus[i].prefader.store(atoi(val) ? 1 : 0);
+            bus_pf_seen[i] = true;
+        }
+        else if (keyed("bus.", ".autolevel", i) && i < kBuses) {
+            int on = 0; float t = 0, up = 0, dn = 0;
+            if (sscanf(val, "%d %f %f %f", &on, &t, &up, &dn) == 4) {
+                BusParams& bp = s->bus[i];
+                bp.al_on.store(on ? 1 : 0);
+                bp.al_target.store(clamp_range(t, kAlTargetMin, kAlTargetMax, kAlDefaultTarget));
+                bp.al_max_boost.store(clamp_range(up, 0.0f, kAlRangeMax, kAlDefaultBoost));
+                bp.al_max_cut.store(clamp_range(dn, 0.0f, kAlRangeMax, kAlDefaultCut));
+                bus_al_seen[i] = true;
+            }
+        }
         else if (keyed("bus.", ".mode", i) && i < kBuses) {
             const int m = atoi(val);
             s->bus[i].mode.store(m >= 0 && m < kBusModeCount ? m : kBusNormal);
@@ -541,6 +587,11 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
                 s->duck_attack_ms.store(at);
                 s->duck_release_ms.store(rel);
             }
+        }
+        else if (!std::strcmp(key, "stream.guard")) {
+            const int m = atoi(val);
+            s->stream_guard_mode.store(m >= kGuardModeOff && m <= kGuardModeOn ? m : kGuardModeOn);
+            guard_seen = true;
         }
         else if (!std::strcmp(key, "rec.source_bus")) s->rec.source_bus.store(atoi(val));
         else if (!std::strcmp(key, "rec.gain"))       s->rec.gain_db.store(atof(val));
@@ -584,7 +635,20 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         // A preset written before v9 describes no delay, so alignment clears
         // rather than being inherited from whatever was loaded before.
         if (!bus_delay_seen[b]) s->bus[b].delay_ms.store(0.0f);
+        // Before v10 there were no pre-fader buses and no auto-level: an old
+        // preset must sound exactly as it did, whatever was loaded before it.
+        if (!bus_pf_seen[b]) s->bus[b].prefader.store(0);
+        if (!bus_al_seen[b]) {
+            s->bus[b].al_on.store(0);
+            s->bus[b].al_target.store(kAlDefaultTarget);
+            s->bus[b].al_max_boost.store(kAlDefaultBoost);
+            s->bus[b].al_max_cut.store(kAlDefaultCut);
+        }
     }
+    if (!guard_seen) s->stream_guard_mode.store(kGuardModeOn);
+    for (int i = 0; i < kStrips; ++i)
+        if (!str_send_seen[i])
+            for (int b = 0; b < kBuses; ++b) s->strip[i].send_db[b].store(0.0f);
     for (int i = 0; i < kStrips; ++i)
         if (!str_delay_seen[i]) s->strip[i].delay_ms.store(0.0f);
     // A preset written before v3 describes no strip EQ at all, so every strip

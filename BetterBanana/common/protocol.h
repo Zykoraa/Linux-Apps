@@ -15,7 +15,7 @@
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 13;
+constexpr uint32_t kVersion    = 14;
 constexpr const char* kShmName = "/betterbanana.state";
 
 // The null sink a screen share transmits. Audio played into it is inaudible in
@@ -24,6 +24,20 @@ constexpr const char* kShmName = "/betterbanana.state";
 // and never something to time-align against: the people hearing it are not in
 // the room, and delaying it only makes them wait.
 constexpr const char* kStreamSinkName = "betterbanana_stream";
+
+// A strip's send to a pre-fader bus (see BusParams::prefader), in dB. At or below
+// kSendOffDb the send is off altogether.
+constexpr float kSendOffDb = -60.0f;
+constexpr float kSendMaxDb = 12.0f;
+
+// Auto-level defaults and limits (engine/autolevel.h). -16 LUFS is where most
+// streaming and voice platforms normalise, so a stream levelled there sits
+// next to everyone else's without anyone reaching for a volume control.
+constexpr float kAlDefaultTarget = -16.0f;
+constexpr float kAlDefaultBoost  = 18.0f;
+constexpr float kAlDefaultCut    = 12.0f;
+constexpr float kAlTargetMin = -30.0f, kAlTargetMax = -6.0f;
+constexpr float kAlRangeMax  = 24.0f;              // either direction
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
 constexpr int kVirtStrips = 2;                 // BetterBanana VAIO, AUX
@@ -185,6 +199,11 @@ struct StripParams {
     af  delay_ms;
     ai  duck_key;                 // this strip's level drives the ducker
     af  duck_depth_db;            // how far this strip drops while ducking (<= 0)
+    // Level sent to each PRE-FADER bus, in dB (kSendOffDb .. kSendMaxDb). A bus
+    // with prefader set takes this strip at this level instead of through the
+    // fader, so the fader can set what you hear while the send sets what, say,
+    // a stream hears. Ignored for post-fader buses; bus_on still routes.
+    af  send_db[kBuses];
     EqParams eq;                  // the parametric block, after the tone knobs
     VoiceFx  fx;                  // the voice changer, after the EQ
 };
@@ -199,7 +218,25 @@ struct BusParams {
     // interface), and only a delay on the BUS can line them up - a strip feeds
     // both, so delaying it moves both together.
     af  delay_ms;
+    // Pre-fader bus: every strip arrives at its own send level (StripParams::
+    // send_db), not through its fader. Off by default, so a bus behaves exactly
+    // as it always has until someone asks for this.
+    ai  prefader;
+    // Auto-level: a slow loudness rider after the bus EQ, before the bus fader,
+    // holding the bus near al_target LUFS within +al_max_boost / -al_max_cut dB.
+    ai  al_on;
+    af  al_target;
+    af  al_max_boost, al_max_cut;
     EqParams eq;
+};
+
+// What a bus's auto-level is doing, for the meters.
+enum AlState : int32_t {
+    kAlOff = 0,          // disabled (gain is at, or ramping back to, 0 dB)
+    kAlActive,           // tracking the target
+    kAlHeldQuiet,        // too little material to judge: holding the gain
+    kAlHeldDuck,         // the ducker is working: holding so as not to undo it
+    kAlAtLimit,          // wants more than max boost / cut allows
 };
 
 struct Meters {
@@ -219,6 +256,49 @@ struct Meters {
     // window; integrated is gated and runs from the last reset.
     af bus_lufs_s [kBuses];
     af bus_lufs_i [kBuses];
+    af bus_al_db   [kBuses];         // gain the auto-level is applying now
+    ai bus_al_state[kBuses];         // AlState
+};
+
+// ---------------------------------------------------------------------------
+// Screen-share stream. The engine owns the stream sink (kStreamSinkName) and
+// keeps Discord's capture wired to the stream bus: one copy of the bus into
+// the capture Discord made for it, callers' voices (AUX) never, and nothing
+// else. Written by the engine only; the GUI and bb-ctl read it.
+// ---------------------------------------------------------------------------
+enum StreamSinkState : int32_t {
+    kSinkAbsent = 0,     // none yet (or it was removed and is being recreated)
+    kSinkCreating,       // asked PipeWire for it, waiting
+    kSinkOwned,          // the engine's own
+    kSinkExternal,       // someone else's node with that name (an old config file)
+    kSinkFailed,         // creation failed; retrying with backoff
+};
+
+enum StreamGuardMode : int32_t {
+    kGuardModeOff = 0,   // touch nothing
+    kGuardModeEcho,      // only keep AUX-carrying buses out of Discord
+    kGuardModeOn,        // the stream bus is Discord's only source (default)
+};
+
+enum StreamGuardState : int32_t {
+    kGuardOff = 0,       // mode off
+    kGuardIdle,          // nothing is capturing
+    kGuardEchoOnly,      // capturing, but no stream bus is set up
+    kGuardOwnCapture,    // fed into Discord's own capture of the stream bus
+    kGuardFallback,      // Discord is not capturing the bus (a single window is
+                         // shared): fed into every capture instead
+    kGuardBusMissing,    // a stream bus is assigned but its node is not up
+};
+
+struct StreamStatus {
+    ai  sink_state;               // StreamSinkState
+    ai  bus;                      // stream bus index, -1 = none
+    ai  guard_state;              // StreamGuardState
+    ai  captures;                 // discord_capture nodes seen
+    au  links_made;
+    au  echo_dropped;             // AUX-carrying bus -> Discord, removed
+    au  dup_dropped;              // anything else into Discord, removed
+    au  relink_fights;            // the session manager kept putting a link back
 };
 
 // ---------------------------------------------------------------------------
@@ -382,6 +462,10 @@ struct Shared {
     af  duck_release_ms;
     ai  duck_enabled;
 
+    // StreamGuardMode; a setting, saved in presets.
+    ai  stream_guard_mode;
+    StreamStatus stream;
+
     au  cmd_seq;                  // GUI bumps after setting cmd
     ai  cmd;
 };
@@ -465,6 +549,7 @@ inline void set_defaults(Shared* s)
         p.delay_ms.store(0.0f);
         p.duck_key.store(0);
         p.duck_depth_db.store(0.0f);
+        for (int b = 0; b < kBuses; ++b) p.send_db[b].store(0.0f);
         eq_set_defaults(p.eq);
         fx_set_defaults(p.fx);
     }
@@ -474,7 +559,14 @@ inline void set_defaults(Shared* s)
         p.mute.store(0); p.mono.store(0); p.sel.store(b == 0 ? 1 : 0);
         p.mode.store(kBusNormal);
         p.delay_ms.store(0.0f);
+        p.prefader.store(0);
+        p.al_on.store(0);
+        p.al_target.store(kAlDefaultTarget);
+        p.al_max_boost.store(kAlDefaultBoost);
+        p.al_max_cut.store(kAlDefaultCut);
         eq_set_defaults(p.eq);
+        s->meters.bus_al_db[b].store(0.0f);
+        s->meters.bus_al_state[b].store(kAlOff);
     }
     routing_write_begin(s->routing);
     std::memset(s->routing.hw_in, 0, sizeof(s->routing.hw_in));
@@ -531,6 +623,16 @@ inline void set_defaults(Shared* s)
         n.enabled = 0; n.port = 6980 + i; n.channels = 2; n.rate = 48000;
         std::snprintf(n.name, sizeof(n.name), "Stream%d", i + 1);
     }
+    s->stream_guard_mode.store(kGuardModeOn);
+    s->stream.sink_state.store(kSinkAbsent);
+    s->stream.bus.store(-1);
+    s->stream.guard_state.store(kGuardIdle);
+    s->stream.captures.store(0);
+    s->stream.links_made.store(0);
+    s->stream.echo_dropped.store(0);
+    s->stream.dup_dropped.store(0);
+    s->stream.relink_fights.store(0);
+
     s->cmd.store(kCmdNone);
     s->cmd_seq.store(0);
 }
