@@ -6,8 +6,8 @@ pkgdesc="Virtual mixing console for PipeWire, modelled on Voicemeeter Banana"
 arch=('x86_64')
 url="https://github.com/Zykoraa/Linux-Apps"
 license=('MIT')
-# python is not optional: bb-health, bb-stream-setup and bb-autoeq are all
-# python3, and bb-health runs as a systemd user service.
+# python is not optional: bb-health and bb-autoeq are python3, and bb-health
+# runs as a systemd user service.
 # libpulse is what provides pactl, which the GUI shells out to for the device
 # list. hicolor-icon-theme owns the directories the icons land in.
 depends=('pipewire' 'qt6-base' 'libsndfile' 'libpulse' 'python' 'hicolor-icon-theme')

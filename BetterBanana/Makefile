@@ -24,7 +24,8 @@ HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset
             engine/dsp.h engine/spectrum.h engine/voicefx.h engine/formant.h \
             engine/pitchtrack.h engine/autotune.h engine/surround.h \
             engine/delay.h engine/loudness.h engine/click.h engine/nodes.h \
-            engine/matrix.h engine/autolevel.h engine/streamguard.h
+            engine/matrix.h engine/autolevel.h engine/streamguard.h \
+            common/streamsetup.h
 GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
             gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
             gui/dialogbits.h
@@ -80,7 +81,7 @@ tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_pitch $(BUILD)/test_autotune $(BUILD)/test_surround \
         $(BUILD)/test_delay $(BUILD)/test_loudness $(BUILD)/test_nodes \
         $(BUILD)/test_contrast $(BUILD)/test_matrix $(BUILD)/test_autolevel \
-        $(BUILD)/test_streamguard \
+        $(BUILD)/test_streamguard $(BUILD)/test_streamsetup \
         $(BUILD)/test_widgets
 ctl:    $(BUILD)/bb-ctl
 
@@ -138,6 +139,9 @@ $(BUILD)/test_autolevel: tests/test_autolevel.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_matrix: tests/test_matrix.cpp $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD)/test_streamsetup: tests/test_streamsetup.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD)/test_streamguard: tests/test_streamguard.cpp $(HDRS) | $(BUILD)
@@ -265,7 +269,7 @@ install-system: engine gui ctl
 # is deliberately not part of this: it needs a running engine and it moves the
 # caller's applications around for half a minute.
 UNIT := test_autolevel test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
-        test_delay test_loudness test_matrix test_nodes test_preset test_spectrum test_streamguard test_surround \
+        test_delay test_loudness test_matrix test_nodes test_preset test_spectrum test_streamguard test_streamsetup test_surround \
         test_voicefx test_widgets
 
 # QT_QPA_PLATFORM=offscreen for all of them: three of these link Qt and would

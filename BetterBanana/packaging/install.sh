@@ -24,7 +24,7 @@ install -m755 "$ROOT/tools/bb-autoeq" "$BIN/bb-autoeq"
 # opens it, so a BetterBanana install that skipped it would leave that menu
 # dead-ending on "not installed". Installing from a repo clone puts it next to
 # us, and it costs nothing extra: one script, and python3 is already required
-# here by bb-health and bb-stream-setup. A dist tarball ships BetterBanana
+# here by bb-health. A dist tarball ships BetterBanana
 # alone, so this stays conditional.
 MICGAIN="$ROOT/../mic-gain/mic-gain"
 if [ -f "$MICGAIN" ]; then

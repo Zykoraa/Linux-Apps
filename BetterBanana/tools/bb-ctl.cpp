@@ -2,6 +2,7 @@
 // Maps the same shared-memory segment the GUI uses.
 #include "../common/protocol.h"
 #include "../common/preset.h"
+#include "../common/streamsetup.h"
 #include "../engine/surround.h"
 #include "../engine/delay.h"
 #include "../common/eqprofile.h"
@@ -118,6 +119,8 @@ static void usage()
       "                              take strips at their send level instead of\n"
       "                              through their faders; sends start at the faders\n"
       "  stream [status]             the screen-share stream, as key/value lines\n"
+      "  stream setup [A1|A2|A3] [--bus-only] [--autolevel] [--dry-run]\n"
+      "                              set up the stream bus in one step\n"
       "  stream guard off|echo|on    what the engine lets into Discord's capture:\n"
       "                              nothing changed / callers kept out / stream bus only\n"
       "  bus <b> autolevel on|off | target <LUFS> | boost <dB> | cut <dB>\n"
@@ -204,18 +207,6 @@ static int stream_bus(Shared* s)
     for (int b = 0; b < kPhysBuses; ++b)
         if (std::strcmp(bo[b], kStreamSinkName) == 0) return b;
     return -1;
-}
-
-// Turns a bus pre-fader (or back). Going pre-fader, each strip's send starts at
-// its current fader level, so the bus sounds the same the moment it switches
-// and only stops following the faders from then on.
-static void set_prefader(Shared* s, int b, bool on, bool keep_sends)
-{
-    BusParams& p = s->bus[b];
-    if (on && !p.prefader.load() && !keep_sends)
-        for (int i = 0; i < kStrips; ++i)
-            s->strip[i].send_db[b].store(clamp_send(s->strip[i].gain_db.load()));
-    p.prefader.store(on ? 1 : 0);
 }
 
 // The voice changer, as "strip <i> fx <what> [values...]" from argv[4].
@@ -591,6 +582,31 @@ int main(int argc, char** argv)
             std::printf("autolevel_db %+.1f\n", s->meters.bus_al_db[b].load());
             std::printf("lufs_s %.1f\n", s->meters.bus_lufs_s[b].load());
         }
+        return 0;
+    }
+    if (cmd == "stream" && argc >= 3 && std::string(argv[2]) == "setup") {
+        StreamSetupOpts o;
+        bool dry = false;
+        for (int k = 3; k < argc; ++k) {
+            const std::string a = argv[k];
+            if      (a == "--dry-run")   dry = true;
+            else if (a == "--bus-only")  o.bus_only = true;
+            else if (a == "--autolevel") o.autolevel = true;
+            else if (a == "--bus" && k + 1 < argc) o.bus = bus_index(argv[++k]);
+            else if (bus_index(a.c_str()) >= 0) o.bus = bus_index(a.c_str());
+            else { std::fprintf(stderr, "stream setup [A1|A2|A3] [--bus-only] [--autolevel] [--dry-run]\n"); return 1; }
+        }
+        const StreamSetupPlan plan = plan_stream_setup(s, o);
+        if (!plan.ok) { std::fprintf(stderr, "error: %s\n", plan.error.c_str()); return 1; }
+        std::printf("Stream bus: %s%s\n", kBusName[plan.bus], plan.reused ? " (already set up)" : "");
+        if (plan.actions.empty()) std::printf("  nothing to change\n");
+        for (const auto& a : plan.actions) std::printf("  %s\n", a.what.c_str());
+        if (dry) { std::printf("--dry-run: nothing was changed.\n"); return 0; }
+        apply_stream_setup(s, plan);
+        std::printf("\nMicrophones are left off it: Discord already sends your voice.\n"
+                    "Each strip's STREAM send now sets what viewers hear from it, and its\n"
+                    "fader only what you hear: bb-ctl strip <i> send <dB>.\n"
+                    "Share your ENTIRE SCREEN in Discord; bb-ctl stream shows what is happening.\n");
         return 0;
     }
     if (cmd == "stream" && argc >= 4 && std::string(argv[2]) == "guard") {
