@@ -64,6 +64,14 @@ int main()
     chk(find_node(nodes, "discord_capture") == nullptr,
         "and goes once the last one has");
 
+    // The serial is what other nodes point at (target.object); the id is not.
+    {
+        NodeMap m = { { 60, { "bb_a3", "BetterBanana A3", "Stream/Output/Audio", 61 } } };
+        chk(m.at(60).serial == 61, "a node keeps its object.serial apart from its id");
+        const NodeInfo bare = { "discord_capture", "", "Stream/Input/Audio" };
+        chk(bare.serial == 0, "and one registered without it reads zero");
+    }
+
     std::printf("%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }
