@@ -112,6 +112,11 @@ static void usage()
       "  strip <i> fx tune off | <speed_ms> [amount]   pitch correction, 0 ms snaps\n"
       "  strip <i> fx key <C..B> | scale <chromatic|major|minor>\n"
       "  strip <i> bus <A1|A2|A3|B1|B2> <0|1>\n"
+      "  strip <i> send [bus] <dB>   level into a pre-fader bus, -60 (off) .. +12;\n"
+      "                              without a bus, the stream bus\n"
+      "  bus <b> prefader <0|1> [--keep-sends]\n"
+      "                              take strips at their send level instead of\n"
+      "                              through their faders; sends start at the faders\n"
       "  bus <b> gain <dB> | mute <0|1> | mono <0|1> | eq <0|1>\n"
       "  strip <i> delay <ms>        hold this strip back, 0 .. 500\n"
       "  bus <b> delay <ms>          hold this bus back, 0 .. 500\n"
@@ -177,6 +182,35 @@ static int bus_index(const char* s)
     for (int b = 0; b < kBuses; ++b) if (strcasecmp(s, kBusName[b]) == 0) return b;
     if (s[0] >= '0' && s[0] <= '4' && s[1] == 0) return s[0] - '0';
     return -1;
+}
+
+// The bus whose output is the screen-share sink, or -1. The engine publishes
+// it once it is running the stream guard; until then, work it out from the
+// routing exactly as it does.
+static int stream_bus(Shared* s)
+{
+    const int pub = s->stream.bus.load();
+    if (pub >= 0 && pub < kPhysBuses) return pub;
+    char hw[kHwStrips][kNameLen], bo[kPhysBuses][kNameLen];
+    uint32_t seq = 0;
+    bool ok = false;
+    for (int t = 0; t < 16 && !ok; ++t) ok = routing_read(s->routing, seq, hw, bo);
+    if (!ok) return -1;
+    for (int b = 0; b < kPhysBuses; ++b)
+        if (std::strcmp(bo[b], kStreamSinkName) == 0) return b;
+    return -1;
+}
+
+// Turns a bus pre-fader (or back). Going pre-fader, each strip's send starts at
+// its current fader level, so the bus sounds the same the moment it switches
+// and only stops following the faders from then on.
+static void set_prefader(Shared* s, int b, bool on, bool keep_sends)
+{
+    BusParams& p = s->bus[b];
+    if (on && !p.prefader.load() && !keep_sends)
+        for (int i = 0; i < kStrips; ++i)
+            s->strip[i].send_db[b].store(clamp_send(s->strip[i].gain_db.load()));
+    p.prefader.store(on ? 1 : 0);
 }
 
 // The voice changer, as "strip <i> fx <what> [values...]" from argv[4].
@@ -501,6 +535,22 @@ int main(int argc, char** argv)
             if (n.enabled) std::printf("          %-4d %-9s %-18s %-6d <- source bb_vban_in_%d\n",
                 i + 1, "in", n.name, n.port, i + 1);
         }
+
+        // Pre-fader buses take each strip at its send, not its fader. Shown as
+        // its own block, after everything else, so nothing that reads the
+        // tables above has to learn about it.
+        for (int b = 0; b < kBuses; ++b) {
+            if (!s->bus[b].prefader.load()) continue;
+            std::printf("\nPRE-FADER %-3s sends:", kBusName[b]);
+            for (int i = 0; i < kStrips; ++i) {
+                const char* nm = (lok && lstrip[i][0]) ? lstrip[i] : kStripName[i];
+                const float d = s->strip[i].send_db[b].load();
+                if (!s->strip[i].bus_on[b].load()) std::printf("  [%s -]", nm);
+                else if (!(d > kSendOffDb))         std::printf("  [%s off]", nm);
+                else                                std::printf("  [%s %+.1f]", nm, d);
+            }
+            std::printf("\n");
+        }
         return 0;
     }
 
@@ -566,6 +616,27 @@ int main(int argc, char** argv)
             const int b = bus_index(argv[4]);
             if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
             p.bus_on[b].store(atoi(argv[5]) ? 1 : 0);
+        }
+        else if (w == "send" && argc >= 5) {
+            // "send <dB>" is the stream bus; "send <bus> <dB>" names one.
+            int b = -1;
+            const char* val = argv[4];
+            if (argc >= 6) {
+                b = bus_index(argv[4]);
+                if (b < 0) { std::fprintf(stderr, "bus must be A1..A3,B1,B2\n"); return 1; }
+                val = argv[5];
+            } else {
+                b = stream_bus(s);
+                if (b < 0) {
+                    std::fprintf(stderr, "no stream bus is set up; name the bus: "
+                                         "strip %d send <A1..B2> <dB>\n", i);
+                    return 1;
+                }
+            }
+            p.send_db[b].store(clamp_send(atof(val)));
+            if (!s->bus[b].prefader.load())
+                std::fprintf(stderr, "note: %s is post-fader, so the send has no effect "
+                                     "until `bus %s prefader 1`\n", kBusName[b], kBusName[b]);
         }
         else { usage(); return 1; }
         return 0;
@@ -795,6 +866,10 @@ int main(int argc, char** argv)
         else if (w == "mono") p.mono.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "eq")   p.eq.on.store(atoi(argv[4]) ? 1 : 0);
         else if (w == "delay") p.delay_ms.store(clamp_delay(atof(argv[4])));
+        else if (w == "prefader") {
+            const bool keep = argc >= 6 && std::string(argv[5]) == "--keep-sends";
+            set_prefader(s, b, atoi(argv[4]) != 0, keep);
+        }
         else if (w == "mode") {
             if (b >= kPhysBuses) {
                 std::fprintf(stderr, "only A1..A3 have modes; B1 and B2 are what "

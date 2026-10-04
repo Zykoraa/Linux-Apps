@@ -21,6 +21,7 @@
 #include "loudness.h"
 #include "voicefx.h"
 #include "nodes.h"
+#include "matrix.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -192,6 +193,10 @@ struct StripDsp {
     SmoothGain gain[kChan];
     PeakMeter  pre[kChan], post[kChan];
     Delay      delay;
+    // The pre-fader tap gets its own copy of the strip delay, so lip-sync
+    // carries to a pre-fader bus too. Only run while some bus wants the tap.
+    Delay      send_delay;
+    bool       send_live = false;
     float c_gate = -1, c_comp = -1, c_aud = -1;
     float c_lo = 1e9f, c_mid = 1e9f, c_hi = 1e9f;
 
@@ -205,6 +210,7 @@ struct StripDsp {
         par.configure(sr);
         fx.configure(sr);
         delay.configure(sr);
+        send_delay.configure(sr);
     }
     void update(const StripParams& p, float sr)
     {
@@ -340,6 +346,9 @@ struct Engine {
     float duck_env = 0.0f;                 // 0..1
     SmoothGain duck_gain[kStrips];
 
+    // Pre-fader send gains, one per strip per bus (engine/matrix.h).
+    StripSends ssend[kStrips];
+
     // The timing-test click. One phase for every bus, so a tick leaves them all
     // on the same sample and the only difference left to hear is the one being
     // measured.
@@ -348,6 +357,8 @@ struct Engine {
 
     // scratch
     float stripout[kStrips][kMaxChunk * kChan];   // per-strip post-DSP output
+    float stripsend[kStrips][kMaxChunk * kChan];  // the same, before the fader
+    float dgbuf[kMaxChunk];                       // one strip's duck gain per frame
     float sbuf[kMaxChunk * kChan];
     float pbuf[kMaxChunk * kChan];
     float acc[kBuses][kMaxChunk * kChan];
@@ -425,13 +436,22 @@ void Engine::mix_chunk(uint32_t n)
     for (int b = 0; b < kBuses; ++b)
         std::memset(acc[b], 0, sizeof(float) * n * kChan);
 
+    // Which buses take strips before the fader (BusParams::prefader).
+    bool prefader[kBuses];
+    for (int b = 0; b < kBuses; ++b)
+        prefader[b] = s->bus[b].prefader.load(std::memory_order_relaxed) != 0;
+
     // ---- pass 1: run each strip's DSP into its own buffer -----------------
     // Keeping the per-strip result lets the ducker see every key strip before
     // anything is summed, and lets solo be decided per bus.
     float key_peak = 0.0f;
+    bool need_pre[kStrips] = {};
     for (int i = 0; i < kStrips; ++i) {
         StripParams& p = s->strip[i];
         StripDsp& d = sdsp[i];
+        for (int b = 0; b < kBuses; ++b)
+            if (prefader[b] && p.bus_on[b].load(std::memory_order_relaxed)) need_pre[i] = true;
+        float* const tap = need_pre[i] ? stripsend[i] : nullptr;
 
         strip_ring[i].drop_to(kResyncQuanta * n);
         strip_ring[i].read_padded(sbuf, n);
@@ -474,8 +494,11 @@ void Engine::mix_chunk(uint32_t n)
                 // real voice going in rather than the artefacts coming out,
                 // and before the fader, so the fader still means level.
                 if (fx_on)  x = d.fx.process(c, x);
-                x *= d.gain[c].next();
+                // Pan first, then the fader, so the pre-fader tap carries the
+                // strip's placement as well as its processing.
                 x *= (c == 0 ? pl : pr) * 1.41421356f;   // pan law is unity at centre
+                if (tap) tap[f * kChan + c] = x;
+                x *= d.gain[c].next();
 
                 const float b2 = std::fabs(x);
                 if (b2 > post_pk[c]) post_pk[c] = b2;
@@ -496,8 +519,16 @@ void Engine::mix_chunk(uint32_t n)
         // they report what the strip produced, and a delay is transport, not
         // level - a meter that lagged the fader by a quarter of a second would
         // read as the mixer being broken.
-        d.delay.set_ms(p.delay_ms.load(std::memory_order_relaxed));
+        const float dms = p.delay_ms.load(std::memory_order_relaxed);
+        d.delay.set_ms(dms);
         if (d.delay.active()) d.delay.process(stripout[i], (int)n);
+        if (tap) {
+            // A tap that was idle holds whatever it last carried: start clean.
+            if (!d.send_live) d.send_delay.reset();
+            d.send_delay.set_ms(dms);
+            if (d.send_delay.active()) d.send_delay.process(tap, (int)n);
+        }
+        d.send_live = tap != nullptr;
 
         for (int c = 0; c < kChan; ++c) {
             d.pre[c].feed_peak(pre_pk[c], n);
@@ -527,35 +558,43 @@ void Engine::mix_chunk(uint32_t n)
 
     // ---- pass 2: apply ducking and sum into the buses ----------------------
     // Solo is decided per bus: a soloed strip silences the others only on the
-    // buses it actually feeds.
+    // buses it actually feeds. Pre-fader buses are exempt: solo is for
+    // listening, and soloing a source in your headphones must not cut it - or
+    // everything else - out of what a stream is hearing.
     bool solo_on_bus[kBuses] = {};
-    for (int b = 0; b < kBuses; ++b)
+    for (int b = 0; b < kBuses; ++b) {
+        if (prefader[b]) continue;
         for (int i = 0; i < kStrips; ++i)
             if (s->strip[i].solo.load(std::memory_order_relaxed) &&
                 s->strip[i].bus_on[b].load(std::memory_order_relaxed)) {
                 solo_on_bus[b] = true;
                 break;
             }
+    }
 
+    float* const accp[kBuses] = { acc[0], acc[1], acc[2], acc[3], acc[4] };
+    static_assert(kBuses == 5, "accp lists every bus");
     for (int i = 0; i < kStrips; ++i) {
         StripParams& p = s->strip[i];
         const float depth = p.duck_depth_db.load(std::memory_order_relaxed);
         const float duck_db = depth * duck_env;
         s->meters.strip_duck_gr[i].store(duck_db, std::memory_order_relaxed);
         duck_gain[i].set_target(db_to_lin(duck_db));
+        // Once per frame, however many buses the strip feeds.
+        for (uint32_t f = 0; f < n; ++f) dgbuf[f] = duck_gain[i].next();
 
         const bool soloed = p.solo.load(std::memory_order_relaxed) != 0;
-        for (uint32_t f = 0; f < n; ++f) {
-            const float dg = duck_gain[i].next();
-            const float L = stripout[i][f * kChan]     * dg;
-            const float R = stripout[i][f * kChan + 1] * dg;
-            for (int b = 0; b < kBuses; ++b) {
-                if (!p.bus_on[b].load(std::memory_order_relaxed)) continue;
-                if (solo_on_bus[b] && !soloed) continue;
-                acc[b][f * kChan]     += L;
-                acc[b][f * kChan + 1] += R;
-            }
+        const bool muted  = p.mute.load(std::memory_order_relaxed) != 0;
+        BusRoute route[kBuses];
+        float target[kBuses];
+        for (int b = 0; b < kBuses; ++b) {
+            route[b].on = p.bus_on[b].load(std::memory_order_relaxed) != 0;
+            route[b].prefader = prefader[b];
+            route[b].solo_blocked = solo_on_bus[b] && !soloed;
+            target[b] = send_target(p.send_db[b].load(std::memory_order_relaxed), muted);
         }
+        matrix_add_strip(accp, stripout[i], need_pre[i] ? stripsend[i] : nullptr,
+                         dgbuf, n, route, target, ssend[i]);
     }
 
     // Tape deck playback feeds the matrix like any other source, before the
@@ -1496,6 +1535,7 @@ int main(int argc, char** argv)
         g_eng.sdsp[i].configure(g_eng.sr);
         g_eng.duck_gain[i].configure(g_eng.sr, 8.0f);
         g_eng.duck_gain[i].snap(1.0f);
+        g_eng.ssend[i].configure(g_eng.sr);
     }
     for (int b = 0; b < kBuses; ++b) g_eng.bdsp[b].configure(g_eng.sr);
     g_eng.click.configure(g_eng.sr);
