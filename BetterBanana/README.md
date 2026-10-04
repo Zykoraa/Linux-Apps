@@ -1214,32 +1214,36 @@ you record *from* are `bb_b1` and `bb_b2`.
 
 ### Screen sharing on Discord
 
-Sharing your screen while running a mixer breaks in three ways that are invisible
+Sharing your screen while running a mixer breaks in two ways that are invisible
 from Discord's UI. `bb-stream-guard` — installed and enabled for you — fixes
-all three, but it is worth knowing what it is doing.
+both, but it is worth knowing what it is doing.
 
 **Everyone hears themselves.** Discord's screen-share capture auto-links to
 every `bb_a*` output bus it can find. Your monitoring buses carry the AUX strip,
 so the voices of the people you are talking to get folded straight back into
 your stream and each of them hears their own echo.
 
-**Audio that is routed perfectly is still silent.** Discord runs *several* nodes
-all named `discord_capture` — four is normal — and only one is actually
-transmitted to viewers. `pw-link` matches ports by name, so linking a bus to
-"discord_capture" hits an instance at random. This is the one that wastes an
-evening: the routing is correct, the meters move, and your friends hear nothing.
+**The stream sounds like it is in a chamber.** Share your entire screen and
+Discord captures every playback stream itself — one node named `discord_capture`
+per stream, each with a `target.object` naming the stream it captures — and
+mixes them all into what viewers hear. Feed the stream bus into more than one
+of them and viewers get several copies, each a few milliseconds apart from its
+own buffering: comb filtering, which sounds hollow, like a tunnel or a chamber.
+An app that reaches both the stream bus and its own capture is doubled the same
+way, and its direct copy also cuts out whenever the app pauses or reopens its
+stream (browsers do this constantly). `pw-link` matches ports by name, so even
+wiring "bus -> discord_capture" by hand lands on an instance at random.
 
-**Music plays twice, and drops out.** Share your entire screen and Discord also
-captures every application's own playback stream, one `discord_capture` per app.
-Anything that reaches the stream bus as well is heard twice, a few milliseconds
-apart, and Discord's copy cuts out whenever the app pauses or reopens its stream
-(browsers do this constantly). Once a stream bus exists, the guard removes every
-other link into `discord_capture`, so viewers hear exactly what the stream bus
-carries. Set `BB_GUARD_EXCLUSIVE=0` in the service's environment to keep
-Discord's own capture instead.
+So the guard feeds the stream bus into exactly one capture — the one Discord
+made for the bus's own stream, addressed by port id — and removes every other
+link into `discord_capture`. Viewers hear one copy of exactly what the stream
+bus carries. Share your **entire screen**: with a single window Discord does not
+capture the bus at all, and the guard falls back to feeding every capture (and
+says so in its log). Set `BB_GUARD_EXCLUSIVE=0` in the service's environment to
+keep Discord's own app capture alongside the bus.
 
-The fix is a dedicated stream bus that carries only what you want streamed, wired
-to every capture instance by port id. One command sets that up:
+The fix is a dedicated stream bus that carries only what you want streamed, fed
+to Discord once, by port id. One command sets that up:
 
     bb-stream-setup
 

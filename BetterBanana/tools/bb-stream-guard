@@ -9,23 +9,24 @@ Voicemeeter-style mixer, and neither is obvious from the Discord UI.
    -- so everyone in the call hears themselves played back inside your stream.
 
 2. THE WRONG CAPTURE NODE. Discord runs SEVERAL nodes all named
-   "discord_capture" (four is common) and only one of them is actually
-   transmitted to viewers. `pw-link` matches ports by NAME, so linking
-   "bus -> discord_capture" picks an instance by luck. Audio can be perfectly
-   routed and still be inaudible because it landed on an idle instance.
+   "discord_capture", one per playback stream it captures, each carrying a
+   target.object naming that stream. `pw-link` matches ports by NAME, so
+   linking "bus -> discord_capture" picks an instance by luck.
 
 3. DOUBLED AUDIO. Sharing the entire screen makes Discord capture every
-   application's playback stream itself, one discord_capture per app. An app
-   that also reaches the stream bus is then heard twice, slightly apart, and
-   its audio cuts out whenever the app pauses or reopens its own stream.
+   application's playback stream itself and MIX the captures. An app that also
+   reaches the stream bus is heard twice, and the bus fed into several captures
+   is heard several times -- each copy offset by its own buffer, which is comb
+   filtering: viewers hear the stream "as if in a chamber".
 
 This daemon fixes all three. Every couple of seconds it:
 
   * drops links into discord_capture from any bus the AUX strip feeds (fixes 1),
-  * attaches your dedicated stream bus to EVERY discord_capture instance,
-    addressed by port id rather than by name (fixes 2),
+  * attaches your dedicated stream bus, by port id, to the ONE capture Discord
+    made for the stream bus itself (fixes 2); with no such capture (sharing a
+    single window), to every capture instead,
   * once a stream bus exists, drops every other link into discord_capture,
-    so the stream carries exactly what the stream bus carries (fixes 3),
+    so viewers hear exactly one copy of the stream bus (fixes 3),
   * re-creates the stream bus if it vanished. A null sink with nothing playing
     gets suspended as idle, which tears down BetterBanana's output node for that
     bus; the stream then goes silent until something restarts the chain.
@@ -49,6 +50,7 @@ Environment:
     BB_GUARD_INTERVAL     poll seconds                     (default 2)
     BB_GUARD_BBCTL        path to bb-ctl                   (default ~/.local/bin/bb-ctl)
 """
+import json
 import os
 import re
 import subprocess
@@ -190,6 +192,37 @@ def links():
     return found
 
 
+_fallback_logged = False
+
+
+def own_capture_ports(stream_bus):
+    """Input port ids of the discord_capture node(s) Discord made for the stream
+    bus's own playback stream -- matched by target.object == the bus node's
+    object.serial. Empty when Discord is not capturing the bus (window share)."""
+    try:
+        graph = json.loads(run("pw-dump") or "[]")
+    except ValueError:
+        return set()
+    serial, nodes = None, set()
+    for o in graph:
+        if o.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("node.name") == stream_bus:
+            serial = str(props.get("object.serial"))
+    for o in graph:
+        if o.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("node.name") == TARGET and serial and \
+                str(props.get("target.object")) == serial:
+            nodes.add(o["id"])
+    return {o["id"] for o in graph
+            if o.get("type") == "PipeWire:Interface:Port"
+            and (o.get("info") or {}).get("direction") == "input"
+            and ((o.get("info") or {}).get("props") or {}).get("node.id") in nodes}
+
+
 def tick():
     inputs = ports("-i")
     cap = {c: inputs.get(f"{TARGET}:input_{c}", []) for c in CHANNELS}
@@ -233,6 +266,21 @@ def tick():
             stream_ids.update(outputs.get(f"{stream_bus}:output_{c}", []))
     port_names = {pid: name for name, ids in outputs.items() for pid in ids}
 
+    # Discord mixes every capture it runs, so the stream bus must reach exactly
+    # one of them: the capture Discord made for the bus's own stream. Without one
+    # (a single window is shared, so Discord is not capturing the bus) feed them all.
+    global _fallback_logged
+    feed = cap_ids
+    if stream_bus:
+        own = own_capture_ports(stream_bus) & cap_ids
+        if own:
+            feed = own
+            _fallback_logged = False
+        elif not _fallback_logged:
+            print(f"bb-stream-guard: Discord is not capturing {stream_bus} itself "
+                  f"(window share?) - feeding every {TARGET}", flush=True)
+            _fallback_logged = True
+
     for lid, o, i in existing:
         if i not in cap_ids:
             continue
@@ -241,6 +289,8 @@ def tick():
         elif EXCLUSIVE and stream_ids and o not in stream_ids:
             # Discord's own per-app capture: the stream bus already carries it.
             why = f"{port_names.get(o, o)}, not the stream bus"
+        elif o in stream_ids and i not in feed:
+            why = f"{port_names.get(o, o)} into a second capture: a duplicate copy"
         else:
             continue
         run("pw-link", "-d", str(lid))
@@ -253,7 +303,7 @@ def tick():
     for c in CHANNELS:
         for src in outputs.get(f"{stream_bus}:output_{c}", []):
             for dst in cap[c]:
-                if (src, dst) not in pairs:
+                if dst in feed and (src, dst) not in pairs:
                     run("pw-link", str(src), str(dst))
                     print(f"bb-stream-guard: attached {stream_bus}:output_{c} "
                           f"({src}) -> {TARGET} port {dst}", flush=True)
