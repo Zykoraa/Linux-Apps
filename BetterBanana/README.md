@@ -1263,9 +1263,12 @@ instead:
 
 **Never route AUX to the stream bus.** That is the echo, straight back.
 
-`bb-stream-setup` will refuse to run until `betterbanana_stream` exists. That
-sink comes from `99-bb-stream.conf`, and PipeWire only reads its configuration at
-startup — so on a fresh install, log out and back in first.
+The engine creates `betterbanana_stream` itself when it starts: no config file,
+no logging out. (Older installs made it with a PipeWire config file,
+`99-bb-stream.conf`; the installer removes that, and until your next login the
+engine simply uses the sink it made.) A bus pointed at the sink waits for it
+rather than letting the session manager connect it to your default device in
+the meantime — which would play the viewers' mix in your headphones.
 
 | Bus | Carries | Who hears it |
 |---|---|---|
@@ -1287,9 +1290,9 @@ Two things that look like routing faults and are not:
   between them, so `-99.9 dB` on a strip can simply mean nothing is playing.
 - **The stream bus can vanish.** A null sink with nothing playing gets suspended
   as idle, and that takes BetterBanana's bus node down with it — the stream then
-  goes silent until something restarts the chain. The shipped
-  `99-bb-stream.conf` disables suspend for `betterbanana_stream`, and the guard re-creates
-  the bus if it disappears anyway.
+  goes silent until something restarts the chain. The engine creates
+  `betterbanana_stream` with suspend disabled, recreates it if anything removes
+  it, and the guard re-creates the bus if it disappears anyway.
 
 ## Troubleshooting
 
@@ -1331,11 +1334,6 @@ Usually the above, with Discord's output landing on the stream sink instead of
 watching your screen share, never by you — and if it is Discord's own output,
 everyone in the call hears themselves. Point Discord's output at **BetterBanana
 AUX**, and check with the `pactl` command above that it actually went there.
-
-### A newly installed sink or source does not exist
-
-PipeWire reads `~/.config/pipewire/pipewire.conf.d/*.conf` only at startup. A
-freshly installed `99-bb-stream.conf` has no effect until you log out and back in.
 
 ## Control from the shell
 

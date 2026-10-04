@@ -8,13 +8,12 @@ SHARE="$HOME/.local/share"
 APPS="$SHARE/applications"
 ICONS="$SHARE/icons/hicolor"
 UNITS="$HOME/.config/systemd/user"
-PWCONF="$HOME/.config/pipewire/pipewire.conf.d"
 ICON_SIZES="16 24 32 48 64 128 256"
 
 [ -x "$ROOT/build/bb-engine" ] || { echo "run 'make' first"; exit 1; }
 [ -x "$ROOT/build/bb-gui" ]    || { echo "run 'make gui' first"; exit 1; }
 
-mkdir -p "$BIN" "$APPS" "$ICONS/scalable/apps" "$UNITS" "$PWCONF" \
+mkdir -p "$BIN" "$APPS" "$ICONS/scalable/apps" "$UNITS" \
          "$SHARE/mime/packages" "$SHARE/metainfo"
 install -m755 "$ROOT/build/bb-engine" "$ROOT/build/bb-gui" "$ROOT/build/bb-ctl" "$BIN/"
 install -m755 "$ROOT/tools/bb-stream-guard" "$BIN/bb-stream-guard"
@@ -60,7 +59,17 @@ sed -i "s|^Exec=bb-gui|Exec=$BIN/bb-gui|" "$APPS/betterbanana.desktop"
 install -m644 "$ROOT/packaging/betterbanana-engine.service" "$UNITS/betterbanana-engine.service"
 install -m644 "$ROOT/packaging/betterbanana-stream-guard.service" "$UNITS/betterbanana-stream-guard.service"
 install -m644 "$ROOT/packaging/betterbanana-health.service" "$UNITS/betterbanana-health.service"
-install -m644 "$ROOT/packaging/99-bb-stream.conf" "$PWCONF/99-bb-stream.conf"
+
+# The stream sink used to come from a PipeWire config file, which only took
+# effect after logging out. The engine creates it itself now, so remove the
+# file an older install left - only if it is ours - or the next login brings
+# the old sink back. Until then the engine leaves that one in place and uses
+# it, so nothing changes mid-session.
+OLDCONF="$HOME/.config/pipewire/pipewire.conf.d/99-bb-stream.conf"
+if [ -f "$OLDCONF" ] && grep -q betterbanana_stream "$OLDCONF"; then
+    rm -f "$OLDCONF"
+    echo "Removed $OLDCONF - the engine creates the stream sink now."
+fi
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" || true
 command -v gtk-update-icon-cache >/dev/null && \
@@ -93,6 +102,3 @@ echo
 echo "Sharing your screen on Discord? One command sets up the stream bus so"
 echo "callers do not hear themselves echoed back (see README):"
 echo "    bb-stream-setup"
-echo
-echo "Run it after your next login -- the stream sink is created by a PipeWire"
-echo "config file, and PipeWire only reads those at startup."

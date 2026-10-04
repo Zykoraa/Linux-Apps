@@ -229,8 +229,6 @@ install-system: engine gui ctl
 	  $(DATADIR)/metainfo/io.github.zykoraa.betterbanana.metainfo.xml
 	install -Dm644 packaging/betterbanana.xml \
 	  $(DATADIR)/mime/packages/betterbanana.xml
-	install -Dm644 packaging/99-bb-stream.conf \
-	  $(DATADIR)/pipewire/pipewire.conf.d/99-bb-stream.conf
 	install -Dm644 LICENSE $(DATADIR)/licenses/betterbanana/LICENSE
 	@# Every unit runs the binary out of ~/.local/bin, which is where the
 	@# per-user installer puts it; all three need repointing, not just the
