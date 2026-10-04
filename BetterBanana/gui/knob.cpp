@@ -94,7 +94,8 @@ void Knob::paintEvent(QPaintEvent*)
     // its worst-looking one. A bipolar arc grows from the *default*, not the
     // range midpoint - the recorder's -60..+12 knob defaults to 0 dB and used
     // to draw a filled arc across the whole -24..0 region as if boosted.
-    const QColor arcCol = atDef ? bbcolor::mix(t.accent, t.panel, 0.55) : t.accent;
+    const QColor acc = m_accent.isValid() ? m_accent : t.accent;
+    const QColor arcCol = atDef ? bbcolor::mix(acc, t.panel, 0.55) : acc;
     QPen fill(arcCol, arcW, Qt::SolidLine, Qt::RoundCap);
     p.setPen(fill);
     if (m_bipolar) {

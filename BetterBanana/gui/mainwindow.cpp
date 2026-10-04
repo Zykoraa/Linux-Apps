@@ -6,6 +6,7 @@
 #include "color.h"
 #include "metrics.h"
 #include "../common/preset.h"
+#include "../common/streamsetup.h"
 #include "../engine/dsp.h"
 #include "../engine/surround.h"
 #include "../engine/delay.h"
@@ -348,6 +349,25 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         root->addWidget(m_pan);
     }
 
+    {   // The stream send. The fader sets what you hear; on a pre-fader stream
+        // bus this sets what the viewers hear, so music can sit low in your
+        // headphones and still reach the stream at full level. Coloured like
+        // the stream bus's button below it; greyed, with a tooltip saying why,
+        // whenever it would do nothing.
+        auto* g = new QGridLayout;
+        g->setSpacing(0);
+        m_send = addKnob(g, 0, "STREAM", -600, 120, 0, true);
+        m_send->setFormatter([](int v) {
+            return v <= -600 ? QString("off") : QString::asprintf("%+.1f dB", v / 10.0);
+        });
+        connect(m_send, &Knob::valueChanged, this, [this](int v) {
+            const int sb = m_shm->stream.bus.load(std::memory_order_relaxed);
+            if (sb >= 0 && sb < kBuses)
+                m_shm->strip[m_index].send_db[sb].store(clamp_send(v / 10.0f));
+        });
+        root->addLayout(g);
+    }
+
     {   // Bus assignment: one row of five, as in Banana.
         auto* row = new QHBoxLayout;
         row->setSpacing(bbui::gapXS());
@@ -531,6 +551,26 @@ void StripWidget::pullFromShm()
     if (m_eqBtn) m_eqBtn->setChecked(p.eq.on.load() != 0);
     if (m_fxBtn) m_fxBtn->setChecked(p.fx.on.load() != 0);
     for (int b = 0; b < m_busBtns.size(); ++b) m_busBtns[b]->setChecked(p.bus_on[b].load() != 0);
+
+    if (m_send) {
+        const int sb = m_shm->stream.bus.load(std::memory_order_relaxed);
+        const bool have = sb >= 0 && sb < kPhysBuses;
+        const bool pre = have && m_shm->bus[sb].prefader.load() != 0;
+        const bool routed = have && p.bus_on[sb].load() != 0;
+        if (have && !m_send->isDragging())
+            m_send->setValue(int(std::lround(p.send_db[sb].load() * 10.0f)));
+        m_send->setEnabled(pre && routed);
+        m_send->setAccent(have ? busChipColour(theme(), sb) : QColor());
+        const QString bus = have ? QString(kBusLabel[sb]) : QString();
+        const QString tip =
+            !have   ? QString("Stream send. No stream bus is set up yet: Engine \u25B8 Stream\u2026")
+          : !routed ? QString("Stream send. This strip is not routed to the stream bus (%1).").arg(bus)
+          : !pre    ? QString("Stream send. %1 follows the faders; make it pre-fader in "
+                              "Engine \u25B8 Stream\u2026 and this sets what viewers hear.").arg(bus)
+                    : QString("What viewers hear from this strip, on %1. The fader only sets "
+                              "what you hear.\nDouble-click: back to 0 dB.").arg(bus);
+        if (m_send->toolTip() != tip) m_send->setToolTip(tip);
+    }
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     m_header->setText(labelFor(m_shm, true, m_index, kStripTitle[m_index]));
 }
@@ -682,6 +722,15 @@ BusWidget::BusWidget(Shared* shm, int index, bool hardware, const QString& title
         emit statusMessage("Integrated loudness measurement restarted");
     });
     root->addWidget(m_lufs);
+    if (m_hardware) {
+        // Which bus the viewers hear, and how it is taking the strips. Present
+        // on every A bus, blank on all but the stream bus, so cards keep one
+        // height whichever bus that is.
+        m_streamTag = makeLabel("", "caption");
+        m_streamTag->setAlignment(Qt::AlignHCenter);
+        m_streamTag->setFixedHeight(bbui::rowH());
+        root->addWidget(m_streamTag);
+    }
     // A strip carries pan and a bus-assign row under its gain readout. Matching
     // that depth here lines every meter in the console up along one baseline.
     root->addStretch(1);
@@ -800,6 +849,25 @@ void BusWidget::refreshMeters()
                     "Right-click to start the integrated measurement again.")
                 .arg(in <= -70.0f ? QString("not enough audio yet")
                                   : QString::asprintf("%.1f LUFS", in)));
+    }
+
+    if (m_streamTag) {
+        QString t, tip;
+        if (m_shm->stream.bus.load(std::memory_order_relaxed) == m_index) {
+            const BusParams& p = m_shm->bus[m_index];
+            t = p.prefader.load() ? "STREAM \u00B7 PRE" : "STREAM";
+            tip = p.prefader.load()
+                ? "Your viewers hear this bus. It takes each strip at its STREAM send, "
+                  "not its fader."
+                : "Your viewers hear this bus. It follows the strip faders; make it "
+                  "pre-fader in Engine \u25B8 Stream\u2026 to give the stream its own levels.";
+            if (p.al_on.load()) {
+                t += QString::asprintf(" \u00B7 AL %+.0f", m_shm->meters.bus_al_db[m_index].load());
+                tip += "\nAuto-level is riding it to a steady loudness.";
+            }
+        }
+        if (m_streamTag->text() != t) m_streamTag->setText(t);
+        if (m_streamTag->toolTip() != tip) m_streamTag->setToolTip(tip);
     }
 
     float v[kChan];
@@ -1388,6 +1456,215 @@ void DuckDialog::refresh()
 {
     const float e = m_shm->meters.duck_env.load(std::memory_order_relaxed);
     m_env->setText(e < 0.02f ? "idle" : QString::asprintf("ducking  %.0f%%", e * 100.0));
+}
+
+// ---------------------------------------------------------------------------
+// StreamDialog
+// ---------------------------------------------------------------------------
+StreamDialog::StreamDialog(Shared* shm, QWidget* parent) : QDialog(parent), m_shm(shm)
+{
+    setWindowTitle("Discord stream");
+    auto* root = new QVBoxLayout(this);
+    bbdlg::chrome(root);
+    root->addWidget(bbdlg::header("Discord stream",
+        "What the people watching your screen share hear. One bus feeds the stream, and "
+        "the engine keeps Discord's capture on that bus alone: callers never hear "
+        "themselves, and nothing reaches the viewers twice."));
+
+    auto* grid = new QGridLayout;
+    grid->setSpacing(bbui::gapS());
+    auto row = [&](int r, const QString& cap, QLabel*& val) {
+        grid->addWidget(makeLabel(cap, "caption", Qt::AlignLeft | Qt::AlignTop), r, 0);
+        val = makeLabel("-", "value", Qt::AlignLeft | Qt::AlignTop);
+        val->setWordWrap(true);
+        grid->addWidget(val, r, 1);
+    };
+    row(0, "STREAM BUS", m_bus);
+    row(1, "SINK", m_sink);
+    row(2, "DISCORD", m_discord);
+    grid->setColumnStretch(1, 1);
+    root->addLayout(grid);
+
+    m_warn = makeLabel("", "alert", Qt::AlignLeft);
+    m_warn->setWordWrap(true);
+    m_warn->hide();
+    root->addWidget(m_warn);
+
+    root->addSpacing(bbui::gapS());
+    root->addWidget(makeLabel("SET UP", "caption", Qt::AlignLeft));
+    m_plan = makeLabel("", "gain", Qt::AlignLeft);
+    m_plan->setWordWrap(true);
+    root->addWidget(m_plan);
+    {
+        auto* r = new QHBoxLayout;
+        m_setupAl = new QCheckBox("Also switch on auto-level");
+        m_setup = new QPushButton("Set up");
+        m_setup->setToolTip("Picks the stream bus, routes your app audio to it, keeps your "
+                            "microphone and your callers off it, and gives every strip a "
+                            "STREAM send. Shown above before anything changes.");
+        connect(m_setup, &QPushButton::clicked, this, &StreamDialog::runSetup);
+        connect(m_setupAl, &QCheckBox::toggled, this, &StreamDialog::refresh);
+        r->addWidget(m_setupAl);
+        r->addStretch();
+        r->addWidget(m_setup);
+        root->addLayout(r);
+    }
+
+    root->addSpacing(bbui::gapS());
+    root->addWidget(makeLabel("THE STREAM BUS", "caption", Qt::AlignLeft));
+    m_pre = new QCheckBox("Pre-fader: each strip reaches the stream at its STREAM send, "
+                          "not its fader");
+    m_pre->setToolTip("Then the faders set what you hear and the STREAM knobs what viewers "
+                      "hear. Switching on starts every send at its fader, so nothing jumps.");
+    connect(m_pre, &QCheckBox::toggled, this, [this](bool on) {
+        const int sb = m_shm->stream.bus.load();
+        if (sb >= 0 && sb < kPhysBuses) set_prefader(m_shm, sb, on);
+    });
+    root->addWidget(m_pre);
+    {
+        auto* r = new QHBoxLayout;
+        r->setSpacing(bbui::gapM());
+        m_al = new QCheckBox("Auto-level: keep the stream at a steady loudness");
+        m_al->setToolTip("Rides the stream slowly toward the target, whatever your apps are set "
+                         "to. It never lifts silence or hiss, and holds while the ducker works.");
+        connect(m_al, &QCheckBox::toggled, this, [this](bool on) {
+            const int sb = m_shm->stream.bus.load();
+            if (sb >= 0 && sb < kPhysBuses) m_shm->bus[sb].al_on.store(on ? 1 : 0);
+        });
+        r->addWidget(m_al, 1);
+        auto* col = new QVBoxLayout;
+        col->addWidget(makeLabel("TARGET", "caption"));
+        // As bb-ctl bus <b> autolevel target: kAlTargetMin .. kAlTargetMax.
+        m_alTarget = new Knob(int(kAlTargetMin * 10), int(kAlTargetMax * 10),
+                              int(kAlDefaultTarget * 10), false, " LUFS");
+        m_alTarget->setMinimumWidth(bbui::px(52));
+        connect(m_alTarget, &Knob::valueChanged, this, [this](int v) {
+            const int sb = m_shm->stream.bus.load();
+            if (sb >= 0 && sb < kPhysBuses) m_shm->bus[sb].al_target.store(v / 10.0f);
+        });
+        col->addWidget(m_alTarget, 0, Qt::AlignHCenter);
+        r->addLayout(col);
+        m_alNow = makeLabel("", "gain", Qt::AlignRight | Qt::AlignVCenter);
+        m_alNow->setMinimumWidth(bbui::px(150));
+        r->addWidget(m_alNow);
+        root->addLayout(r);
+    }
+    {
+        auto* r = new QHBoxLayout;
+        r->addWidget(makeLabel("Let into Discord's capture:", "caption", Qt::AlignLeft));
+        m_guard = new QComboBox;
+        m_guard->addItem("the stream bus only (recommended)", int(kGuardModeOn));
+        m_guard->addItem("anything but your callers", int(kGuardModeEcho));
+        m_guard->addItem("anything - leave Discord alone", int(kGuardModeOff));
+        connect(m_guard, &QComboBox::currentIndexChanged, this, [this](int i) {
+            if (i >= 0) m_shm->stream_guard_mode.store(m_guard->itemData(i).toInt());
+        });
+        r->addWidget(m_guard, 1);
+        root->addLayout(r);
+    }
+
+    root->addStretch();
+    root->addWidget(makeLabel("Changes apply at once. Save a preset (Ctrl+S) to keep them.",
+                              "caption", Qt::AlignLeft));
+    auto* close = new QPushButton("Close");
+    connect(close, &QPushButton::clicked, this, &QDialog::accept);
+    root->addLayout(bbdlg::buttonRow(nullptr, close));
+
+    resize(600, 520);
+    bbdlg::rememberGeometry(this, "stream");
+    bbdlg::tameDefaults(this);
+    m_timer = new QTimer(this);
+    connect(m_timer, &QTimer::timeout, this, &StreamDialog::refresh);
+    m_timer->start(250);
+    refresh();
+}
+
+void StreamDialog::refresh()
+{
+    const int sb = m_shm->stream.bus.load(std::memory_order_relaxed);
+    const bool have = sb >= 0 && sb < kPhysBuses;
+    auto set = [](QLabel* l, const QString& t) { if (l->text() != t) l->setText(t); };
+
+    set(m_bus, have ? QString("%1  (%2)").arg(kBusLabel[sb], labelFor(m_shm, false, sb, kBusLabel[sb]))
+                    : QString("none yet - Set up picks one"));
+
+    static const char* const sink[] = {
+        "not there yet", "being created", "ready",
+        "ready (made by an old config file; the engine takes over after your next login)",
+        "could not be created - retrying" };
+    set(m_sink, sink[std::clamp(m_shm->stream.sink_state.load(), 0, 4)]);
+
+    const int st = m_shm->stream.guard_state.load();
+    static const char* const guard[] = {
+        "the guard is off - Discord captures whatever it likes",
+        "not sharing your screen right now",
+        "sharing - your callers are kept out (no stream bus set up)",
+        "sharing - the stream bus goes to Discord, once, and nothing else",
+        "sharing a window - the stream bus goes into every capture",
+        "sharing - but the stream bus is not running" };
+    QString d = guard[std::clamp(st, 0, 5)];
+    if (st >= kGuardEchoOnly)
+        d += QString("\n%1 capture stream%2 \u00B7 %3 link%4 made \u00B7 %5 removed")
+                 .arg(m_shm->stream.captures.load()).arg(m_shm->stream.captures.load() == 1 ? "" : "s")
+                 .arg(m_shm->stream.links_made.load()).arg(m_shm->stream.links_made.load() == 1 ? "" : "s")
+                 .arg(m_shm->stream.echo_dropped.load() + m_shm->stream.dup_dropped.load());
+    set(m_discord, d);
+
+    const bool fallback = st == kGuardFallback;
+    if (fallback)
+        set(m_warn, "Discord is sharing a single window, so it is not capturing the stream bus "
+                    "by itself. It still works, but share your Entire Screen for the cleanest "
+                    "result.");
+    m_warn->setVisible(fallback);
+
+    StreamSetupOpts o;
+    o.autolevel = m_setupAl->isChecked();
+    const StreamSetupPlan plan = plan_stream_setup(m_shm, o);
+    QString pt;
+    if (!plan.ok) pt = QString::fromStdString(plan.error);
+    else if (plan.actions.empty()) pt = "Everything is set up.";
+    else {
+        pt = "Set up will:";
+        for (const auto& a : plan.actions) pt += "\n  \u2022 " + QString::fromStdString(a.what);
+    }
+    set(m_plan, pt);
+    m_setup->setEnabled(plan.ok && !plan.actions.empty());
+
+    {
+        QSignalBlocker b1(m_pre), b2(m_al), b3(m_guard);
+        m_pre->setEnabled(have);
+        m_al->setEnabled(have);
+        m_alTarget->setEnabled(have);
+        m_pre->setChecked(have && m_shm->bus[sb].prefader.load());
+        m_al->setChecked(have && m_shm->bus[sb].al_on.load());
+        const int gi = m_guard->findData(m_shm->stream_guard_mode.load());
+        if (gi >= 0) m_guard->setCurrentIndex(gi);
+    }
+    if (have && !m_alTarget->isDragging())
+        m_alTarget->setValue(int(std::lround(m_shm->bus[sb].al_target.load() * 10.0f)));
+
+    QString now;
+    if (have && m_shm->bus[sb].al_on.load()) {
+        static const char* const as[] = { "off", "tracking", "holding: too quiet to judge",
+                                          "holding: ducker active", "at its limit" };
+        now = QString::asprintf("%+.1f dB  ", m_shm->meters.bus_al_db[sb].load())
+            + as[std::clamp(m_shm->meters.bus_al_state[sb].load(), 0, 4)];
+    }
+    if (have) {
+        const float l = m_shm->meters.bus_lufs_s[sb].load();
+        now += (now.isEmpty() ? "" : "\n")
+             + (l <= -70.0f ? QString("silent") : QString::asprintf("%.1f LUFS now", l));
+    }
+    set(m_alNow, now);
+}
+
+void StreamDialog::runSetup()
+{
+    StreamSetupOpts o;
+    o.autolevel = m_setupAl->isChecked();
+    const StreamSetupPlan plan = plan_stream_setup(m_shm, o);
+    if (plan.ok) apply_stream_setup(m_shm, plan);
+    refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -3326,6 +3603,7 @@ void MainWindow::openStripFx(int strip)
 }
 
 void MainWindow::openDuckDialog() { DuckDialog(m_shm, this).exec(); }
+void MainWindow::openStreamDialog() { StreamDialog(m_shm, this).exec(); }
 
 void MainWindow::openAppsDialog()
 {
@@ -3512,6 +3790,7 @@ void MainWindow::buildMenus()
     });
     eng->addAction("Sidechain &ducking...", QKeySequence("Ctrl+D"), this, &MainWindow::openDuckDialog);
     eng->addAction("&VBAN streams...", QKeySequence("Ctrl+B"), this, &MainWindow::openVbanDialog);
+    eng->addAction("Discord &stream...", this, &MainWindow::openStreamDialog);
 
     auto* mic = eng->addMenu("Analy&se microphone");
     mic->setToolTip("Measure a microphone and be told which control to change");

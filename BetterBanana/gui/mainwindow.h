@@ -83,6 +83,7 @@ private:
     Knob*        m_eqMid  = nullptr;
     Knob*        m_eqHi   = nullptr;
     XYPad*       m_pan    = nullptr;
+    Knob*        m_send   = nullptr;   // what the stream bus takes, pre-fader
     QPushButton* m_mono   = nullptr;
     QPushButton* m_solo   = nullptr;
     QPushButton* m_mute   = nullptr;
@@ -139,6 +140,7 @@ private:
     Fader*       m_fader  = nullptr;
     QLabel*      m_gainLbl = nullptr;
     QLabel*      m_lufs   = nullptr;   // short-term loudness, integrated in the tip
+    QLabel*      m_streamTag = nullptr; // "STREAM · PRE · AL +3" on the stream bus
     LevelMeter*  m_meter  = nullptr;
     QLabel*      m_header = nullptr;
     EqThumb*     m_thumb  = nullptr;
@@ -211,6 +213,32 @@ private:
     bb::Shared* m_shm;
     QPushButton* m_on = nullptr;
     QLabel*      m_env = nullptr;
+    QTimer*      m_timer = nullptr;
+};
+
+// Discord screen sharing: which bus the viewers hear, what the engine is doing
+// with Discord's capture right now, and setting it all up in one click.
+class StreamDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit StreamDialog(bb::Shared* shm, QWidget* parent = nullptr);
+private slots:
+    void refresh();
+    void runSetup();
+private:
+    bb::Shared*  m_shm;
+    QLabel*      m_bus = nullptr;
+    QLabel*      m_sink = nullptr;
+    QLabel*      m_discord = nullptr;
+    QLabel*      m_warn = nullptr;
+    QLabel*      m_plan = nullptr;
+    QPushButton* m_setup = nullptr;
+    QCheckBox*   m_setupAl = nullptr;
+    QCheckBox*   m_pre = nullptr;
+    QCheckBox*   m_al = nullptr;
+    Knob*        m_alTarget = nullptr;
+    QLabel*      m_alNow = nullptr;
+    QComboBox*   m_guard = nullptr;
     QTimer*      m_timer = nullptr;
 };
 
@@ -374,6 +402,7 @@ public:
     void openStripEq(int strip);
     void openStripFx(int strip);
     void openDuckDialog();
+    void openStreamDialog();
     void openDiagnoseDialog();
     void openAlignDialog();
     // Public because a diagnostic finding offers it as its fix.

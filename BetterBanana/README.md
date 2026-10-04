@@ -1243,23 +1243,43 @@ says so in its log). Set `BB_GUARD_EXCLUSIVE=0` in the service's environment to
 keep Discord's own app capture alongside the bus.
 
 The fix is a dedicated stream bus that carries only what you want streamed, fed
-to Discord once, by port id. One command sets that up:
+to Discord once, by port id. **Engine ▸ Discord stream…** sets it up in one
+click, and shows first exactly what it is going to change:
 
-    bb-stream-setup
+- it claims a free output bus (or reuses the one already set up) and points it
+  at the `betterbanana_stream` sink;
+- it routes your application audio to it — the VAIO strip and anything fed by a
+  virtual cable. Microphones are left out on purpose: Discord already sends your
+  voice, so streaming it as well means viewers hear you twice;
+- AUX is never routed, and if it already was, it is taken off;
+- it makes the bus **pre-fader** (below).
 
-It claims a free output bus, points it at the `betterbanana_stream` null sink, and
-routes your application audio — the VAIO strip and anything fed by a virtual
-cable — to it. Microphones are left out on purpose: Discord already sends your
-voice, so streaming it as well means viewers hear you twice. AUX is never
-routed, and if it already was, the tool removes it.
+From a shell, the same thing:
 
-It is safe to re-run, it never takes a bus that already has a device, and
-`--dry-run` shows what it would do without touching anything. To do it by hand
-instead:
+    bb-ctl stream setup               # or: --dry-run, --bus A2, --autolevel
 
-    bb-ctl route out A3 betterbanana_stream     # A3 becomes the stream bus
-    bb-ctl strip 1 bus A3 1           # game / app audio -> stream
-    bb-ctl strip 3 bus A3 1           # music -> stream
+It is safe to re-run, and it never takes a bus that already has a device.
+
+**Your headphones and your stream get separate levels.** A pre-fader bus takes
+each strip *before* its fader, at that strip's own **STREAM** send - the knob
+above the bus buttons on every strip, coloured like the stream bus. So the
+fader is what you hear and the STREAM knob is what your viewers hear: put a
+music player at full volume, pull its strip's fader down until it sits under
+the conversation in your headphones, and the stream still gets it at full
+level. Mute still mutes the stream (it is the kill switch), ducking still
+applies, and soloing something to listen to it never cuts the broadcast.
+Switching a bus pre-fader starts every send where its fader was, so nothing
+jumps.
+
+    bb-ctl strip 1 send -6            # this strip, 6 dB down on the stream
+    bb-ctl bus A3 prefader 0          # back to following the faders
+
+**Auto-level** is optional: a slow loudness rider on the stream bus that keeps
+it near -16 LUFS whatever your apps are set to. It never lifts silence or hiss,
+moves at most a dB and a half a second, and holds still while the ducker is
+pulling music down under your voice. Switch it on in the dialog, or:
+
+    bb-ctl bus A3 autolevel on        # target -16 LUFS; also: target <LUFS>
 
 **Never route AUX to the stream bus.** That is the echo, straight back.
 

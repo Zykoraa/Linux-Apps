@@ -101,6 +101,5 @@ echo "Watchdog:       systemctl --user status betterbanana-health"
 echo "$micgain_note"
 echo "Make sure $BIN is on your PATH."
 echo
-echo "Sharing your screen on Discord? One command sets up the stream bus so"
-echo "callers do not hear themselves echoed back (see README):"
-echo "    bb-stream-setup"
+echo "Sharing your screen on Discord? Engine -> Discord stream... in the mixer"
+echo "sets up the stream bus in one click (or: bb-ctl stream setup)."
