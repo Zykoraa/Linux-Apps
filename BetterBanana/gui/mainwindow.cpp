@@ -360,11 +360,22 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         m_send->setFormatter([](int v) {
             return v <= -600 ? QString("off") : QString::asprintf("%+.1f dB", v / 10.0);
         });
+        // Turning it on a stream bus that still follows the faders makes that
+        // bus pre-fader: turning a STREAM knob only ever means "give the
+        // stream its own level", and the switch is silent (every send starts
+        // at its fader). It is a normal mixer change, so Ctrl+Z undoes it.
         connect(m_send, &Knob::valueChanged, this, [this](int v) {
             const int sb = m_shm->stream.bus.load(std::memory_order_relaxed);
-            if (sb >= 0 && sb < kBuses)
-                m_shm->strip[m_index].send_db[sb].store(clamp_send(v / 10.0f));
+            if (sb < 0 || sb >= kPhysBuses || !m_shm->strip[m_index].bus_on[sb].load()) return;
+            if (!m_shm->bus[sb].prefader.load()) {
+                set_prefader(m_shm, sb, true);
+                emit statusMessage(QString("%1 is now pre-fader: the STREAM knobs set what viewers "
+                                           "hear, the faders what you hear. Ctrl+Z undoes it.")
+                                       .arg(kBusLabel[sb]));
+            }
+            m_shm->strip[m_index].send_db[sb].store(clamp_send(v / 10.0f));
         });
+        m_send->installEventFilter(this);
         root->addLayout(g);
     }
 
@@ -557,22 +568,58 @@ void StripWidget::pullFromShm()
         const bool have = sb >= 0 && sb < kPhysBuses;
         const bool pre = have && m_shm->bus[sb].prefader.load() != 0;
         const bool routed = have && p.bus_on[sb].load() != 0;
-        if (have && !m_send->isDragging())
-            m_send->setValue(int(std::lround(p.send_db[sb].load() * 10.0f)));
-        m_send->setEnabled(pre && routed);
-        m_send->setAccent(have ? busChipColour(theme(), sb) : QColor());
         const QString bus = have ? QString(kBusLabel[sb]) : QString();
+        const QString name = labelFor(m_shm, true, m_index, kStripTitle[m_index]);
+
+        // Locked when there is no stream level to set. Not disabled: a disabled
+        // widget swallows clicks silently, which is exactly what made it look
+        // broken. eventFilter() eats the input and says why instead.
+        m_sendLocked = !(have && routed);
+        m_sendWhy =
+            !have ? QString("No stream bus is set up yet. Engine \u25B8 Discord stream\u2026 sets one up.")
+          : m_index == kStrips - 1
+                  ? QString("AUX is your callers' voices: it never goes to the stream, or they "
+                            "would hear themselves.")
+          : QString("%1 does not go to the stream bus, so it has no stream level. Turn on its "
+                    "%2 button if viewers should hear it.").arg(name, bus);
+
+        // What the stream is getting from this strip right now: its send on a
+        // pre-fader bus, its fader on one that still follows the faders - so a
+        // first turn continues from where the stream really is.
+        if (have && !m_send->isDragging()) {
+            const float db = pre ? p.send_db[sb].load() : p.gain_db.load();
+            QSignalBlocker quiet(m_send);   // showing a value must not set one
+            m_send->setValue(int(std::lround(db * 10.0f)));
+        }
+        m_send->setAccent(m_sendLocked ? theme().textDim : busChipColour(theme(), sb));
         const QString tip =
-            !have   ? QString("Stream send. No stream bus is set up yet: Engine \u25B8 Stream\u2026")
-          : !routed ? QString("Stream send. This strip is not routed to the stream bus (%1).").arg(bus)
-          : !pre    ? QString("Stream send. %1 follows the faders; make it pre-fader in "
-                              "Engine \u25B8 Stream\u2026 and this sets what viewers hear.").arg(bus)
-                    : QString("What viewers hear from this strip, on %1. The fader only sets "
-                              "what you hear.\nDouble-click: back to 0 dB.").arg(bus);
+            m_sendLocked ? m_sendWhy
+          : !pre ? QString("What viewers hear from this strip. %1 follows the faders right now; "
+                           "turning this gives the stream its own levels (%1 goes pre-fader), "
+                           "and the fader then only sets what you hear.").arg(bus)
+                 : QString("What viewers hear from this strip, on %1. The fader only sets "
+                           "what you hear.\nDouble-click: back to 0 dB.").arg(bus);
         if (m_send->toolTip() != tip) m_send->setToolTip(tip);
     }
     m_gainLbl->setText(QString::asprintf("%+.1f dB", p.gain_db.load()));
     m_header->setText(labelFor(m_shm, true, m_index, kStripTitle[m_index]));
+}
+
+bool StripWidget::eventFilter(QObject* o, QEvent* e)
+{
+    if (o == m_send && m_sendLocked) {
+        switch (e->type()) {
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::Wheel:
+        case QEvent::KeyPress:
+            emit statusMessage(m_sendWhy);
+            return true;
+        default:
+            break;
+        }
+    }
+    return QWidget::eventFilter(o, e);
 }
 
 void StripWidget::refreshMeters()

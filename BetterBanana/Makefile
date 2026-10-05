@@ -82,7 +82,7 @@ tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_delay $(BUILD)/test_loudness $(BUILD)/test_nodes \
         $(BUILD)/test_contrast $(BUILD)/test_matrix $(BUILD)/test_autolevel \
         $(BUILD)/test_streamguard $(BUILD)/test_streamsetup \
-        $(BUILD)/test_widgets
+        $(BUILD)/test_widgets $(BUILD)/test_strip
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -102,6 +102,24 @@ $(BUILD)/test_widgets: tests/test_widgets.cpp gui/knob.cpp gui/widgets.cpp gui/t
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  tests/test_widgets.cpp gui/knob.cpp gui/widgets.cpp gui/theme.cpp \
 	  $(BUILD)/moc_knob.cpp -o $@ $(QT_LD)
+
+# A real strip card, built from the same sources as bb-gui minus main.cpp,
+# driven with key and wheel events. Needs the offscreen platform, which
+# `check` selects.
+$(BUILD)/test_strip: tests/test_strip.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
+                     gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+                     gui/dialogbits.cpp \
+                     $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
+                     $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp \
+                     $(BUILD)/moc_knob.cpp $(BUILD)/qrc_betterbanana.cpp \
+                     $(GUI_HDRS) $(HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
+	  tests/test_strip.cpp gui/mainwindow.cpp gui/eqdialog.cpp gui/fxdialog.cpp \
+	  gui/calibdialog.cpp gui/widgets.cpp gui/theme.cpp gui/knob.cpp \
+	  gui/dialogbits.cpp \
+	  $(BUILD)/moc_mainwindow.cpp $(BUILD)/moc_eqdialog.cpp \
+	  $(BUILD)/moc_fxdialog.cpp $(BUILD)/moc_calibdialog.cpp $(BUILD)/moc_knob.cpp \
+	  $(BUILD)/qrc_betterbanana.cpp -o $@ $(QT_LD) -lrt -lpthread
 
 # Needs Qt for QColor only; no display, no event loop.
 $(BUILD)/test_contrast: tests/test_contrast.cpp gui/theme.cpp $(GUI_HDRS) | $(BUILD)
@@ -270,7 +288,7 @@ install-system: engine gui ctl
 # caller's applications around for half a minute.
 UNIT := test_autolevel test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
         test_delay test_loudness test_matrix test_nodes test_preset test_spectrum test_streamguard test_streamsetup test_surround \
-        test_voicefx test_widgets
+        test_voicefx test_widgets test_strip
 
 # QT_QPA_PLATFORM=offscreen for all of them: three of these link Qt and would
 # otherwise open real windows on whatever session happens to be running the

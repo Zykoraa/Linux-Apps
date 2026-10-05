@@ -60,6 +60,9 @@ signals:
     void fxEditRequested(int stripIndex);
     void statusMessage(const QString& text);
 
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override;
+
 private:
     Knob* addKnob(QGridLayout* g, int col, const QString& name,
                   int lo, int hi, int def, bool bipolar);
@@ -68,6 +71,10 @@ private:
     bb::Shared* m_shm;
     int   m_index;
     bool  m_hardware;
+    // The STREAM knob takes no input while this strip has no stream level at
+    // all (no stream bus, or not routed to it), and says why when touched.
+    bool    m_sendLocked = true;
+    QString m_sendWhy;
 
     bool  m_missing = false;
     bool  m_dimmed = false;
