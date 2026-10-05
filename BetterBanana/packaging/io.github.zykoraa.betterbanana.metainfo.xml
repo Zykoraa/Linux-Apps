@@ -114,6 +114,15 @@
   </recommends>
 
   <releases>
+    <release version="0.3.1" date="2026-10-05">
+      <description>
+        <p>
+          The STREAM knobs work on a stream bus set up before 0.3.0: turning
+          one gives the stream its own levels, with nothing jumping. A knob
+          that cannot act says why instead of silently ignoring you.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-04">
       <description>
         <p>

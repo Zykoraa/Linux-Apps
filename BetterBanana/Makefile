@@ -29,7 +29,7 @@ HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset
 GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
             gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
             gui/dialogbits.h
-VERSION := 0.3.0
+VERSION := 0.3.1
 CXXFLAGS := -O2 -std=c++20 -DBB_VERSION='"$(VERSION)"' -Wall -Wextra -Wno-unused-parameter -ffp-contract=fast -Wno-missing-field-initializers
 PW_CF    := $(shell pkg-config --cflags libpipewire-0.3)
 PW_LD    := $(shell pkg-config --libs libpipewire-0.3)

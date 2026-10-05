@@ -1,6 +1,6 @@
 # Maintainer: Zykoraa <thompsonj52d@gmail.com>
 pkgname=betterbanana
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Virtual mixing console for PipeWire, modelled on Voicemeeter Banana"
 arch=('x86_64')

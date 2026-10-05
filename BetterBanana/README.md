@@ -69,7 +69,7 @@ Cable), and set your chat app's microphone to **BetterBanana Out B1**.
 
 ## Getting it onto another Linux machine
 
-    make dist        # -> betterbanana-0.3.0.tar.gz, self-contained source
+    make dist        # -> betterbanana-0.3.1.tar.gz, self-contained source
 
 Copy that tarball over. Nothing in it is tied to this machine: the build asks Qt
 where its `moc` lives rather than hardcoding a path, and `make check-deps` runs
@@ -85,7 +85,7 @@ engine with `systemctl --user enable --now betterbanana-engine`.
 
 **Any other distribution** — build and install into your home directory:
 
-    tar xzf betterbanana-0.3.0.tar.gz && cd betterbanana-0.3.0
+    tar xzf betterbanana-0.3.1.tar.gz && cd betterbanana-0.3.1
     make && make gui && make install
 
 Dependencies:
