@@ -28,8 +28,9 @@ Ten colour themes ship with it; Catppuccin Latte is the light one.
 
 **Features**
 
-- 5×5 routing matrix, per-bus solo, per-strip gate / compressor / 3-band EQ
-- 3 virtual cables assignable to any hardware strip, plus VAIO and AUX
+- 6×5 routing matrix, per-bus solo, per-strip gate / compressor / 3-band EQ
+- 3 virtual cables assignable to any hardware strip, plus three virtual inputs:
+  VAIO, AUX and VAIO3
 - Sidechain ducking: music steps back while you talk
 - 12-band parametric EQ on **every strip and every bus**: shelves, pass filters,
   preamp, draggable curve over a live spectrum analyser
@@ -139,12 +140,13 @@ No cmake needed; Qt's `moc` is invoked directly (Qt6's, at `/usr/lib/qt6/moc` �
 Only one engine may run at a time; a second instance refuses to start rather
 than publishing duplicate node names and fighting over the graph.
 
-The engine registers four devices any application can use:
+The engine registers these devices for applications to use:
 
 | Device      | Kind          | Purpose                                  |
 |-------------|---------------|------------------------------------------|
 | `bb_vaio`  | Audio/Sink    | apps play *into* it → strip "VAIO"       |
 | `bb_aux`   | Audio/Sink    | apps play *into* it → strip "AUX"        |
+| `bb_vaio3` | Audio/Sink    | apps play *into* it → strip "VAIO3"      |
 | `bb_b1`    | Audio/Source  | apps record *from* it ← bus B1           |
 | `bb_b2`    | Audio/Source  | apps record *from* it ← bus B2           |
 | `bb_cable1..3` | Audio/Sink | virtual cables, assignable to any strip  |
@@ -1153,6 +1155,19 @@ whichever applications you point at that cable, separately from VAIO and AUX.
 For example, put *BetterBanana Cable 1* on **HW INPUT 2**, then send a game
 or a browser to it while music keeps going through VAIO.
 
+**VAIO3** is a third virtual input for an application that should have a strip
+to itself without giving up a hardware input - a music player, say. Unlike VAIO
+and AUX it starts on A1 alone, because music on a B bus is music in a
+microphone. It sits after AUX, so strips 0-4 keep the numbers presets, scripts
+and keybinds already use. A preset saved before VAIO3 existed resets it to
+those defaults when loaded. It takes part in stream setup like VAIO, and can be
+the ducker's target: key the microphone strip, give VAIO3 a DUCK depth, and the
+music steps back while you talk.
+
+The Applications dialog's saved rules leave a stream alone while it sits on a
+sink another application runs to capture it (OBS, a recorder, eveamp's Spotify
+bridge). Moving it off would only start a tug of war with that application.
+
 Cables feed their strip inside the engine rather than through a monitor source,
 so there is no extra latency or conversion. A cable feeds at most one strip; the
 routing value is stored as `cable:N`.
@@ -1412,12 +1427,20 @@ strip** (`s0`–`s4`), because they are the same kind of block:
     ./build/test_fader        # fader value, clamping, paging and fine drag
     ./build/test_contrast     # the colour contract, over all ten palettes
     ./build/test_widgets      # the custom widgets, driven by real mouse events
+    ./build/test_approute     # auto-routing leaves application capture sinks alone
+    ./tests/isolated.sh       # integration.sh against a private, throwaway engine
     ./tests/integration.sh    # drives real audio through a running engine
 
 `tests/integration.sh` needs a running engine and drives real audio through it,
 so it is deliberately not part of `make check`. It parks any application sitting
 on a BetterBanana sink for the duration and puts each one back on the sink it
 came from.
+
+`tests/isolated.sh` runs it (or any command) without touching the real mixer:
+it starts a private PipeWire with a dummy clock, a WirePlumber with no hardware,
+no D-Bus and no saved state, a pipewire-pulse, and an engine on its own
+shared-memory segment (`BB_SHM`). The engine's stream guard then only ever sees
+that private graph, and the live mix, its devices and Discord are untouched.
 
 `test_preset` checks that serialise → deserialise → serialise is byte-identical
 on a fully populated mixer. Undo is built out of those two functions, so a field

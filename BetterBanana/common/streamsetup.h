@@ -63,7 +63,7 @@ inline void set_prefader(Shared* s, int b, bool on, bool keep_sends = false)
 
 inline const char* stream_strip_name(int i)
 {
-    static const char* const n[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX" };
+    static const char* const n[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX", "VAIO3" };
     return i >= 0 && i < kStrips ? n[i] : "?";
 }
 
@@ -114,8 +114,9 @@ inline StreamSetupPlan plan_stream_setup(const Shared* s, const StreamSetupOpts&
 
     // ---- the strips ----------------------------------------------------------
     if (!o.bus_only) {
-        for (int i = 0; i < kStrips - 1; ++i) {
-            const bool vaio  = i == kHwStrips;
+        for (int i = 0; i < kStrips; ++i) {
+            if (i == kAuxStrip) continue;
+            const bool vaio  = i == kVaioStrip || i == kVaio3Strip;
             const bool cable = i < kHwStrips &&
                                std::strncmp(hw[i], kCablePrefix, std::strlen(kCablePrefix)) == 0;
             if (!vaio && !cable) continue;
@@ -124,8 +125,8 @@ inline StreamSetupPlan plan_stream_setup(const Shared* s, const StreamSetupOpts&
                                      std::string("route ") + stream_strip_name(i) + " to " + name });
         }
     }
-    if (s->strip[kStrips - 1].bus_on[b].load())
-        plan.actions.push_back({ StreamSetupAction::UnrouteAux, kStrips - 1,
+    if (s->strip[kAuxStrip].bus_on[b].load())
+        plan.actions.push_back({ StreamSetupAction::UnrouteAux, kAuxStrip,
                                  std::string("take AUX off ") + name
                                  + " (callers would hear themselves)" });
 

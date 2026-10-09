@@ -97,7 +97,7 @@ static bool offerToStartEngine()
     // Poll rather than sleep, so the dialog stays responsive.
     QElapsedTimer t; t.start();
     while (t.elapsed() < 4000) {
-        const int fd = shm_open(kShmName, O_RDWR, 0600);
+        const int fd = shm_open(shm_name(), O_RDWR, 0600);
         if (fd >= 0) { close(fd); return true; }
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     }
@@ -135,10 +135,10 @@ int main(int argc, char** argv)
         app.setStyleSheet(buildStyleSheet(theme()));
     }
 
-    int fd = shm_open(kShmName, O_RDWR, 0600);
+    int fd = shm_open(shm_name(), O_RDWR, 0600);
     if (fd < 0) {
         if (!offerToStartEngine()) return 1;
-        fd = shm_open(kShmName, O_RDWR, 0600);
+        fd = shm_open(shm_name(), O_RDWR, 0600);
         if (fd < 0) return 1;
     }
     void* m = mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

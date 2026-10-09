@@ -380,6 +380,7 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
     bool bus_delay_seen[kBuses] = {}, str_delay_seen[kStrips] = {};
     bool str_band_seen[kStrips][kEqBands] = {}, str_eq_seen[kStrips] = {}, str_pre_seen[kStrips] = {};
     bool str_fx_seen[kStrips] = {};
+    bool str_seen[kStrips] = {};   // every preset writes strip.N.gain for each strip it has
     bool str_send_seen[kStrips] = {}, bus_pf_seen[kBuses] = {}, bus_al_seen[kBuses] = {};
     bool guard_seen = false;
 
@@ -467,7 +468,10 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         if      (keyed_rest("strip.", ".fx", i, rest) && i < kStrips) {
             if (detail::read_fx(s->strip[i].fx, rest, val)) str_fx_seen[i] = true;
         }
-        else if (keyed("strip.", ".gain", i) && i < kStrips) s->strip[i].gain_db.store(atof(val));
+        else if (keyed("strip.", ".gain", i) && i < kStrips) {
+            s->strip[i].gain_db.store(atof(val));
+            str_seen[i] = true;
+        }
         else if (keyed("strip.", ".mute", i) && i < kStrips) s->strip[i].mute.store(atoi(val));
         else if (keyed("strip.", ".solo", i) && i < kStrips) s->strip[i].solo.store(atoi(val));
         else if (keyed("strip.", ".monosrc", i) && i < kStrips) s->strip[i].mono_source.store(atoi(val) ? 1 : 0);
@@ -646,6 +650,11 @@ inline bool preset_deserialize(Shared* s, const std::string& text)
         }
     }
     if (!guard_seen) s->stream_guard_mode.store(kGuardModeOn);
+    // A strip the preset does not describe did not exist when it was written
+    // (VAIO3 arrived in protocol v15). It starts as a fresh engine starts it,
+    // rather than keeping whatever the previous preset left there.
+    for (int i = 0; i < kStrips; ++i)
+        if (!str_seen[i]) strip_set_defaults(s->strip[i], i);
     for (int i = 0; i < kStrips; ++i)
         if (!str_send_seen[i])
             for (int b = 0; b < kBuses; ++b) s->strip[i].send_db[b].store(0.0f);

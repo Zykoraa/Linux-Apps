@@ -11,12 +11,22 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 namespace bb {
 
 constexpr uint32_t kMagic      = 0x42423031;   // 'BB01'
-constexpr uint32_t kVersion    = 14;
+constexpr uint32_t kVersion    = 15;
 constexpr const char* kShmName = "/betterbanana.state";
+
+// The segment every component maps. BB_SHM names another one, so a test
+// engine (with its own PipeWire, see tests/isolated.sh) never touches the live
+// mixer's state.
+inline const char* shm_name()
+{
+    const char* e = std::getenv("BB_SHM");
+    return e && *e ? e : kShmName;
+}
 
 // The null sink a screen share transmits. Audio played into it is inaudible in
 // the room by design - it exists to be captured by something else - so it is a
@@ -40,8 +50,14 @@ constexpr float kAlTargetMin = -30.0f, kAlTargetMax = -6.0f;
 constexpr float kAlRangeMax  = 24.0f;              // either direction
 
 constexpr int kHwStrips   = 3;                 // Hardware Input 1..3
-constexpr int kVirtStrips = 2;                 // BetterBanana VAIO, AUX
+constexpr int kVirtStrips = 3;                 // BetterBanana VAIO, AUX, VAIO3
 constexpr int kStrips     = kHwStrips + kVirtStrips;
+// Strip indices of the virtual inputs. VAIO3 was added after AUX rather than
+// before it, so every index a preset, a script or a keybind already names
+// keeps its meaning.
+constexpr int kVaioStrip  = kHwStrips;         // 3
+constexpr int kAuxStrip   = kHwStrips + 1;     // 4: voice chat, never to a stream or B bus
+constexpr int kVaio3Strip = kHwStrips + 2;     // 5: a dedicated media player
 constexpr int kPhysBuses  = 3;                 // A1 A2 A3
 constexpr int kVirtBuses  = 2;                 // B1 B2
 constexpr int kBuses      = kPhysBuses + kVirtBuses;
@@ -515,6 +531,30 @@ inline bool routing_read(const Routing& r, uint32_t& seen,
     return true;
 }
 
+// A strip's mix settings as a fresh engine starts them. Hardware strips
+// default to A1; VAIO and AUX to A1 + B1, which is the layout most people end
+// up building by hand anyway. VAIO3 carries a music player, and music on a B
+// bus is music in somebody's microphone, so it starts on A1 alone.
+inline void strip_set_defaults(StripParams& p, int index)
+{
+    for (int b = 0; b < kBuses; ++b) p.bus_on[b].store(0);
+    p.bus_on[0].store(1);
+    if (index >= kHwStrips && index != kVaio3Strip) p.bus_on[kPhysBuses].store(1);
+    p.gain_db.store(0.0f);
+    p.mute.store(0); p.solo.store(0); p.mono.store(0);
+    p.gate.store(0.0f); p.comp.store(0.0f); p.audibility.store(0.0f);
+    p.eq_low.store(0.0f); p.eq_mid.store(0.0f); p.eq_high.store(0.0f);
+    p.pan_x.store(0.0f); p.pan_y.store(0.0f);
+    p.mono_source.store(0);
+    p.limit_db.store(12.0f);
+    p.delay_ms.store(0.0f);
+    p.duck_key.store(0);
+    p.duck_depth_db.store(0.0f);
+    for (int b = 0; b < kBuses; ++b) p.send_db[b].store(0.0f);
+    eq_set_defaults(p.eq);
+    fx_set_defaults(p.fx);
+}
+
 inline void set_defaults(Shared* s)
 {
     s->magic.store(kMagic);
@@ -532,26 +572,8 @@ inline void set_defaults(Shared* s)
     }
 
     for (int i = 0; i < kStrips; ++i) {
-        StripParams& p = s->strip[i];
-        p.present.store(0);
-        // Hardware strips default to A1; virtual strips to A1 + B1, which is
-        // the layout most people end up building by hand anyway.
-        for (int b = 0; b < kBuses; ++b) p.bus_on[b].store(0);
-        p.bus_on[0].store(1);
-        if (i >= kHwStrips) p.bus_on[kPhysBuses].store(1);
-        p.gain_db.store(0.0f);
-        p.mute.store(0); p.solo.store(0); p.mono.store(0);
-        p.gate.store(0.0f); p.comp.store(0.0f); p.audibility.store(0.0f);
-        p.eq_low.store(0.0f); p.eq_mid.store(0.0f); p.eq_high.store(0.0f);
-        p.pan_x.store(0.0f); p.pan_y.store(0.0f);
-        p.mono_source.store(0);
-        p.limit_db.store(12.0f);
-        p.delay_ms.store(0.0f);
-        p.duck_key.store(0);
-        p.duck_depth_db.store(0.0f);
-        for (int b = 0; b < kBuses; ++b) p.send_db[b].store(0.0f);
-        eq_set_defaults(p.eq);
-        fx_set_defaults(p.fx);
+        s->strip[i].present.store(0);
+        strip_set_defaults(s->strip[i], i);
     }
     for (int b = 0; b < kBuses; ++b) {
         BusParams& p = s->bus[b];

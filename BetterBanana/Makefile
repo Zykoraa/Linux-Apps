@@ -26,7 +26,7 @@ HDRS     := common/protocol.h common/preset.h common/eqprofile.h common/fxpreset
             engine/delay.h engine/loudness.h engine/click.h engine/nodes.h \
             engine/matrix.h engine/autolevel.h engine/streamguard.h \
             common/streamsetup.h
-GUI_HDRS := gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
+GUI_HDRS := gui/approute.h gui/mainwindow.h gui/eqdialog.h gui/fxdialog.h gui/calibdialog.h \
             gui/theme.h gui/knob.h gui/widgets.h gui/color.h gui/metrics.h \
             gui/dialogbits.h
 VERSION := 0.3.1
@@ -82,7 +82,7 @@ tests:  $(BUILD)/test_dsp $(BUILD)/test_eq $(BUILD)/test_fader \
         $(BUILD)/test_delay $(BUILD)/test_loudness $(BUILD)/test_nodes \
         $(BUILD)/test_contrast $(BUILD)/test_matrix $(BUILD)/test_autolevel \
         $(BUILD)/test_streamguard $(BUILD)/test_streamsetup \
-        $(BUILD)/test_widgets $(BUILD)/test_strip
+        $(BUILD)/test_widgets $(BUILD)/test_strip $(BUILD)/test_approute
 ctl:    $(BUILD)/bb-ctl
 
 $(BUILD)/bb-engine: | check-deps
@@ -122,6 +122,9 @@ $(BUILD)/test_strip: tests/test_strip.cpp gui/mainwindow.cpp gui/eqdialog.cpp gu
 	  $(BUILD)/qrc_betterbanana.cpp -o $@ $(QT_LD) -lrt -lpthread
 
 # Needs Qt for QColor only; no display, no event loop.
+$(BUILD)/test_approute: tests/test_approute.cpp gui/approute.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) tests/test_approute.cpp -o $@ $(QT_LD)
+
 $(BUILD)/test_contrast: tests/test_contrast.cpp gui/theme.cpp $(GUI_HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -fPIC $(QT_CF) \
 	  tests/test_contrast.cpp gui/theme.cpp -o $@ $(QT_LD)
@@ -288,7 +291,7 @@ install-system: engine gui ctl
 # caller's applications around for half a minute.
 UNIT := test_autolevel test_autotune test_contrast test_dsp test_eq test_fader test_pitch \
         test_delay test_loudness test_matrix test_nodes test_preset test_spectrum test_streamguard test_streamsetup test_surround \
-        test_voicefx test_widgets test_strip
+        test_voicefx test_widgets test_strip test_approute
 
 # QT_QPA_PLATFORM=offscreen for all of them: three of these link Qt and would
 # otherwise open real windows on whatever session happens to be running the

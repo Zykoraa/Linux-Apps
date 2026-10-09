@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "approute.h"
 #include "eqdialog.h"
 #include "fxdialog.h"
 #include "dialogbits.h"
@@ -70,7 +71,7 @@ static const char* kBusLabel[kBuses] = { "A1", "A2", "A3", "B1", "B2" };
 // this, in two different spellings; shortening the card titles updated one of
 // them, and pullFromShm reverted the header from another twice a second.
 static const char* kStripTitle[kStrips] = {
-    "HW INPUT 1", "HW INPUT 2", "HW INPUT 3", "VAIO", "AUX"
+    "HW INPUT 1", "HW INPUT 2", "HW INPUT 3", "VAIO", "AUX", "VAIO3"
 };
 
 static inline float sliderDb(int v) { return v / 10.0f; }
@@ -206,11 +207,15 @@ StripWidget::StripWidget(Shared* shm, int index, bool hardware, const QString& t
         });
         root->addWidget(m_device);
     } else {
-        auto* vl = makeLabel(index == kHwStrips ? "bb_vaio" : "bb_aux", "caption");
+        static const char* const sink[kVirtStrips] = { "bb_vaio", "bb_aux", "bb_vaio3" };
+        static const char* const tip[kVirtStrips] = {
+            "Virtual input: whatever plays into BetterBanana VAIO",
+            "Virtual input: whatever plays into BetterBanana AUX",
+            "Virtual input: whatever plays into BetterBanana VAIO3 (a media player of its own)",
+        };
+        auto* vl = makeLabel(sink[index - kHwStrips], "caption");
         vl->setFixedHeight(bbui::rowH());   // keeps every meter top on one line
-        vl->setToolTip(index == kHwStrips
-            ? "Virtual input: whatever plays into BetterBanana Cable 1"
-            : "Virtual input: whatever plays into BetterBanana Cable 2");
+        vl->setToolTip(tip[index - kHwStrips]);
         root->addWidget(vl);
     }
 
@@ -577,7 +582,7 @@ void StripWidget::pullFromShm()
         m_sendLocked = !(have && routed);
         m_sendWhy =
             !have ? QString("No stream bus is set up yet. Engine \u25B8 Discord stream\u2026 sets one up.")
-          : m_index == kStrips - 1
+          : m_index == kAuxStrip
                   ? QString("AUX is your callers' voices: it never goes to the stream, or they "
                             "would hear themselves.")
           : QString("%1 does not go to the stream bus, so it has no stream level. Turn on its "
@@ -1328,7 +1333,7 @@ void VbanDialog::apply()
 // HiFi__Line__sink") are unreadable, so the lists show pactl's `description`
 // ("UMC202HD 192k Line A") and keep node.name only as the stored value.
 // ---------------------------------------------------------------------------
-struct DevEntry { QString id, label; bool captureOnly = false; };
+struct DevEntry { QString id, label; bool captureOnly = false; bool appCapture = false; };
 
 static QString pactlRun(const QStringList& args)
 {
@@ -1397,7 +1402,7 @@ static QVector<DevEntry> parseDevices(const QString& json, bool own)
         const bool captureOnly =
             o.value("properties").toObject().value("betterbanana.capture-only").toString() == "true"
             || id == QLatin1String(kStreamSinkName);
-        v.append({ id, label, captureOnly });
+        v.append({ id, label, captureOnly, isAppCaptureSink(o.value("properties").toObject()) });
     }
     return v;
 }
@@ -1722,7 +1727,7 @@ void StreamDialog::runSetup()
 static void listTargets(bool playback, QStringList& ids, QStringList& labels)
 {
     const QStringList prefer = playback
-        ? QStringList{ "bb_vaio", "bb_aux", "bb_cable1", "bb_cable2", "bb_cable3" }
+        ? QStringList{ "bb_vaio", "bb_aux", "bb_vaio3", "bb_cable1", "bb_cable2", "bb_cable3" }
         : QStringList{ "bb_b1", "bb_b2" };
     for (const DevEntry& d : promote(listDevices(playback, true), prefer)) {
         if (playback && d.captureOnly) continue;
@@ -2984,16 +2989,16 @@ static QVector<Finding> diagnose(Shared* shm, MainWindow* owner)
     int streamBus = -1;
     for (int b = 0; b < kPhysBuses && routed; ++b)
         if (QString::fromUtf8(bo[b]) == QString(kStreamSinkName)) streamBus = b;
-    if (streamBus >= 0 && shm->strip[kStrips - 1].bus_on[streamBus].load())
+    if (streamBus >= 0 && shm->strip[kAuxStrip].bus_on[streamBus].load())
         f.append({ 0, QString("%1 is routed to the stream bus, so callers hear themselves")
-                          .arg(sname(kStrips - 1)),
+                          .arg(sname(kAuxStrip)),
                    QString("%1 is where incoming voice arrives. Sending it to %2, which "
                            "is what a screen share transmits, mixes everyone's own voice "
                            "back into the stream as an echo - and the people hearing it "
                            "are the only ones who can tell.")
-                       .arg(sname(kStrips - 1), bname(streamBus)),
+                       .arg(sname(kAuxStrip), bname(streamBus)),
                    "Turn that route off",
-                   [shm, streamBus] { shm->strip[kStrips - 1].bus_on[streamBus].store(0); } });
+                   [shm, streamBus] { shm->strip[kAuxStrip].bus_on[streamBus].store(0); } });
 
     // --- the ducker ---------------------------------------------------------
     if (shm->duck_enabled.load()) {
@@ -4747,9 +4752,11 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
     // A rule saved before the stream bus was excluded from the target list can
     // still point at it, and re-applying that rule silences the app every time
     // the mixer opens. Drop such a rule instead of honouring it.
-    QSet<QString> captureOnly;
-    for (const DevEntry& d : parseDevices(sinksJson, true))
+    QSet<QString> captureOnly, appCapture;
+    for (const DevEntry& d : parseDevices(sinksJson, true)) {
         if (d.captureOnly) captureOnly.insert(d.id);
+        if (d.appCapture)  appCapture.insert(d.id);
+    }
 
     QSet<int> seen;
     for (bool pb : { true, false }) {
@@ -4757,6 +4764,11 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
                                        : parseStreams(sourceOutputs, sourceShort, false))) {
             const int key = pb ? s.index : -(s.index + 1);
             seen.insert(key);
+            // Another application is capturing this stream (see approute.h).
+            // Checked before the stream counts as handled, so if it is later
+            // let go somewhere ordinary - that application crashed, say - the
+            // rule still gets its one turn.
+            if (pb && appCapture.contains(s.target)) continue;
             if (m_ruledStreams.contains(key)) continue;
             m_ruledStreams.insert(key);
             const QString want = ruleFor(s.app, pb);

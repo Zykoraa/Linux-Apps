@@ -32,7 +32,7 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v
 // struct has changed underneath us.
 static pid_t engine_pid_unchecked()
 {
-    int fd = shm_open(kShmName, O_RDONLY, 0600);
+    int fd = shm_open(shm_name(), O_RDONLY, 0600);
     if (fd < 0) return -1;
     void* m = mmap(nullptr, sizeof(Shared), PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
@@ -45,8 +45,8 @@ static pid_t engine_pid_unchecked()
 
 static Shared* map_shm(bool rw = true)
 {
-    int fd = shm_open(kShmName, rw ? O_RDWR : O_RDONLY, 0600);
-    if (fd < 0) { std::fprintf(stderr, "bb-ctl: engine not running (%s)\n", kShmName); return nullptr; }
+    int fd = shm_open(shm_name(), rw ? O_RDWR : O_RDONLY, 0600);
+    if (fd < 0) { std::fprintf(stderr, "bb-ctl: engine not running (%s)\n", shm_name()); return nullptr; }
     void* m = mmap(nullptr, sizeof(Shared), PROT_READ | (rw ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { perror("mmap"); return nullptr; }
@@ -73,7 +73,7 @@ static void bar(float lin)
     std::printf("] %6.1f dB", d);
 }
 
-static const char* kStripName[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX" };
+static const char* kStripName[kStrips] = { "HW IN 1", "HW IN 2", "HW IN 3", "VAIO", "AUX", "VAIO3" };
 static const char* kBusName[kBuses]    = { "A1", "A2", "A3", "B1", "B2" };
 
 // "  16.0 ms" or "       -", the same width either way, so a column of them
@@ -146,7 +146,7 @@ static void usage()
       "  eq save <t> <name>          save an EQ as a named profile\n"
       "  eq flat <t>                 reset an EQ to flat\n"
       "  eq preamp <t>               set the preamp so the curve cannot clip\n"
-      "     <t> is a bus (A1..B2) or an input strip (s0..s4)\n"
+      "     <t> is a bus (A1..B2) or an input strip (s0..s5)\n"
       "  route in <1..3> <source-node-name|cable:0..2|->\n"
       "  route out <A1|A2|A3> <sink-node-name|->\n"
       "  rec file <path> | bus <A1..B2> | start | stop\n"
@@ -155,7 +155,7 @@ static void usage()
       "  vban out <1..8> on|off | host <ip> | port <n> | name <s> | bus <A1..B2>\n"
       "  vban in  <1..8> on|off | port <n> | name <s>\n"
       "  vban apply                  reload VBAN modules\n"
-      "  label strip <0..4> <name>   rename a strip (empty resets)\n"
+      "  label strip <0..5> <name>   rename a strip (empty resets)\n"
       "  label bus <A1..B2> <name>   rename a bus\n"
       "  preset save <name|path>     save current state\n"
       "  preset load <name|path>     restore a saved state\n"

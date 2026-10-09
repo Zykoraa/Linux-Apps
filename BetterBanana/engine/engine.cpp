@@ -1610,7 +1610,7 @@ void Engine::poll_control()
     {
         int aux = 0;
         for (int b = 0; b < kPhysBuses; ++b)
-            if (shm->strip[kStrips - 1].bus_on[b].load(std::memory_order_relaxed)) aux |= 1 << b;
+            if (shm->strip[kAuxStrip].bus_on[b].load(std::memory_order_relaxed)) aux |= 1 << b;
         const int sig = shm->stream_guard_mode.load(std::memory_order_relaxed) * 1000
                       + (shm->stream.bus.load(std::memory_order_relaxed) + 1) * 10 + aux;
         const double now = now_s();
@@ -1879,7 +1879,7 @@ void Engine::guard_work()
     in.mode = shm->stream_guard_mode.load(std::memory_order_relaxed);
     in.stream_bus = shm->stream.bus.load(std::memory_order_relaxed);
     for (int b = 0; b < kPhysBuses; ++b)
-        in.aux_on[b] = shm->strip[kStrips - 1].bus_on[b].load(std::memory_order_relaxed) != 0;
+        in.aux_on[b] = shm->strip[kAuxStrip].bus_on[b].load(std::memory_order_relaxed) != 0;
 
     const GuardPlan plan = plan_guard(g, in);
     shm->stream.guard_state.store(plan.state, std::memory_order_relaxed);
@@ -1983,7 +1983,7 @@ int main(int argc, char** argv)
     // Refuse to start a second engine: two of them would publish duplicate
     // node names and silently fight over the graph.
     {
-        int probe = shm_open(kShmName, O_RDWR, 0600);
+        int probe = shm_open(shm_name(), O_RDWR, 0600);
         if (probe >= 0) {
             void* pm = mmap(nullptr, sizeof(Shared), PROT_READ, MAP_SHARED, probe, 0);
             if (pm != MAP_FAILED) {
@@ -2008,7 +2008,7 @@ int main(int argc, char** argv)
     // Shared memory. Deliberately NOT unlinked: reusing the same inode keeps a
     // running GUI's mapping valid across an engine restart. set_defaults()
     // reinitialises the contents, and struct_size guards against layout drift.
-    g_eng.shm_fd = shm_open(kShmName, O_CREAT | O_RDWR, 0600);
+    g_eng.shm_fd = shm_open(shm_name(), O_CREAT | O_RDWR, 0600);
     if (g_eng.shm_fd < 0) { perror("shm_open"); return 1; }
     if (ftruncate(g_eng.shm_fd, sizeof(Shared)) < 0) { perror("ftruncate"); return 1; }
     void* m = mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE, MAP_SHARED, g_eng.shm_fd, 0);
@@ -2079,8 +2079,8 @@ int main(int argc, char** argv)
         e.desc = hw_desc[i];
         // Left unconnected until the GUI assigns a device.
     }
-    static const char* vs_name[kVirtStrips] = { "bb_vaio", "bb_aux" };
-    static const char* vs_desc[kVirtStrips] = { "BetterBanana VAIO", "BetterBanana AUX" };
+    static const char* vs_name[kVirtStrips] = { "bb_vaio", "bb_aux", "bb_vaio3" };
+    static const char* vs_desc[kVirtStrips] = { "BetterBanana VAIO", "BetterBanana AUX", "BetterBanana VAIO3" };
     for (int i = 0; i < kVirtStrips; ++i) {
         Endpoint& e = g_eng.ep_in[kHwStrips + i];
         e.eng = &g_eng; e.kind = kEpVirtSink; e.index = kHwStrips + i;
@@ -2125,8 +2125,8 @@ int main(int argc, char** argv)
     pw_loop_update_timer(pw_main_loop_get_loop(g_eng.loop), g_eng.spec_timer, &sval, &sitv, false);
 
     std::fprintf(stderr,
-        "[bb] engine up: 2 virtual sinks (VAIO/AUX), 2 virtual sources (B1/B2),\n"
-        "      3 hw inputs + 3 hw outputs idle until assigned. shm=%s\n", kShmName);
+        "[bb] engine up: 3 virtual sinks (VAIO/AUX/VAIO3), 2 virtual sources (B1/B2),\n"
+        "      3 hw inputs + 3 hw outputs idle until assigned. shm=%s\n", shm_name());
 
     pw_main_loop_run(g_eng.loop);
 

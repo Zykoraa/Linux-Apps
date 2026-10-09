@@ -407,6 +407,51 @@ int main()
         chk(!has_strip_for_device(dev), "and is gone afterwards");
     }
 
+    // --- VAIO3: indices stay put, and old presets do not inherit a stale strip ---
+    {
+        chk(kVaioStrip == 3 && kAuxStrip == 4 && kVaio3Strip == 5,
+            "VAIO3 is appended, so the indices presets and scripts use keep their meaning");
+        auto s = std::make_unique<Shared>();
+        set_defaults(s.get());
+        chk(s->strip[kVaio3Strip].bus_on[0].load() == 1, "VAIO3 starts on A1");
+        bool onB = false;
+        for (int b = kPhysBuses; b < kBuses; ++b) onB |= s->strip[kVaio3Strip].bus_on[b].load() != 0;
+        chk(!onB, "and on no B bus, so music never lands in a microphone");
+        chk(s->strip[kVaioStrip].bus_on[kPhysBuses].load() == 1, "VAIO keeps its A1 + B1 default");
+
+        // A preset from before v15 describes five strips. Strip 5 must come back
+        // to defaults, not keep what the last preset or a fader left on it.
+        std::string old = preset_serialize(s.get());
+        std::string trimmed;
+        size_t pos = 0;
+        while (pos < old.size()) {
+            size_t nl = old.find('\n', pos);
+            if (nl == std::string::npos) nl = old.size();
+            const std::string line = old.substr(pos, nl - pos);
+            if (line.rfind("strip.5.", 0) != 0) trimmed += line + "\n";
+            pos = nl + 1;
+        }
+        chk(trimmed.find("strip.5.") == std::string::npos && trimmed.find("strip.4.gain") != std::string::npos,
+            "the trimmed text is a five-strip preset");
+        s->strip[kVaio3Strip].gain_db.store(-30.0f);
+        s->strip[kVaio3Strip].bus_on[3].store(1);
+        s->strip[kVaio3Strip].duck_depth_db.store(-12.0f);
+        chk(preset_deserialize(s.get(), trimmed), "a five-strip preset still loads");
+        chk(s->strip[kVaio3Strip].gain_db.load() == 0.0f && s->strip[kVaio3Strip].bus_on[3].load() == 0
+            && s->strip[kVaio3Strip].duck_depth_db.load() == 0.0f,
+            "and resets VAIO3 instead of keeping stale settings");
+
+        // A six-strip preset carries VAIO3's own settings.
+        s->strip[kVaio3Strip].gain_db.store(-7.5f);
+        s->strip[kVaio3Strip].duck_depth_db.store(-14.0f);
+        const std::string six = preset_serialize(s.get());
+        auto t = std::make_unique<Shared>();
+        set_defaults(t.get());
+        chk(preset_deserialize(t.get(), six), "a six-strip preset loads");
+        near(t->strip[kVaio3Strip].gain_db.load(), -7.5, 1e-3, "VAIO3's fader round trips");
+        near(t->strip[kVaio3Strip].duck_depth_db.load(), -14.0, 1e-3, "and its duck depth");
+    }
+
     // --- filenames survive the characters node names actually contain ---------
     chk(path_escape("alsa_output.pci-0000_16_00.6.pro-output-0")
             == "alsa_output.pci-0000_16_00.6.pro-output-0",

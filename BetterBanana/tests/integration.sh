@@ -105,15 +105,15 @@ reset_state () {
   # Custom strip/bus names change the status columns these assertions parse,
   # so start from the built-in names. The caller's names are restored from the
   # snapshot preset on exit.
-  for i in 0 1 2 3 4; do "$CTL" label strip $i "" ; "$CTL" strip $i key 0; "$CTL" strip $i duck 0; done
+  for i in 0 1 2 3 4 5; do "$CTL" label strip $i "" ; "$CTL" strip $i key 0; "$CTL" strip $i duck 0; done
   "$CTL" duck off
   for b in A1 A2 A3 B1 B2; do "$CTL" label bus $b "" ; done
   # Every other strip is silenced and unrouted, so a live microphone or a
   # virtual cable cannot leak into the measured bus.
-  for i in 0 1 2 4; do
+  for i in 0 1 2 4 5; do
     for b in A1 A2 A3 B1 B2; do "$CTL" strip $i bus $b 0; done
   done
-  for i in 0 1 2 3 4; do
+  for i in 0 1 2 3 4 5; do
     "$CTL" strip $i gain 0; "$CTL" strip $i mute 0; "$CTL" strip $i solo 0; "$CTL" strip $i mono 0
     "$CTL" strip $i gate 0; "$CTL" strip $i comp 0; "$CTL" strip $i aud 0
     "$CTL" strip $i eq 0 0 0; "$CTL" strip $i pan 0
@@ -166,7 +166,7 @@ duck_peak () {   # $1 = "key" to also drive the key strip
   park
   parecord -d bb_b2 --file-format=wav --rate=48000 --channels=2 "$TMP/d.wav" & R=$!
   sleep 0.4
-  [ "$1" = key ] && paplay -d bb_cable1 "$TMP/tone.wav" &
+  [ "$1" = key ] && paplay -d bb_vaio3 "$TMP/tone.wav" &
   paplay -d bb_vaio "$TMP/tone.wav"
   sleep 0.2; kill $R 2>/dev/null; wait $R 2>/dev/null
   python3 - "$TMP/d.wav" <<'PY2'
@@ -178,7 +178,8 @@ PY2
 }
 reset_state
 "$CTL" strip 3 bus B2 1                            # only VAIO reaches B2
-"$CTL" strip 1 key 1                               # Cable 1 is the key
+"$CTL" strip 5 key 1                               # VAIO3 is the key: a virtual strip
+                                                   # needs no device assigned to it
 "$CTL" strip 3 duck -14                            # VAIO drops 14 dB while keyed
 "$CTL" duck on; "$CTL" duck threshold -34
 sleep 1

@@ -124,14 +124,14 @@ int main(int argc, char** argv)
         chk(said.contains("does not go to the stream"), "and it says why");
     }
     {
-        StripWidget aux(s, kStrips - 1, false, "AUX");
+        StripWidget aux(s, kAuxStrip, false, "AUX");
         listen(aux);
         aux.pullFromShm();
         Knob* k = sendKnob(aux);
         if (!k) { chk(false, "AUX has a STREAM knob"); return 1; }
         said.clear();
         keyUp(k);
-        chk(!s->strip[kStrips - 1].bus_on[2].load(), "AUX is never put on the stream");
+        chk(!s->strip[kAuxStrip].bus_on[2].load(), "AUX is never put on the stream");
         chk(said.contains("callers"), "and the reason given is the callers");
     }
     {

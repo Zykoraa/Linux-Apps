@@ -63,6 +63,7 @@ int main()
         chk(!has(p, StreamSetupAction::RouteStrip, 0), "but never the microphone");
         chk(!has(p, StreamSetupAction::RouteStrip, 2), "nor an unassigned strip");
         chk(!has(p, StreamSetupAction::RouteStrip, 4), "nor AUX");
+        chk(has(p, StreamSetupAction::RouteStrip, kVaio3Strip), "VAIO3 is an app strip too");
         chk(has(p, StreamSetupAction::Prefader), "and the bus goes pre-fader");
 
         apply_stream_setup(s.get(), p);
