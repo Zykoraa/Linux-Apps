@@ -125,6 +125,28 @@ int main()
             "one copy of the bus, nothing else, in the whole capture set");
     }
 
+    // --- targets not in yet: the monitor buses go at once, the bus waits ----
+    // Discord's captures arrive linked to A1/A2 - the whole monitor mix - and
+    // waiting for target.object before removing those is the burst viewers
+    // hear when stream audio is switched on.
+    {
+        Builder b = scene();
+        b.link(58, 316);      // A1
+        b.link(59, 314);      // A2
+        b.link(238, 367);     // Brave, directly
+        b.link(60, 315);      // and the bus into its own capture
+        GuardInput pending = on;
+        pending.targets_pending = true;
+        const GuardPlan p = plan_guard(b.g, pending);
+        chk(p.state == -1, "with targets pending the guard gives no verdict");
+        chk(p.make.empty(), "and makes nothing: it does not know where the bus belongs");
+        chk(p.drop.size() == 6, "but drops both channels of A1, A2 and the app straight away");
+        bool bus_kept = true;
+        for (auto& [lid, why] : p.drop)
+            bus_kept = bus_kept && b.g.ports.at(b.g.links.at(lid).out_port).node != 60;
+        chk(bus_kept, "and leaves the bus's own links alone");
+    }
+
     // --- the serial, not the id --------------------------------------------
     {
         Builder b = scene();

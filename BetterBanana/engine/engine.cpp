@@ -1812,7 +1812,7 @@ void Engine::stream_sink_tick()
 
 // ---------------------------------------------------------------------------
 // Stream guard: apply plan_guard() (engine/streamguard.h) to the live graph.
-// Runs on the main loop, debounced: any registry change arms a 100 ms one-shot,
+// Runs on the main loop, debounced: any registry change arms a 20 ms one-shot,
 // and a burst of changes is handled in one pass.
 // ---------------------------------------------------------------------------
 static void on_link_error(void* data, int /*seq*/, int res, const char* message)
@@ -1835,7 +1835,7 @@ void Engine::schedule_guard()
 {
     if (guard_armed || !guard_timer) return;
     guard_armed = true;
-    timespec val{0, 100 * 1000 * 1000}, itv{0, 0};
+    timespec val{0, 20 * 1000 * 1000}, itv{0, 0};
     pw_loop_update_timer(pw_main_loop_get_loop(loop), guard_timer, &val, &itv, false);
 }
 
@@ -1859,9 +1859,11 @@ void Engine::guard_work()
 
     if (!synced) return;
 
-    // A capture whose target has not arrived yet: give it a moment.
+    // A capture whose target has not arrived yet: give it a moment, but take
+    // out what does not depend on it in the meantime (streamguard.h).
+    bool targets_pending = false;
     for (const auto& [id, bc] : bound_caps)
-        if (!capture_target.count(id) && now - bc->since < 1.0) { schedule_guard(); return; }
+        if (!capture_target.count(id) && now - bc->since < 1.0) targets_pending = true;
 
     Graph g;
     g.nodes = nodes;
@@ -1880,11 +1882,12 @@ void Engine::guard_work()
     in.stream_bus = shm->stream.bus.load(std::memory_order_relaxed);
     for (int b = 0; b < kPhysBuses; ++b)
         in.aux_on[b] = shm->strip[kAuxStrip].bus_on[b].load(std::memory_order_relaxed) != 0;
+    in.targets_pending = targets_pending;
 
     const GuardPlan plan = plan_guard(g, in);
-    shm->stream.guard_state.store(plan.state, std::memory_order_relaxed);
+    if (plan.state >= 0) shm->stream.guard_state.store(plan.state, std::memory_order_relaxed);
     shm->stream.captures.store(plan.captures, std::memory_order_relaxed);
-    if (plan.state != guard_logged_state) {
+    if (plan.state >= 0 && plan.state != guard_logged_state) {
         static const char* const names[] = { "off", "idle", "echo protection only (no stream bus)",
             "stream bus -> Discord's own capture of it",
             "Discord is not capturing the stream bus (window share?) - feeding every capture",
@@ -1906,9 +1909,11 @@ void Engine::guard_work()
     for (const auto& [lid, why] : plan.drop) {
         if (lid >= kPendingBase) continue;
         const LinkInfo& l = g.links.at(lid);
-        const auto po = ports.find(l.out_port), pi = ports.find(l.in_port);
-        const auto key = std::make_pair(po != ports.end() ? po->second.node : 0u,
-                                        pi != ports.end() ? pi->second.node : 0u);
+        // Keyed by port pair, not node pair: left and right are two links
+        // between the same two nodes, and a node key held the second channel
+        // back a full second - one side of the whole monitor mix, AUX
+        // included, live in the stream every time Discord made its captures.
+        const auto key = std::make_pair(l.out_port, l.in_port);
         // At most one drop a second per pair: if something keeps putting a
         // link back, keep removing it - the echo matters more - but do not let
         // reacting to every event turn that into a busy loop.
@@ -1955,7 +1960,8 @@ void Engine::guard_work()
                      port_name(out).c_str(), kCaptureName, inp);
     }
 
-    if (deferred || !pending_make.empty() || !pending_drop.empty()) schedule_guard();
+    if (targets_pending || deferred || !pending_make.empty() || !pending_drop.empty())
+        schedule_guard();
 }
 
 static void on_guard_timer(void* data, uint64_t /*expirations*/)

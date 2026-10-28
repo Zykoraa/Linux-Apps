@@ -61,6 +61,12 @@ struct GuardInput {
     int  mode = kGuardModeOn;          // StreamGuardMode
     int  stream_bus = -1;              // A bus index, -1 = none
     bool aux_on[kPhysBuses] = {};      // AUX strip routed to A1..A3
+    // A capture's target.object has not arrived yet, so which capture is the
+    // bus's own is unknown. What does not depend on that - every other bus and
+    // every app - is still removed at once: those links go live the moment
+    // Discord makes its captures, and A1/A2 carry the whole monitor mix, AUX
+    // included. Only the bus's own links wait.
+    bool targets_pending = false;
 };
 
 enum DropWhy { kDropEcho, kDropDuplicate };
@@ -68,7 +74,7 @@ enum DropWhy { kDropEcho, kDropDuplicate };
 struct GuardPlan {
     std::vector<std::pair<uint32_t, DropWhy>>  drop;   // link ids
     std::vector<std::pair<uint32_t, uint32_t>> make;   // (out port, in port)
-    int state = kGuardIdle;                            // StreamGuardState
+    int state = kGuardIdle;                            // StreamGuardState, -1 = targets pending
     int captures = 0;
 };
 
@@ -140,6 +146,18 @@ inline GuardPlan plan_guard(const Graph& g, const GuardInput& in)
                 if (cap_nodes.count(id) && t == serial) own_nodes.insert(id);
         for (uint32_t p : cap_in)
             if (own_nodes.count(g.ports.at(p).node)) feed.insert(p);
+    }
+
+    if (in.targets_pending) {
+        for (const auto& [lid, l] : g.links) {
+            if (!cap_in.count(l.in_port)) continue;
+            if (blocked.count(l.out_port))
+                plan.drop.push_back({ lid, kDropEcho });
+            else if (exclusive && !stream_out.empty() && !stream_out.count(l.out_port))
+                plan.drop.push_back({ lid, kDropDuplicate });
+        }
+        plan.state = -1;                                   // no verdict yet
+        return plan;
     }
 
     if (!exclusive)               plan.state = kGuardEchoOnly;
