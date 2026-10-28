@@ -4749,6 +4749,20 @@ void MainWindow::applyAppRulesWith(const QString& sinksJson,
                                    const QString& sourceOutputs, const QString& sourceShort,
                                    bool complete)
 {
+    // Outputs can appear after the initial device list (notably the stream
+    // sink created by the engine). Reuse this async poll to clear a stale
+    // "missing" marker without rebuilding open device menus every second.
+    const auto outputs = parseDevices(sinksJson, false);
+    QStringList outputIds, outputLabels;
+    for (const DevEntry& d : outputs) { outputIds << d.id; outputLabels << d.label; }
+    for (int b = 0; b < kPhysBuses; ++b) {
+        const QString current = m_buses[b]->deviceValue();
+        if (m_buses[b]->deviceMissing() && outputIds.contains(current)) {
+            m_buses[b]->setDeviceList(outputIds, outputLabels);
+            m_buses[b]->setDeviceValue(current);
+        }
+    }
+
     // A rule saved before the stream bus was excluded from the target list can
     // still point at it, and re-applying that rule silences the app every time
     // the mixer opens. Drop such a rule instead of honouring it.
